@@ -6,12 +6,14 @@ the first place, see [Fineract_Setup.md](./Fineract_Setup.md).
 ## Run
 
 ```bash
+cp .env.example .env   # then set SECURERS_API_KEY -- fetch from SecureRS dashboard
 docker compose -f docker-compose-fineract.yml up -d
 ```
 
-No build step — the Fineract image is pulled from Docker Hub at a pinned tag.
-(This used to be `./gradlew :fineract-provider:jibDockerBuild` against a local
-checkout plus `docker-compose-postgresql-kafka.yml`; both are gone.)
+Fineract image is pulled from Docker Hub at a pinned tag.
+The listener however is built locally.
+
+`.env` is required: the listener refuses to start without a SecureRS API key.
 
 ## Seed
 
@@ -22,8 +24,7 @@ chmod +x Scripts/Seeding/seed-fineract.sh
 
 Needs `jq`. Writes a timestamped log to the current directory.
 
-> `seed-client.sh` is currently broken — it uses `$OFFICE_ID` / `$STAFF_ID`
-> without setting them.
+> `seed-loan.sh` currently uses `$OFFICE_ID` / `$STAFF_ID` = 1 which is created during the `seed-fineract.sh` script.
 
 ## View DB
 
@@ -33,12 +34,6 @@ docker exec -it fineract-db-1 psql -U postgres -d fineract_default
 
 Use `\dt` to list tables. The seed script touches `m_office`, `m_staff`,
 `m_client`, `m_product_loan` and `m_savings_product`.
-
-Tenant registry (rarely needed) lives in a separate database:
-
-```bash
-docker exec -it fineract-db-1 psql -U postgres -d fineract_tenants
-```
 
 ---
 
@@ -82,17 +77,15 @@ docker exec -it fineract-kafka-1 /opt/kafka/bin/kafka-console-consumer.sh \
   --max-messages 10
 ```
 
-- **Listener** — decoded and pretty-printed, which is usually what you want:
+- **Listener** — decoded and filed into SecureRS. These can be viewed after logging into SecureRS.
 
-```bash
-docker logs -f fineract-listener-1
-```
+- **SecureRS** — the far end of the pipeline. Events appear under the
+  `fineract_default` user at <https://localhost:8443/pde/>.
 
 ## Configuring Events
 
-All 131 event types are **disabled by default** — this is the single most common
-reason nothing shows up. Settings live in the tenant database, so they are lost
-on `down -v` and must be re-applied.
+All 131 event types are **disabled by default**, therefore nothing will show until we configure which events we want to listen to.
+Settings live in the tenant database, so they are lost on `down -v` and must be re-applied.
 
 See what's available to turn on:
 
@@ -148,7 +141,7 @@ manager fail startup validation.
 The listener decodes events using the `.avsc` files vendored in
 `Kafka_Listener/schemas/`, baked into its image at build time. They are a pinned
 copy from Fineract's `fineract-avro-schemas/src/main/`, matching the image tag
-in the compose file — **re-copy them if you bump that tag**.
+in the compose file.
 
 After editing `listener.py` or the schemas:
 
@@ -157,5 +150,89 @@ docker compose -f docker-compose-fineract.yml up -d --build listener
 ```
 
 Fineract's `.avsc` files use `bigdecimal` as a type alias, which is not a real
-Avro named type — `listener.py` inlines it before parsing, mirroring what the
-Gradle codegen does.
+Avro named type — `listener.py` inlines it before parsing.
+
+---
+
+# SecureRS ingestion
+
+The listener does not just print events — it files each one into the SecureRS
+evidence repository (`../Evidence Repository/SecureRS`) as a potential digital
+evidence (PDE) record.
+
+## Pipeline
+
+```
+Fineract ──▶ m_external_event ──▶ Kafka(external-events) ──▶ listener ──▶ SecureRS /pde/add/
+                                                                 │
+                                                                 └─▶ /dead-letter/events.jsonl
+```
+
+Each event becomes one JSON document — the decoded `MessageV1` envelope, the
+decoded payload, the Kafka coordinates it arrived on, and the time the listener
+observed it — POSTed as a file upload. SecureRS hashes it on the way in,
+encrypts it at rest, and gives it a random on-disk name.
+
+## Setup
+
+1. **Move SecureRS off port 8443.** `fineract-manager` already publishes 8443
+   and the workers hold 8444–8445. In `Evidence Repository/SecureRS/.env`:
+
+   ```
+   HTTPS_PORT=9443
+   SITE_URL=https://localhost:9443/
+   ENFORCE_SSL=True
+   ```
+
+   Then `docker compose up -d` that project. This is the only change the
+   SecureRS side needs, and it is a gitignored `.env`, not code.
+
+2. **Create an API key.** Log in at <https://localhost:9443/admin/> →
+   *API Key Permissions* → *API keys* → *Add*. The full `<prefix>.<secret>`
+   value is shown **once**, at creation.
+
+3. **Point the listener at it.** `cp .env.example .env`, set
+   `SECURERS_API_KEY`, then:
+
+   ```bash
+   docker compose -f docker-compose-fineract.yml up -d --build listener
+   ```
+
+Stored evidence appears under the user `fineract_default` (`fineract_` + the
+Fineract tenant id) at <https://localhost:9443/pde/>.
+
+## Field mapping
+
+`pde.models.PDE` is narrow and `pde.views.add` does no validation beyond the
+hash check. A missing or oversized field surfaces as a 500 error.
+The listener therefore clamps everything to the column widths:
+
+| PDE column | Source | Notes |
+|---|---|---|
+| `pde` | the JSON document | the evidence artefact itself |
+| `hash` / `MD5SUM` | MD5 of that document | checked twice; header must match the form field |
+| `user` | `fineract_<tenantId>` | sanitised to `\w+`, or the details page 404s |
+| `machine` | envelope `source` | truncated to 50 |
+| `ip` | resolved `fineract-manager` | IPv4 only — the column is 16 chars |
+| `rank` | `SECURERS_RANK` | placeholder `0.0` until the anomaly detector scores events |
+| `filename` | `<type>_<createdAt>_<idempotencyKey>.json` | label only; on-disk name is randomised |
+
+## Delivery guarantees
+
+Offsets are committed only after SecureRS accepts an event, so a repository
+outage replays rather than drops. The trade-off is **at-least-once**: a crash
+between the POST and the commit re-files that event, and SecureRS has no unique
+constraint to collapse the duplicate. The envelope's `idempotencyKey` is stored
+in every document, so duplicates are identifiable after the fact.
+
+Transient failures (connection refused, 5xx, an unexpected redirect) retry with
+exponential backoff. Permanent ones (403 from a bad key, or SecureRS answering
+`{"status": "Error"}`) are written to the dead-letter volume rather than
+retried forever:
+
+```bash
+docker compose -f docker-compose-fineract.yml exec listener cat /dead-letter/events.jsonl
+```
+
+Each line holds the failure reason plus the original Kafka bytes, base64'd, so
+nothing is lost.

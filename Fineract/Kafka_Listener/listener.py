@@ -1,35 +1,67 @@
-# listener.py — Fineract Kafka external-event listener with Avro decoding
+# listener.py — Fineract Kafka external-event listener with Avro decoding.
+
+import base64
+import hashlib
 import io
 import json
 import os
+import re
+import socket
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
 import fastavro
+import requests
+import urllib3
 from kafka import KafkaConsumer
 from kafka.errors import NoBrokersAvailable
 
 TOPICS = ["external-events"]
 BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "securers-ingest")
+AUTO_OFFSET_RESET = os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest")
 SCHEMA_DIRS = [
     Path(os.environ.get("AVRO_SCHEMA_DIR", "/schemas")),
     Path(os.environ.get("AVRO_TEMPLATE_DIR", "/schemas-templates")),
 ]
 
+SECURERS_URL = os.environ.get(
+    "SECURERS_URL", "https://host.docker.internal:8443/pde/add/"
+)
+SECURERS_API_KEY = os.environ.get("SECURERS_API_KEY", "").strip()
+SECURERS_TIMEOUT = float(os.environ.get("SECURERS_TIMEOUT", "30"))
+MAX_ATTEMPTS = int(os.environ.get("SECURERS_MAX_ATTEMPTS", "10"))
+DEAD_LETTER_PATH = os.environ.get("DEAD_LETTER_PATH", "").strip()
+VERBOSE = os.environ.get("LISTENER_VERBOSE", "0").lower() not in ("0", "false", "no", "off")
+
+# SecureRS uses self-signed cert generated on first start, so verification is off by default
+_CA_BUNDLE = os.environ.get("SECURERS_CA_BUNDLE", "").strip()
+if _CA_BUNDLE:
+    VERIFY = _CA_BUNDLE
+else:
+    VERIFY = os.environ.get("SECURERS_VERIFY_SSL", "0").lower() not in (
+        "0", "false", "no", "off",
+    )
+if VERIFY is False:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 CYAN = "\033[96m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
+RED = "\033[91m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
-# ── Load all .avsc schemas ───────────────────────────────────────────────────
-# Fineract uses "bigdecimal" as a type alias in .avsc files. It's not a real
-# Avro named type — it's a logical type shortcut that the Gradle codegen
-# expands. We do the same: inline-replace every "bigdecimal" reference in the
-# raw JSON before handing it to fastavro.
+
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{DIM}[{ts}]{RESET} {msg}", flush=True)
+
+
+# Load all .avsc schemas
 BIGDECIMAL_INLINE = {
     "type": "bytes",
     "logicalType": "decimal",
@@ -71,8 +103,7 @@ def load_schemas(schema_dirs) -> dict:
     if not isinstance(schema_dirs, list):
         schema_dirs = [schema_dirs]
 
-    # Collect all raw schemas and apply bigdecimal replacement
-    raw_schemas = []  # (filename, fqn, raw_dict)
+    raw_schemas = [] 
 
     for d in schema_dirs:
         if not d.exists():
@@ -93,7 +124,7 @@ def load_schemas(schema_dirs) -> dict:
     print(f"  {len(raw_schemas)} schema files to process", flush=True)
 
     named_schemas = {}
-    top_level = {}  # fqn -> parsed schema
+    top_level = {}
     pending = raw_schemas
     last_errors = {}
 
@@ -132,8 +163,6 @@ def make_serialisable(obj):
         return [make_serialisable(v) for v in obj]
     return obj
 
-
-# Avro Single Object Container magic marker (spec §12)
 AVRO_SINGLE_OBJECT_MAGIC = b'\xc3\x01'
 
 
@@ -151,70 +180,225 @@ def decode_avro(raw_bytes: bytes, schema):
     return fastavro.schemaless_reader(reader, schema)
 
 
-def print_event(msg, schemas):
-    """Decode a Fineract MessageV1 envelope and pretty-print it."""
-    ts = datetime.now().strftime("%H:%M:%S")
+# Map Fineract event to SecureRS PDE model
+IP_MAX, MACHINE_MAX, USER_MAX, FILENAME_MAX = 16, 50, 50, 200
 
-    # Decode the outer MessageV1 envelope
+def _resolve_source_ip() -> str:
+    """Best-effort origin address for the evidence.
+
+    PDE.ip is a CharField(max_length=16), so this has to be an IPv4 literal.
+    """
+    explicit = os.environ.get("SECURERS_SOURCE_IP", "").strip()
+    if explicit:
+        return explicit[:IP_MAX]
+    try:
+        return socket.gethostbyname(
+            os.environ.get("FINERACT_HOST", "fineract-manager")
+        )[:IP_MAX]
+    except OSError:
+        return "0.0.0.0"
+
+
+SOURCE_IP = _resolve_source_ip()
+MACHINE_OVERRIDE = os.environ.get("SECURERS_MACHINE", "").strip()
+USER_OVERRIDE = os.environ.get("SECURERS_USER", "").strip()
+# TODO:Placeholder relevance score until the anomaly detector scores events
+RANK = float(os.environ.get("SECURERS_RANK", "0.0"))
+
+
+def _as_user(tenant_id: str) -> str:
+    """SecureRS routes per-user detail pages through `details/(?P<user>\\w+)$`,
+    so anything outside [A-Za-z0-9_] would make the stored evidence
+    unreachable from the UI."""
+    raw = USER_OVERRIDE or f"fineract_{tenant_id or 'unknown'}"
+    return (re.sub(r"\W+", "_", raw) or "fineract")[:USER_MAX]
+
+
+def _as_filename(event_type: str, created_at: str, idempotency_key: str) -> str:
+    stem = f"{event_type}_{created_at}_{idempotency_key}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", stem)[:FILENAME_MAX] + ".json"
+
+
+def build_record(msg, schemas):
+    """Decode a MessageV1 envelope into the payload SecureRS expects.
+
+    Returns a dict of POST fields plus the document bytes, or None if the
+    message could not be decoded (caller dead-letters those).
+    """
     envelope_schema = schemas.get("org.apache.fineract.avro.MessageV1")
     if envelope_schema is None:
-        print(f"{YELLOW}[{ts}] ⚠ MessageV1 schema not loaded — raw dump:{RESET}", flush=True)
-        print(msg.value[:300], flush=True)
-        return
+        return None, "MessageV1 schema not loaded"
 
     try:
         envelope = decode_avro(msg.value, envelope_schema)
     except Exception as e:
-        print(f"{YELLOW}[{ts}] ⚠ Envelope decode failed ({e}) — raw bytes:{RESET}", flush=True)
-        print(msg.value[:300], flush=True)
-        return
+        return None, f"envelope decode failed: {e}"
 
-    event_type = envelope.get("type", "?")
-    category = envelope.get("category", "?")
-    created = envelope.get("createdAt", "?")
     data_schema_name = envelope.get("dataschema", "")
-
-    # Header
-    print(f"\n{CYAN}{'─' * 72}{RESET}", flush=True)
-    print(f"{BOLD}{GREEN}[{ts}] {event_type}{RESET}", flush=True)
-    print(f"  {DIM}category:{RESET}  {category}", flush=True)
-    print(f"  {DIM}created:{RESET}   {created}", flush=True)
-    print(f"  {DIM}tenant:{RESET}    {envelope.get('tenantId', '?')}", flush=True)
-    print(f"  {DIM}schema:{RESET}    {data_schema_name}", flush=True)
-    print(f"  {DIM}topic:{RESET}     {msg.topic}  p={msg.partition}  o={msg.offset}", flush=True)
-
-    # Decode the inner data payload
     inner_bytes = envelope.get("data")
-    if inner_bytes and data_schema_name and data_schema_name in schemas:
+    payload, payload_error = None, None
+    if inner_bytes and data_schema_name in schemas:
         try:
-            payload = decode_avro(inner_bytes, schemas[data_schema_name])
-            payload = make_serialisable(payload)
-            # Filter out null fields for readability
-            payload = {k: v for k, v in payload.items() if v is not None}
-            print(f"  {DIM}payload:{RESET}", flush=True)
-            print(json.dumps(payload, indent=4, default=str), flush=True)
+            payload = make_serialisable(decode_avro(inner_bytes, schemas[data_schema_name]))
         except Exception as e:
-            print(f"  {YELLOW}payload decode failed: {e}{RESET}", flush=True)
-            print(f"  raw data bytes ({len(inner_bytes)}): {inner_bytes[:200]}", flush=True)
+            payload_error = f"payload decode failed: {e}"
     elif inner_bytes:
-        print(f"  {YELLOW}schema '{data_schema_name}' not loaded — raw data ({len(inner_bytes)} bytes){RESET}",
-              flush=True)
-    else:
-        print(f"  {DIM}(no data payload){RESET}", flush=True)
+        payload_error = f"schema '{data_schema_name}' not loaded"
+
+    document = {
+        "event": {k: v for k, v in envelope.items() if k != "data"},
+        "payload": payload,
+        "kafka": {
+            "topic": msg.topic,
+            "partition": msg.partition,
+            "offset": msg.offset,
+            "timestamp": msg.timestamp,
+        },
+        "capture": {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "listener_group": GROUP_ID,
+            "payload_error": payload_error,
+        },
+    }
+    if payload_error:
+        document["payload_raw_b64"] = base64.b64encode(inner_bytes or b"").decode()
+
+    blob = json.dumps(document, indent=2, sort_keys=True, default=str).encode("utf-8")
+    digest = hashlib.md5(blob).hexdigest()
+
+    event_type = str(envelope.get("type", "UnknownEvent"))
+    filename = _as_filename(
+        event_type,
+        str(envelope.get("createdAt", "")),
+        str(envelope.get("idempotencyKey", f"{msg.partition}-{msg.offset}")),
+    )
+
+    return {
+        "blob": blob,
+        "digest": digest,
+        "filename": filename,
+        "event_type": event_type,
+        "category": str(envelope.get("category", "?")),
+        "fields": {
+            "ip": SOURCE_IP,
+            "machine": (MACHINE_OVERRIDE or str(envelope.get("source", "fineract")))[:MACHINE_MAX],
+            "user": _as_user(str(envelope.get("tenantId", ""))),
+            "rank": str(RANK),
+            "filename": filename,
+            "md5sum": digest,
+        },
+    }, None
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# Submit
+SESSION = requests.Session()
+
+def submit_once(record):
+    """POST one record. Returns (ok, retryable, detail)."""
+    try:
+        response = SESSION.post(
+            SECURERS_URL,
+            data=record["fields"],
+            files={"pde": (record["filename"], record["blob"], "application/json")},
+            headers={
+                "X-API-KEY": SECURERS_API_KEY,
+                "MD5SUM": record["digest"],
+            },
+            timeout=SECURERS_TIMEOUT,
+            verify=VERIFY,
+            # SecureRS sets SECURE_SSL_REDIRECT, so an http:// URL answers 301.
+            # Following it would silently replay the POST as a bodyless GET so we surface it as an error instead.
+            allow_redirects=False,
+        )
+    except requests.exceptions.RequestException as e:
+        return False, True, f"{type(e).__name__}: {e}"
+
+    if response.is_redirect:
+        location = response.headers.get("Location", "?")
+        return False, True, (
+            f"HTTP {response.status_code} redirect to {location} — "
+            "SECURERS_URL is probably http:// against an ENFORCE_SSL=True instance"
+        )
+    if response.status_code >= 500:
+        return False, True, f"HTTP {response.status_code}"
+    if response.status_code >= 400:
+        return False, False, f"HTTP {response.status_code}: {response.text[:200]}"
+
+    try:
+        body = response.json()
+    except ValueError:
+        return False, False, f"non-JSON response: {response.text[:200]}"
+
+    if body.get("status") == "Success":
+        return True, False, ""
+    return False, False, f"rejected: {body}"
+
+
+def submit(record):
+    """Retry transient failures with capped exponential backoff."""
+    delay, detail = 1.0, "no attempt made"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        ok, retryable, detail = submit_once(record)
+        if ok:
+            return True, ""
+        if not retryable:
+            return False, detail
+        log(f"{YELLOW}retry {attempt}/{MAX_ATTEMPTS} in {delay:.0f}s — {detail}{RESET}")
+        time.sleep(delay)
+        delay = min(delay * 2, 60.0)
+    return False, f"gave up after {MAX_ATTEMPTS} attempts — {detail}"
+
+
+def dead_letter(msg, reason, record=None):
+    """Park an event we could not file, so nothing is lost silently."""
+    log(f"{RED}✗ DEAD-LETTER p{msg.partition} o{msg.offset} — {reason}{RESET}")
+    if not DEAD_LETTER_PATH:
+        return
+    entry = {
+        "reason": reason,
+        "topic": msg.topic,
+        "partition": msg.partition,
+        "offset": msg.offset,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "raw_b64": base64.b64encode(msg.value or b"").decode(),
+    }
+    if record:
+        entry["filename"] = record["filename"]
+        entry["md5"] = record["digest"]
+    try:
+        path = Path(DEAD_LETTER_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError as e:
+        log(f"{RED}  could not write dead-letter file: {e}{RESET}")
+
+
+# Main
+if not SECURERS_API_KEY:
+    raise SystemExit(
+        "SECURERS_API_KEY is not set. Create an API key in the SecureRS admin "
+        "(https://localhost:8443/admin/ -> API Key Permissions -> API keys) and "
+        "pass the full '<prefix>.<secret>' value."
+    )
+
 print(f"{BOLD}Loading Avro schemas from {SCHEMA_DIRS}...{RESET}", flush=True)
 schemas = load_schemas(SCHEMA_DIRS)
 print(f"Loaded {len(schemas)} schemas", flush=True)
+
+print(f"{BOLD}SecureRS target{RESET}  {SECURERS_URL}", flush=True)
+print(f"  {DIM}tls verify:{RESET} {VERIFY}", flush=True)
+print(f"  {DIM}attributed:{RESET} ip={SOURCE_IP} rank={RANK}", flush=True)
+print(f"  {DIM}dead-letter:{RESET} {DEAD_LETTER_PATH or '(disabled — failures are logged only)'}", flush=True)
 
 consumer = None
 while consumer is None:
     try:
         consumer = KafkaConsumer(
             bootstrap_servers=BOOTSTRAP,
-            auto_offset_reset="earliest",
-            group_id="debug-listener",
+            auto_offset_reset=AUTO_OFFSET_RESET,
+            group_id=GROUP_ID,
+            enable_auto_commit=False,
         )
         print(f"{GREEN}Connected to Kafka at {BOOTSTRAP}{RESET}", flush=True)
     except NoBrokersAvailable:
@@ -222,15 +406,30 @@ while consumer is None:
         time.sleep(5)
 
 consumer.subscribe(TOPICS)
-print(f"Subscribed to: {TOPICS}", flush=True)
+print(f"Subscribed to: {TOPICS} as group '{GROUP_ID}'", flush=True)
 print(f"{CYAN}Waiting for events...{RESET}\n", flush=True)
 
 for msg in consumer:
-    if msg.topic == "external-events":
-        print_event(msg, schemas)
+    if msg.topic not in TOPICS:
+        consumer.commit()
+        continue
+
+    record, error = build_record(msg, schemas)
+    if record is None:
+        dead_letter(msg, error)
+        consumer.commit()
+        continue
+
+    ok, detail = submit(record)
+    if ok:
+        log(
+            f"{GREEN}✓{RESET} {BOLD}{record['event_type']}{RESET} "
+            f"{DIM}{record['category']}  p{msg.partition} o{msg.offset}  "
+            f"{len(record['blob'])}B  md5={record['digest'][:8]}…{RESET}"
+        )
+        if VERBOSE:
+            print(record["blob"].decode("utf-8"), flush=True)
     else:
-        # job-topic messages — just print basic info
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"\n{DIM}[{ts}] job-topic  p={msg.partition}  o={msg.offset}  "
-              f"len={len(msg.value)}{RESET}", flush=True)
-        print(f"  {msg.value[:200]}", flush=True)
+        dead_letter(msg, detail, record)
+
+    consumer.commit()
