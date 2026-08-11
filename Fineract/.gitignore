@@ -1,0 +1,6 @@
+# Local compose overrides (machine-specific). The committed setup needs no
+# .env -- Avro schemas are vendored into the listener image.
+.env
+
+# Seed script output
+seed-fineract-*.log

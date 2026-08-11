@@ -1,0 +1,72 @@
+services:
+  kafka:
+    image: "apache/kafka:4.2.0-rc2"
+    ports:
+      - "9092:9092"
+    env_file:
+      - ./config/docker/env/kafka-server.env
+
+  db:
+    extends:
+      file: ./config/docker/compose/postgresql.yml
+      service: postgresql
+
+  fineract-manager:
+    image: apache/fineract:fd8fc8929
+    ports:
+      - "8443:8443"
+    volumes:
+      - fineract-plugins:/app/plugins
+    healthcheck:
+      # The Fineract image is Alpine/busybox based and ships no curl -- use the
+      # busybox wget applet instead (-O - so a failed fetch exits non-zero).
+      test: ["CMD", "busybox", "wget", "--no-check-certificate", "-q", "-O", "-", "https://localhost:8443/fineract-provider/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    env_file:
+      - ./config/docker/env/fineract-manager.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-postgresql.env
+      - ./config/docker/env/kafka-client.env
+
+  fineract-worker:
+    image: apache/fineract:fd8fc8929
+    deploy:
+      mode: replicated
+      replicas: 1
+    ports:
+      - "8444-8445:8443"
+    volumes:
+      - fineract-plugins:/app/plugins
+    depends_on:
+      fineract-manager:
+        condition: service_healthy
+    env_file:
+      - ./config/docker/env/fineract-worker.env
+      - ./config/docker/env/fineract-common.env
+      - ./config/docker/env/fineract-postgresql.env
+      - ./config/docker/env/kafka-client.env
+
+  listener:
+    build:
+      context: ./Kafka_Listener
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # Schemas are baked into the image (see Kafka_Listener/Dockerfile), so no
+      # local Fineract checkout is needed. These are needed to interpret kafka events.
+      - AVRO_SCHEMA_DIR=/schemas
+      - AVRO_TEMPLATE_DIR=/schemas/avro-templates
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+volumes:
+  fineract-plugins:

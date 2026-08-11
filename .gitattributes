@@ -1,0 +1,27 @@
+# Normalise line endings on checkout regardless of each developer's
+# core.autocrlf setting (Git for Windows defaults it to "true").
+#
+# This matters beyond cosmetics for shell scripts run inside containers:
+# the Postgres entrypoint executes config/docker/postgresql/
+# docker-entrypoint-initdb.d/01-init.sh, and a CR at the end of the shebang
+# (or of the "EOSQL" heredoc terminator) stops it running -- which silently
+# leaves the fineract_tenants database uncreated.
+#
+# Compose v2 does strip CR from env_file values, so *.env is normalised for
+# consistency rather than to fix a live bug.
+
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.env   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.avsc  text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+
+Dockerfile text eol=lf
+
+# Windows-only helpers, if any are added later, must keep CRLF.
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
