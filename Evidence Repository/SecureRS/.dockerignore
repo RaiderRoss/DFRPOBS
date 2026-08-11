@@ -1,0 +1,29 @@
+# Keep the build context small and stop host state leaking into the image.
+# Runtime state lives on named volumes (see docker-compose.yml) -- copying it
+# in here would shadow the mounts on a fresh container.
+.git
+.gitattributes
+.gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime state -- provided by volumes.
+db.sqlite3
+data/
+certs/
+media/
+
+# Docs and fixtures that don't belong in the runtime image.
+UserManual.pdf
+screenshots/
+one.img
+LICENSE
+README.md
+
+# Local envs and secrets.
+.env
+.venv
+venv/
+env/
+*.log

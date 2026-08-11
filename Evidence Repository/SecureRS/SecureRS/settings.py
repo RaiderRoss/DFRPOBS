@@ -29,6 +29,21 @@ DEBUG = True
 # @TODO CHANGE TO ONLY ALLOW PRODUCTION SERVER DOMAINS and IPs
 ALLOWED_HOSTS = ['*']
 
+
+def _env_flag(name, default=True):
+    """Read a boolean from the environment, defaulting to the secure value."""
+    raw = os.environ.get(name, '').strip()
+    if not raw:  # unset or empty is treated as "not configured"
+        return default
+    return raw.lower() not in ('0', 'false', 'no', 'off')
+
+
+# SECURITY WARNING: development escape hatches. Both MUST be left at their
+# default (True) for any non-local deployment. Set ENFORCE_2FA=0 to drop the
+# OTP challenges, ENFORCE_SSL=0 to allow plain HTTP.
+ENFORCE_2FA = _env_flag('ENFORCE_2FA')
+ENFORCE_SSL = _env_flag('ENFORCE_SSL')
+
 # Application definition
 PROJECT_NAME = 'SecureRS'
 
@@ -108,7 +123,9 @@ WSGI_APPLICATION = 'SecureRS.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        # DB_PATH lets the container point the database at a mounted volume so
+        # it survives image rebuilds. Unset falls back to the project root.
+        'NAME': os.environ.get('DB_PATH') or os.path.join(BASE_DIR, 'db.sqlite3'),
     }
 }
 
@@ -165,20 +182,27 @@ LOGIN_URL = 'two_factor:login'
 LOGIN_REDIRECT_URL = 'two_factor:profile'
 LOGOUT_REDIRECT_URL = '/'
 
-SECURE_SSL_REDIRECT = True
-SECURE_HSTS_SECONDS = 60
-SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_SSL_REDIRECT = ENFORCE_SSL
+SECURE_HSTS_SECONDS = 60 if ENFORCE_SSL else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = ENFORCE_SSL
 SECURE_FRAME_DENY = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_BROWSER_XSS_FILTER = True
-SESSION_COOKIE_SECURE = True
+# Secure-only cookies are never sent over plain HTTP, which silently breaks
+# login when the app is served without TLS.
+SESSION_COOKIE_SECURE = ENFORCE_SSL
+CSRF_COOKIE_SECURE = ENFORCE_SSL
 SESSION_COOKIE_HTTPONLY = True
 
 
-DEFAULT_FILE_STORAGE = "randomfilestorage.storage.RandomFileSystemStorage"
+# In-project replacement for randomfilestorage, which is Django<1.11 only.
+# See handler/storage.py.
+DEFAULT_FILE_STORAGE = "handler.storage.RandomFileSystemStorage"
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
 
-SITE_URL = "https://localhost:8000/"
+# Used to build absolute PDE download links (pde/serializers.py), so it has to
+# match the port the app is actually published on. Trailing slash required.
+SITE_URL = os.environ.get('SITE_URL') or "https://localhost:8443/"
 
 REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (

@@ -169,10 +169,52 @@ def test_receiver(request, user, device, **kwargs):
         user.email_user(subject='Backup token used', message=message)
 
 
+def otp_required_if_enforced(view):
+    """Apply @otp_required unless 2FA has been disabled for development."""
+    if settings.ENFORCE_2FA:
+        return otp_required(view)
+    return view
+
+
+def serve_pde(request, path):
+    """Decrypt and return the requested PDE, notifying the owner by email.
+
+    Access control only: staff may fetch any PDE, everyone else is limited to
+    their own. Callers are responsible for any authentication checks.
+    """
+    if request.user.is_staff:
+        pde = PDE.objects.all()
+    else:
+        pde = PDE.objects.filter(user=request.user.get_username())
+    for p in pde:
+        if p.pde == "pde/files/"+path:
+            f = EncryptedFile(p.pde)
+            content = f.read()
+            m = hashlib.md5()
+            m.update(content)
+            message = 'Hi %(username)s,\n\n' \
+                    'You\'ve verified yourself and just downloaded a PDE file with the following details: \n\n' \
+                    'File: %(path)s\n' \
+                    'MD5: %(md5)s\n' \
+                    % {'username': request.user.get_username(), 'path': path, 'md5': m.hexdigest()}
+            request.user.email_user(
+                subject='PDE Download Success', message=message)
+
+            response = HttpResponse(content, content_type=magic.Magic(
+                mime=True).from_buffer(content))
+            response['Content-Disposition'] = 'attachment; filename=' + path
+            return response
+
+    return HttpResponse(status=404)
+
+
 @login_required
-@otp_required
+@otp_required_if_enforced
 @csrf_protect
 def get(request, path, ):
+    if not settings.ENFORCE_2FA:
+        return serve_pde(request, path)
+
     msg = ""
     if request.method == "POST":
         token = request.POST.get("token", None)
@@ -180,37 +222,14 @@ def get(request, path, ):
         print(token)
         if token:  # token
             if django_otp.match_token(request.user, token):
-                if request.user.is_staff:
-                    pde = PDE.objects.all()
-                else:
-                    pde = PDE.objects.filter(user=request.user.get_username())
-                for p in pde:
-                    if p.pde == "pde/files/"+path:
-                        f = EncryptedFile(p.pde)
-                        content = f.read()
-                        m = hashlib.md5()
-                        m.update(content)
-                        message = 'Hi %(username)s,\n\n' \
-                                'You\'ve verified yourself and just downloaded a PDE file with the following details: \n\n' \
-                                'File: %(path)s\n' \
-                                'MD5: %(md5)s\n' \
-                                % {'username': request.user.get_username(), 'path': path, 'md5': m.hexdigest()}
-                        request.user.email_user(
-                            subject='PDE Download Success', message=message)
-
-                        response = HttpResponse(content, content_type=magic.Magic(
-                            mime=True).from_buffer(content))
-                        response['Content-Disposition'] = 'attachment; filename=' + path
-                        return response
-
-                return HttpResponse(status=404)
+                return serve_pde(request, path)
             else:
                 msg = "Invalid token, please try again."
         else:
             msg = "Invalid token, please try again."
-    
+
     context = {
         'dfi': request.user,
         'message': msg,
     }
-    return render(request, 'pde/otp.html', context) 
+    return render(request, 'pde/otp.html', context)

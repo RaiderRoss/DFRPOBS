@@ -24,7 +24,8 @@ from django.conf import settings
 from django.views.static import serve
 from django.contrib.auth.views import LogoutView
 
-admin.site.__class__ = AdminSiteOTPRequired
+if settings.ENFORCE_2FA:
+    admin.site.__class__ = AdminSiteOTPRequired
 admin.site.enable_nav_sidebar = False
 
 urlpatterns = [

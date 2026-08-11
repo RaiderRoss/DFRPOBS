@@ -1,15 +1,22 @@
-FROM python:3.7
+FROM python:3.11-slim
 
-ADD . /SecureRS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libmagic1 \
+        build-essential \
+        openssl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /SecureRS
 
-RUN pip3 install -r requirements.txt
-CMD [ "python", "manage.py", "makemigrations", "home" ]
-CMD [ "python", "manage.py", "migrate" ]
-RUN echo "from django.contrib.auth.models import User; User.objects.create_superuser('admin', 'admin@example.com', 'admin')" | python manage.py shell
-CMD [ "python", "manage.py", "runsslserver", "0.0.0.0:443" ]
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+RUN chmod +x entrypoint.sh
 
 EXPOSE 443/tcp
+# Plain-HTTP port, used only when ENFORCE_SSL=0 (development).
+EXPOSE 8000/tcp
 
-MAINTAINER Avinash tashan.avi@gmail.com
+ENTRYPOINT ["./entrypoint.sh"]
