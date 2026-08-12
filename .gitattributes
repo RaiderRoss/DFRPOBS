@@ -1,0 +1,36 @@
+# Normalise line endings across the project.
+#
+# This repo is worked on from both WSL (git with core.autocrlf unset) and
+# Windows (git installs default to core.autocrlf=true). Without this file,
+# Windows git reports every LF-terminated file as modified because it intends
+# to rewrite it as CRLF — phantom diffs with zero line changes.
+#
+# Worse, a commit made through Windows git would store CRLF endings, and shell
+# scripts with CRLF fail inside Linux containers with:
+#     /usr/bin/env: 'bash\r': No such file or directory
+#
+# eol=lf forces LF in the working tree on every platform, so the shell scripts
+# in Fineract/Scripts, Anomaly Detection/Scripts and Fineract/Seeding stay
+# executable wherever they are checked out.
+
+* text=auto eol=lf
+
+# Explicit for the executable content, so intent is obvious on review.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.gradle text eol=lf
+
+# Never touch binaries.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.pcap binary
+*.rdb  binary
+*.tar  binary
+*.gz   binary
+*.zip  binary
