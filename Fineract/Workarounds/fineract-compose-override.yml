@@ -1,0 +1,21 @@
+# Workaround for the Bitnami Docker Hub catalog migration (August 2025).
+#
+# Bitnami moved all versioned image tags out of the `bitnami` namespace into
+# `bitnamilegacy`, leaving only rolling `latest` tags behind. The pinned tag
+# bitnami/kafka:3.5.1-debian-11-r7 that Fineract 1.9.0 references therefore
+# returns "manifest unknown" and `docker compose up` fails outright.
+#
+# bitnamilegacy/kafka:3.5.1-debian-11-r7 is the same image (linux/amd64), so
+# the KAFKA_CFG_* environment contract in config/docker/env/kafka-server.env
+# is unchanged.
+#
+# Layered with a second -f flag so the Fineract working tree stays unmodified:
+#
+#   docker compose -f docker-compose-postgresql-kafka.yml \
+#                  -f <this file> up -d
+#
+# Fineract/Scripts/fineract-up.sh does this for you.
+
+services:
+  kafka:
+    image: "bitnamilegacy/kafka:3.5.1-debian-11-r7"
