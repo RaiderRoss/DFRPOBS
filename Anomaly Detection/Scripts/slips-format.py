@@ -47,9 +47,45 @@ def main() -> int:
     # medium/high findings that matter, so --brief leads with severity and
     # collapses info to a count.
     brief = "--brief" in sys.argv
+    # --stream prints each finding the moment it arrives, for `tail -f`.
+    # The default path buffers all of stdin so it can sort and summarise,
+    # which never terminates against a live log.
+    stream = "--stream" in sys.argv
 
     def c(code: str) -> str:
         return code if color else ""
+
+    def render(level: str, clock: str, tw: str, src: str, desc: str) -> str:
+        col, glyph = LEVELS.get(level, (DIM, "·"))
+        return (
+            f"  {c(col)}{glyph} {level:<8}{c(RESET)}"
+            f"{c(DIM)}{clock}  TW{tw}  {src:<15}{c(RESET)} {desc}"
+        )
+
+    def parse(raw: str):
+        m = LINE.match(raw.strip())
+        if not m:
+            return None
+        ts = m.group("ts")
+        clock = ts.split("T")[1][:8] if "T" in ts else ts[:8]
+        return (
+            m.group("level").lower(),
+            clock,
+            m.group("tw"),
+            m.group("src"),
+            m.group("desc"),
+        )
+
+    if stream:
+        for raw in sys.stdin:
+            if not raw.strip():
+                continue
+            parsed = parse(raw)
+            if parsed:
+                print(render(*parsed), flush=True)
+            else:
+                print(f"    {c(DIM)}{raw.strip()}{c(RESET)}", flush=True)
+        return 0
 
     counts: Counter = Counter()
     rows = []
@@ -117,4 +153,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # Ctrl-C out of a live tail is the normal way to stop, not a crash.
+        sys.exit(130)
+    except BrokenPipeError:
+        # Downstream closed (e.g. piped into head); exit quietly.
+        sys.exit(0)

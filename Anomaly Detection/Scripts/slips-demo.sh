@@ -43,7 +43,14 @@ hr
 # ---------------------------------------------------------------
 head_ "[1/5] Preparing"
 docker rm -f slips slips-redis >/dev/null 2>&1
-rm -rf "$OUT"; mkdir -p "$OUT"
+
+# Slips writes as root inside the container, so its output is root-owned on
+# the host and a plain `rm -rf` fails with "Permission denied" on the
+# databases/ and redis/ subdirectories. Clear it from inside a container,
+# which is also root, rather than requiring sudo.
+mkdir -p "$OUT"
+docker run --rm -v "$OUT":/output "$IMG" \
+    bash -c 'rm -rf /output/* /output/.[!.]* 2>/dev/null; exit 0' >/dev/null 2>&1
 
 MYIP=$(ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
 if [ -z "$MYIP" ]; then
