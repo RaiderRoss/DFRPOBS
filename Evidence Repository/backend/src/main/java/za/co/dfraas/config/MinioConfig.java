@@ -1,9 +1,10 @@
 package za.co.dfraas.config;
 
-import io.minio.MinioClient;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
+import io.minio.MinioClient;
 
 /**
  * Builds the MinIO client used for evidence blob storage.

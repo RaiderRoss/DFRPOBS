@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+  DFRaaS Checkstyle ruleset.
+
+  Deliberately narrow: it catches things that are bugs or that reviewers would flag
+  anyway, and leaves pure formatting to Spotless so the two tools never disagree.
+  Add rules as the codebase grows rather than starting from sun_checks/google_checks,
+  which would bury real findings in style noise.
+-->
+<module name="Checker">
+	<property name="severity" value="error"/>
+	<property name="fileExtensions" value="java"/>
+	<!-- Must match Spotless spacesPerTab, or LineLength scores every tab as 8 columns. -->
+	<property name="tabWidth" value="4"/>
+
+	<!-- No tabs-vs-spaces rule here: Spotless owns indentation. -->
+
+	<module name="TreeWalker">
+
+		<!-- Imports -->
+		<module name="UnusedImports"/>
+		<module name="RedundantImport"/>
+		<module name="AvoidStarImport"/>
+		<module name="IllegalImport"/>
+
+		<!-- Correctness -->
+		<module name="EqualsHashCode"/>
+		<module name="StringLiteralEquality"/>
+		<module name="EmptyStatement"/>
+		<module name="FallThrough"/>
+		<module name="MissingSwitchDefault"/>
+		<module name="SimplifyBooleanExpression"/>
+		<module name="SimplifyBooleanReturn"/>
+		<module name="NoFinalizer"/>
+		<module name="CovariantEquals"/>
+		<module name="DefaultComesLast"/>
+		<module name="IllegalThrows"/>
+		<module name="ModifiedControlVariable"/>
+
+		<!-- Readability -->
+		<module name="NeedBraces"/>
+		<module name="OneTopLevelClass"/>
+		<module name="UpperEll"/>
+		<module name="ModifierOrder"/>
+		<module name="ArrayTypeStyle"/>
+		<module name="OuterTypeFilename"/>
+
+		<!-- Naming -->
+		<module name="TypeName"/>
+		<module name="MethodName"/>
+		<module name="MemberName"/>
+		<module name="ParameterName"/>
+		<module name="LocalVariableName"/>
+		<module name="ConstantName">
+			<!-- Allow the conventional SLF4J field name alongside SCREAMING_SNAKE_CASE. -->
+			<property name="format" value="^(log|logger|[A-Z][A-Z0-9]*(_[A-Z0-9]+)*)$"/>
+		</module>
+		<module name="PackageName"/>
+	</module>
+
+	<module name="LineLength">
+		<property name="max" value="120"/>
+		<!-- Long URLs in Javadoc and import statements cannot usefully be wrapped. -->
+		<property name="ignorePattern" value="^package .*|^import .*|^\s*\*\s*&lt;?https?://"/>
+	</module>
+
+	<module name="NewlineAtEndOfFile"/>
+	<module name="FileTabCharacter">
+		<property name="eachLine" value="false"/>
+		<property name="severity" value="ignore"/>
+	</module>
+</module>

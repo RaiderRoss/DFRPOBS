@@ -42,8 +42,6 @@ public class EvidenceEventConsumer {
 			@Header(KafkaHeaders.RECEIVED_PARTITION) int partition,
 			@Header(KafkaHeaders.OFFSET) long offset) {
 
-		// The key is the partition key — currently workGroupId, pending the composite-key
-		// decision noted in the README.
 		log.info("Received evidence event: key={} partition={} offset={} bytes={}",
 				key, partition, offset, payload.length());
 

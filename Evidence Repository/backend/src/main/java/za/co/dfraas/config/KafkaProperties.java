@@ -1,6 +1,7 @@
 package za.co.dfraas.config;
 
 import jakarta.validation.constraints.NotBlank;
+
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
@@ -13,4 +14,5 @@ import org.springframework.validation.annotation.Validated;
 @Validated
 @ConfigurationProperties(prefix = "dfraas.kafka")
 public record KafkaProperties(@NotBlank String evidenceEventsTopic) {
+
 }

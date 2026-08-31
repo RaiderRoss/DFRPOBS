@@ -9,18 +9,11 @@ Design is inspired by two references:
 
 The system is being adapted from both — K-FFRaaS shapes the domain model and process states, SecureRS shapes the ingestion/storage/integrity mechanics — and modified/scaled for finance-sector use rather than used as-is.
 
-## Base architecture (layered, Java + Vue)
+## Base architecture (Java)
 Backend (Java, Spring Boot) is layered as:
 `SecurityConfiguration → _Resource (API layer) → _Service (business logic) → _Repository (persistence) → Entity`, with `DTO` + `Mapper` classes shaping what the API exposes, and Liquibase (`Master.xml` + changesets) managing schema.
 
-Frontend (Vue) follows: `Index.ts → .vue views / .component.ts controllers → .Service.ts`, calling the backend API layer.
-
-## Key design decision: readiness vs. investigation are separate
-Evidence collection happens continuously and automatically (K-FFRaaS "readiness"), independent of whether any formal investigation ever occurs. A **Case** is a separate, later concept that could allow linking of evidence via a many-to-many join.
-
-**Case is deferred as an optional future extension.** Current focus is the evidence/integrity/custody core only.
-
-## Current data model (core, Case excluded for now)
+## Current data model
 - **WorkGroup** — `id, name, classificationCode` — the business-unit classification evidence is tagged with (K-FFRaaS concept).
 - **TriggerEvent** — `id, sourceSystem, triggerType, firedAt` — the SIEM/IDS alert that caused ingestion.
 - **EvidenceItem** — `id, workGroupId, triggerEventId, storageRef, currentHash, status` — the hub entity; references the stored object and its current integrity state.
@@ -28,17 +21,6 @@ Evidence collection happens continuously and automatically (K-FFRaaS "readiness"
 - **IntegrityCheck** — `id, evidenceItemId, computedHash, matchesStored, checkedAt` — periodic/on-demand re-verification, separate from custody events, matching SecureRS's verify-on-read pattern.
 - **AppUser** — `id, username, role, mfaEnabled`.
 - **AccessLog** — `id, evidenceItemId, userId, action, occurredAt` — every read/view, logged separately from custody-changing actions (compliance requirement).
-
-**Deferred (future extension):**
-- **Case** — `id, caseNumber, status, openedAt`
-- **CaseEvidenceLink** — `id, caseId, evidenceItemId, linkedByUserId, linkedAt` — join entity; an evidence item can belong to multiple cases and vice versa.
-
-**Decided:** `EvidenceStatus` / `CustodyAction` are **Postgres native enum types** (`CREATE TYPE ... AS ENUM`), chosen for DB-level integrity given the compliance context. Consequences to plan for (verified against Postgres 16.15):
-
-- JPA needs `@JdbcTypeCode(SqlTypes.NAMED_ENUM)` on those fields.
-- `ALTER TYPE ... ADD VALUE` *does* run inside a transaction on PG12+, but the new value **cannot be used in that same transaction** (`ERROR: unsafe use of new value`). So a changeset that adds a status and then backfills rows to it must be split into two changesets.
-- There is no `DROP VALUE` in Postgres. Removing a value means recreating the type and rewriting every dependent column, so rollbacks are effectively forward-only.
-- Net effect: the value set is expensive to change after the fact, which raises the cost of guessing wrong up front — see open question 1.
 
 ## Storage & infrastructure
 - **MinIO** — evidence blob storage (object storage), referenced by `EvidenceItem.storageRef`. Should use envelope encryption via a real KMS/HSM (not a static key in config, which is what the SecureRS prototype does).
@@ -58,16 +40,15 @@ Evidence collection happens continuously and automatically (K-FFRaaS "readiness"
 - Compliance target is jurisdiction-appropriate (e.g. POPIA/GDPR/SOC 2/PCI-DSS as relevant) rather than CJIS, which is US law-enforcement specific.
 - Schema migrations are themselves auditable events — reviewed and versioned carefully.
 
-## Project scaffolding decisions
-- **Mono-repo**: `/backend` (Spring Boot/Java), `/frontend` (Vue/Vite), `/docs/architecture` (diagrams), `docker-compose.yml` at repo root.
-- **Backend packages** mirror the layered architecture: `config, resource, service, repository, entity, dto, mapper`.
-- **Liquibase** changelog structure: `db.changelog-master.xml` includes numbered changesets under `changes/`. First changesets built: `0000-enable-extensions` (pgcrypto for `gen_random_uuid()`) and `0001-create-work-group-table` (with seed data), each with rollback blocks. Files live at `backend/src/main/resources/liquibase/`.
+## Project scaffolding
+- **Mono-repo**: `/backend` (Spring Boot/Java), `/frontend`, `/docs` (diagrams), `docker-compose.yml` at repo root.
+- **Backend packages** mirror the layered architecture: `config, resource, service, repository, entity, dto, mapper`, plus `exception` for the domain exceptions the service layer raises and the API layer translates.
+- **Liquibase** changelog structure: `db.changelog-master.xml` includes numbered changesets under `changes/`.
 - **Local dev stack** (`docker-compose.yml`, repo root): Postgres, MinIO (+ auto bucket-creation init container), Redpanda (+ console UI for topic inspection).
-- **Conventions locked early**: Spotless/Checkstyle (Java), ESLint + Prettier (Vue), enforced before feature code is written.
 
 ## Running locally
 
-Prerequisites: JDK 21, Docker, and the bundled Maven wrapper (no local Maven needed).
+Prerequisites: JDK 21, Docker, and the bundled Maven wrapper.
 
 ```bash
 cp .env.example .env          # dev-only placeholder credentials
@@ -75,7 +56,7 @@ docker compose up -d          # Postgres, MinIO (+bucket), Redpanda (+console)
 cd backend && ./mvnw spring-boot:run
 ```
 
-Liquibase applies `0000` and `0001` on first boot; the app then listens on 8080.
+Liquibase applies liquibase changes on first boot, the app then listens on 8080.
 `./mvnw test` runs the suite against Testcontainers and needs no running stack.
 
 | Service          | URL / port                    | Dev credentials             |
@@ -99,14 +80,9 @@ host while its dependencies run in Docker:
   would connect once and then fail on the unresolvable `redpanda` hostname — which is why
   9092 is deliberately not published to the host.
 
-If backend is later containerised itself, it will join the compose network and should
-switch to `redpanda:9092` and `postgres:5432`.
+All credentials above are dev-only placeholders
 
-All credentials above are dev-only placeholders and are overridden by environment
-variables in any real deployment — see `.env.example` for the full list.
-
-## Open questions to resolve next
+## Open questions
 1. Whether WorkGroup classification on ingest is fully automated (mapping table from SIEM alert type) or requires human review before storage.
 2. Final Kafka partition key strategy (`workGroupId` alone vs. composite key).
-3. Whether `CustodyEvent`/`AccessLog` need an optional `caseId` once Case is (re)introduced, to answer "what happened to this evidence while it was part of Case X" without joining through `CaseEvidenceLink`.
-4. Backend entity/DTO/mapper/service classes for `WorkGroup` (and subsequent entities) not yet written — the layered package skeleton exists, the classes do not.
+3. `WorkGroup` is now implemented end to end (entity → repository → DTO → mapper → service → resource, at `/api/work-groups`) and serves as the template for the entities that follow. It exposes read and create only: update/delete need the soft-delete and custody semantics described above, which are not built yet. `TriggerEvent`, `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first.
