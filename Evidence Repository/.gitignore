@@ -1,1 +1,18 @@
-/target
+# Local secrets — never commit. .env.example is the tracked template.
+.env
+.env.local
+.env.*.local
+
+# Build output
+target/
+dist/
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

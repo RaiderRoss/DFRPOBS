@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <changeSet id="0001-1" author="dfraas-team">
+        <preConditions onFail="MARK_RAN">
+            <not>
+                <tableExists tableName="work_group"/>
+            </not>
+        </preConditions>
+        <comment>Creates work_group — the classification each EvidenceItem is tagged with</comment>
+        <createTable tableName="work_group">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="name" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="classification_code" type="VARCHAR(64)">
+                <constraints nullable="false" unique="true"/>
+            </column>
+            <column name="created_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="work_group"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0001-2" author="dfraas-team">
+        <comment>Seed baseline work groups — replace with your institution's actual classification scheme</comment>
+        <insert tableName="work_group">
+            <column name="name" value="Online Banking"/>
+            <column name="classification_code" value="ONLINE_BANKING"/>
+        </insert>
+        <insert tableName="work_group">
+            <column name="name" value="Internal Systems"/>
+            <column name="classification_code" value="INTERNAL_SYSTEMS"/>
+        </insert>
+        <rollback>
+            <delete tableName="work_group">
+                <where>classification_code IN ('ONLINE_BANKING', 'INTERNAL_SYSTEMS')</where>
+            </delete>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
