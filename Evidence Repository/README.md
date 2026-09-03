@@ -7,7 +7,8 @@ Design is inspired by two references:
 - **K-FFRaaS** — a forensic readiness *process model* for financial institutions (based on ISO/IEC 27043), organized into Planning, Implementation, and Assessment phases. It defines the "work group" concept and the readiness-before-investigation philosophy.
 - **SecureRS** (Singh, Ikuesan & Venter, 2022, IEEE Access) — a concrete secure-storage *engineering pattern*: hash files before any other processing touches them, encrypt at rest (AES), verify integrity on access, and gate downloads behind OTP/2FA.
 
-The system is being adapted from both — K-FFRaaS shapes the domain model and process states, SecureRS shapes the ingestion/storage/integrity mechanics — and modified/scaled for finance-sector use rather than used as-is.
+K-FFRaaS shapes the domain model and process states.
+SecureRS shapes the ingestion/storage/integrity mechanics — and modified/scaled for finance-sector use rather than used as-is.
 
 ## Base architecture (Java)
 Backend (Java, Spring Boot) is layered as:
@@ -15,7 +16,7 @@ Backend (Java, Spring Boot) is layered as:
 
 ## Current data model
 - **WorkGroup** — `id, name, classificationCode` — the business-unit classification evidence is tagged with (K-FFRaaS concept).
-- **TriggerEvent** — `id, sourceSystem, triggerType, firedAt` — the SIEM/IDS alert that caused ingestion.
+- **TriggerEvent** — `id, externalEventId, sourceSystem, triggerType, firedAt, receivedAt, payload, payloadSha256` — the SIEM/IDS alert that caused ingestion. Four fields beyond the original sketch, each load-bearing: `externalEventId` is the source's own identifier and the only thing dedupe can key on (`id` is generated here, so it never repeats across deliveries); `receivedAt` is the database's account of when we saw the alert, kept distinct from the sender-supplied `firedAt`; and `payload` + `payloadSha256` retain the original alert and its digest, because the alert is itself part of the evidentiary record. Unique on `(sourceSystem, externalEventId)` — composite, because alert numbering is per-vendor.
 - **EvidenceItem** — `id, workGroupId, triggerEventId, storageRef, currentHash, status` — the hub entity; references the stored object and its current integrity state.
 - **CustodyEvent** — `id, evidenceItemId, action, performedBy, previousHash, newHash, occurredAt` — append-only chain-of-custody ledger; every state-changing action on evidence creates one.
 - **IntegrityCheck** — `id, evidenceItemId, computedHash, matchesStored, checkedAt` — periodic/on-demand re-verification, separate from custody events, matching SecureRS's verify-on-read pattern.
@@ -25,10 +26,11 @@ Backend (Java, Spring Boot) is layered as:
 ## Storage & infrastructure
 - **MinIO** — evidence blob storage (object storage), referenced by `EvidenceItem.storageRef`. Should use envelope encryption via a real KMS/HSM (not a static key in config, which is what the SecureRS prototype does).
 - **Postgres** — all metadata/entities, managed via Liquibase.
-- **Kafka** (Redpanda locally, for lightweight Kafka-API-compatible dev) — decouples SIEM/IDS trigger publishing from the ingestion pipeline. Topic `evidence-events`, currently planned to partition by `workGroupId` (tradeoff: guarantees ordering within a work group, but risks a "hot" partition if one work group generates disproportionate alert volume — composite keying by `sourceSystem + workGroupId` was discussed as an alternative, not yet decided).
-  - Ingestion consumer must be **idempotent** (dedupe on `triggerEventId`), since Kafka's default delivery is at-least-once.
-  - Schema registry (Avro/Protobuf) recommended for the evidence-event schema as it evolves.
-  - Kafka retention/compaction policy for raw trigger events is a separate decision from MinIO's evidence retention policy.
+- **Kafka** (Redpanda locally, for lightweight Kafka-API-compatible dev) — decouples SIEM/IDS trigger publishing from the ingestion pipeline. Topic `evidence-events`, currently planned to partition by `workGroupId` 
+- Ingestion consumer is **idempotent**, deduping on `(sourceSystem, externalEventId)` inside a single transaction backed by `uq_trigger_event_source_external`, since Kafka's default delivery is at-least-once.
+- Poison messages (unparseable or invalid) are logged and skipped rather than retried, because a malformed payload fails identically forever and would block its partition. They should go to a dead-letter topic — not yet wired.
+- Schema registry (Avro/Protobuf) recommended for the evidence-event schema as it evolves.
+- Kafka retention/compaction policy for raw trigger events is a separate decision from MinIO's evidence retention policy.
 
 ## Security & compliance principles (from SecureRS, adapted)
 - Hash evidence (SHA-256+) **before** any other processing touches it, on ingest.
@@ -67,6 +69,7 @@ Liquibase applies liquibase changes on first boot, the app then listens on 8080.
 | MinIO console    | http://localhost:9001         | `dfraas_admin` / `dfraas_dev_only` |
 | Kafka (Redpanda) | `localhost:19092`             | none                        |
 | Redpanda console | http://localhost:8081         | none                        |
+| Swagger          | http://localhost:8080/swagger-ui/index.html | none          |
 
 Two host ports differ from the in-container defaults, both because the app runs on the
 host while its dependencies run in Docker:
@@ -84,5 +87,8 @@ All credentials above are dev-only placeholders
 
 ## Open questions
 1. Whether WorkGroup classification on ingest is fully automated (mapping table from SIEM alert type) or requires human review before storage.
-2. Final Kafka partition key strategy (`workGroupId` alone vs. composite key).
-3. `WorkGroup` is now implemented end to end (entity → repository → DTO → mapper → service → resource, at `/api/work-groups`) and serves as the template for the entities that follow. It exposes read and create only: update/delete need the soft-delete and custody semantics described above, which are not built yet. `TriggerEvent`, `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first.
+2. **`EvidenceItem` → `TriggerEvent` cardinality and nullability.** The relationship is one-to-many, not one-to-one: a single alert can reasonably preserve several artifacts (auth log, firewall log, DB audit trail), so the FK stays on `EvidenceItem` and must *not* be given a unique constraint. The open part is nullability, and the answer looks like `NULL`-able: a `NOT NULL` `trigger_event_id` means evidence can only exist because an alert fired, which makes the system purely reactive and abandons the readiness half of K-FFRaaS — scheduled preservation, compliance holds and manual preservation by an investigator all have no trigger event. Provenance is not lost by allowing null, because every `EvidenceItem` gets a mandatory opening `CustodyEvent` carrying `performedBy` and `action`; that is the universal provenance record, and `TriggerEvent` is the narrower automated *cause* when there was one. Explicitly rejected: synthesising a placeholder `TriggerEvent` for manual preservation, which would mean inventing an alert that never fired in the one table whose job is to record alerts that did.
+3. **Ingestion is not yet resumable, and this is a latent data-loss bug.** `recordIfAbsent` commits the trigger event, then `EvidenceEventConsumer` returns early whenever `created == false`. If the consumer dies (or MinIO is unavailable) after that commit but before the blob is stored, the Kafka offset was never committed, so the record is redelivered — and on redelivery the trigger event exists, `created` is `false`, and the consumer returns early. No `EvidenceItem` is ever created, silently and permanently. The dedupe key is currently *"has this alert been recorded"* when it needs to be *"has this alert been fully processed"*. Options: (a) one transaction over everything — rejected, the MinIO write sits outside the database transaction and reintroduces the dual-write problem; (b) early-return only when the trigger event already has evidence items — correct but turns the guard into a join, and gets murky once one trigger legitimately yields several items over time; (c) **preferred** — a processing state on `TriggerEvent` (`RECEIVED` → `PROCESSED`, plus a terminal `FAILED`), resuming when the state is `RECEIVED` and skipping only on `PROCESSED`. Unlike `EvidenceStatus` this set is closed and internal, so it is a safe place for a native Postgres enum. It also makes *"which alerts were received but never preserved"* queryable, which is precisely the question a readiness audit asks and which nothing in the schema can currently answer. To be resolved with the `EvidenceItem` changeset, since the guard has nothing to check until then.
+4. **How manual and scheduled preservation enter the system.** Kafka is currently the only ingress — `TriggerEventResource` exposes no create endpoint, and a test asserts `405`. Anything may produce to `evidence-events`, and `sourceSystem`. Question is whether to add manual replay and scheduled collection. Should this publish to the topic or bypass trigger events entirely and create an `EvidenceItem` with a null `trigger_event_id` per item 3.
+5. `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first. Planned order: `AppUser` next (so custody and access records have a real subject to reference before the append-only tables exist), then `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AccessLog`.
+6. `EvidenceEventConsumer` records and hashes the trigger event, but the storage half — MinIO blob, `EvidenceItem`, opening `CustodyEvent`, one transaction — is still TODO 3 and blocked on those entities.
