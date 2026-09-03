@@ -11,4 +11,7 @@
     <!-- First domain table: WorkGroup -->
     <include file="changes/0001-create-work-group-table.xml" relativeToChangelogFile="true"/>
 
+    <!-- Ingestion input: the SIEM/IDS alert that triggers evidence preservation -->
+    <include file="changes/0002-create-trigger-event-table.xml" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>

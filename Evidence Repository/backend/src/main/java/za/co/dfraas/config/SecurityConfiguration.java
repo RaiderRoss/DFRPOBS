@@ -38,6 +38,18 @@ public class SecurityConfiguration {
 						session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 				.authorizeHttpRequests(auth -> auth
 						.requestMatchers("/actuator/health/**").permitAll()
+						// Swagger UI and the spec it fetches. Both have to be open together:
+						// the page itself loads over a plain GET with no Authorization header,
+						// so leaving /v3/api-docs authenticated renders an empty UI and a 401
+						// in the console rather than a login prompt. Dev affordance only —
+						// see SPRINGDOC in application.properties for switching it off, and
+						// close these paths before this service is exposed outside localhost.
+						.requestMatchers(
+								"/swagger-ui.html",
+								"/swagger-ui/**",
+								"/v3/api-docs",
+								"/v3/api-docs/**",
+								"/v3/api-docs.yaml").permitAll()
 						// Placeholder for the step-up rule. Authentication alone is not
 						// enough to download evidence — this matcher must additionally
 						// require a verified OTP once 2FA is implemented.
