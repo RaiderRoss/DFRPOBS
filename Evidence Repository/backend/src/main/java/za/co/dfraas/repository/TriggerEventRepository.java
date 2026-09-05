@@ -1,6 +1,7 @@
 package za.co.dfraas.repository;
 
 import java.time.OffsetDateTime;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -10,6 +11,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
+import za.co.dfraas.entity.CorrelationStatus;
 import za.co.dfraas.entity.TriggerEvent;
 
 /**
@@ -48,4 +50,27 @@ public interface TriggerEventRepository extends JpaRepository<TriggerEvent, UUID
 	 * {@code ix_trigger_event_fired_at}.
 	 */
 	List<TriggerEvent> findByFiredAtBetween(OffsetDateTime from, OffsetDateTime to);
+
+	/**
+	 * The correlation work queue: alerts recorded but not yet correlated, oldest first.
+	 *
+	 * <p>This is what README open question 3 was reaching for. The original bug was that
+	 * ingestion could commit a trigger event and then die before preserving anything, with
+	 * no way to tell afterwards; the schema could not answer "which alerts were received and
+	 * produced nothing". Once collection is continuous the gap moves to correlation, but the
+	 * question is the same one and this method is its answer.
+	 *
+	 * <p>Pass {@code PENDING} and {@link CorrelationStatus#FAILED} together to drive a sweep
+	 * — both need the same work done, and the partial index
+	 * {@code ix_trigger_event_correlation_pending} covers exactly that pair. Query them
+	 * separately when reporting, because an alert never attempted and one whose attempt
+	 * broke say entirely different things about the system.
+	 *
+	 * <p>Ordered by {@code receivedAt} rather than {@code firedAt}: a source with a wrong
+	 * clock must not be able to push its alerts to the front of the queue.
+	 */
+	Page<TriggerEvent> findByCorrelationStatusInOrderByReceivedAtAsc(
+			Collection<CorrelationStatus> statuses, Pageable pageable);
+
+	long countByCorrelationStatus(CorrelationStatus correlationStatus);
 }

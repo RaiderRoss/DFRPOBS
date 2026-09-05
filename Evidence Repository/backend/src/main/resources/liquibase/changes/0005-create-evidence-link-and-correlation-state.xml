@@ -1,0 +1,495 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        Correlation: the relationship between an alert and the evidence covering the time
+        it fired, replacing evidence_item.trigger_event_id.
+
+        That column encoded *causation* — this artifact exists because that alert fired.
+        Under continuous collection the artifact already existed, and what an alert does is
+        gather evidence that was preserved independently of it. Two consequences follow,
+        and neither can be expressed by a foreign key on evidence_item:
+
+          1. The cardinality is many-to-many. A firewall log covering 10:00-11:00 overlaps
+             every alert that fired in that hour, and a single FK caps it at one.
+
+          2. The relationship is an *assertion*, not a fact. A time-overlap match is a
+             hypothesis produced by a rule with parameters; a causal ingest is an
+             observation. A schema that cannot tell those apart invites an investigator to
+             read a proposed correlation as established provenance, which is the one
+             misreading this system exists to prevent. So the link carries how it was made,
+             by whom, on what reasoning, and whether a human has since confirmed or
+             dismissed it.
+
+        Hence a link *entity*, not a bare join table.
+    -->
+
+    <changeSet id="0005-1" author="dfraas-team">
+        <preConditions onFail="MARK_RAN">
+            <not>
+                <tableExists tableName="evidence_link"/>
+            </not>
+        </preConditions>
+        <comment>Creates evidence_link — the reviewable association between a trigger event and an evidence item</comment>
+        <createTable tableName="evidence_link">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+
+            <column name="trigger_event_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="evidence_item_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                How this link came to exist. VARCHAR + CHECK (0005-4), matching
+                evidence_item.status.
+
+                  CAUSAL            the item was collected *because* this alert fired —
+                                    on-demand collection, and the meaning the old
+                                    evidence_item.trigger_event_id column carried. Still a
+                                    real case after this refactor: some artifacts (a memory
+                                    capture, a targeted snapshot) can only be taken in
+                                    response to something, and they are the one link kind
+                                    that is an observation rather than an inference.
+                  AUTO_TIME_WINDOW  the item's coverage window overlaps the alert's
+                                    correlation window. The default automated path.
+                  AUTO_RULE         matched on something narrower than time — host, account,
+                                    IP, session. Distinguished from AUTO_TIME_WINDOW because
+                                    it is far stronger evidence of relevance, and an
+                                    investigator triaging a large bundle should be able to
+                                    see which links are which.
+                  MANUAL            an investigator added it.
+            -->
+            <column name="link_method" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Whether a human has ruled on the link. PROPOSED is the honest default for
+                anything automated: the system found an overlap, which is a reason to look,
+                not a finding.
+
+                DISMISSED rather than deletion, deliberately. "The system suggested this and
+                an investigator judged it irrelevant" is itself part of the investigative
+                record — it shows what was considered and rejected, which is exactly what a
+                defence would probe. Deleting the row would leave the bundle looking as
+                though the item was never surfaced at all.
+            -->
+            <column name="disposition" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Why this link exists, in a form a person can read: the overlap that matched,
+                the rule that fired, or the investigator's stated reason. This is what makes
+                "why is this item in this incident's bundle?" answerable a year later,
+                without re-running a correlation whose parameters may since have changed.
+            -->
+            <column name="rationale" type="TEXT">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                Who created the link. NULL for automated links, where the answer is "the
+                correlation pass" and naming a fake user would be worse than saying nothing;
+                required for MANUAL ones (0005-4).
+
+                TODO: becomes a foreign key to app_user once that table exists. VARCHAR for
+                now, matching what CustodyEvent.performed_by will have to do in the interim.
+            -->
+            <column name="linked_by" type="VARCHAR(255)">
+                <constraints nullable="true"/>
+            </column>
+
+            <column name="linked_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+
+            <column name="reviewed_by" type="VARCHAR(255)">
+                <constraints nullable="true"/>
+            </column>
+            <column name="reviewed_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                True when this link was added by a later correlation pass, after the alert
+                had already been correlated once.
+
+                Late arrival is normal here rather than exceptional: evidence covering
+                14:00-15:00 may not be preserved until 15:02, by which time an alert that
+                fired at 14:30 has already been correlated and possibly already reviewed. A
+                second pass adds the link, and flags it, so an investigator who looked at
+                the bundle yesterday can see what has appeared since. Links are only ever
+                added by re-correlation, never removed — silently retracting evidence from a
+                bundle someone has already reviewed would be indefensible.
+            -->
+            <column name="late_arrival" type="BOOLEAN" defaultValueBoolean="false">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="evidence_link"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-2" author="dfraas-team">
+        <comment>Foreign keys to both sides — RESTRICT, as everywhere in this schema</comment>
+        <!--
+            RESTRICT on both, and CASCADE would be actively wrong here rather than merely
+            unsafe. Cascading from trigger_event would mean deleting an alert erases the
+            record of what was gathered under it; cascading from evidence_item would mean a
+            hard-deleted item quietly leaves every bundle it belonged to. Evidence is
+            soft-delete only, and this table inherits that.
+        -->
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_link_trigger_event"
+            baseTableName="evidence_link"
+            baseColumnNames="trigger_event_id"
+            referencedTableName="trigger_event"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_link_evidence_item"
+            baseTableName="evidence_link"
+            baseColumnNames="evidence_item_id"
+            referencedTableName="evidence_item"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <rollback>
+            <dropForeignKeyConstraint baseTableName="evidence_link" constraintName="fk_evidence_link_evidence_item"/>
+            <dropForeignKeyConstraint baseTableName="evidence_link" constraintName="fk_evidence_link_trigger_event"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-3" author="dfraas-team">
+        <comment>One link per (alert, item) pair — re-correlation must update, never duplicate</comment>
+        <!--
+            Without this, every re-correlation pass would re-add every link it found last
+            time, and a bundle would grow duplicates in proportion to how often it was
+            swept. It is also what makes a re-correlation pass safely idempotent: the pass
+            can insert unconditionally and let the constraint reject what it has already
+            recorded, exactly as trigger_event ingestion does.
+
+            Leading column is trigger_event_id, so this index also serves "everything linked
+            to this alert" — the bundle query — and no separate index on it is needed.
+        -->
+        <addUniqueConstraint
+            tableName="evidence_link"
+            columnNames="trigger_event_id, evidence_item_id"
+            constraintName="uq_evidence_link_pair"/>
+        <rollback>
+            <dropUniqueConstraint tableName="evidence_link" constraintName="uq_evidence_link_pair"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-4" author="dfraas-team">
+        <comment>Constrain link method and disposition, and require attribution where a human is the author</comment>
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_method
+                CHECK (link_method IN ('CAUSAL', 'AUTO_TIME_WINDOW', 'AUTO_RULE', 'MANUAL'));
+        </sql>
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_disposition
+                CHECK (disposition IN ('PROPOSED', 'CONFIRMED', 'DISMISSED'));
+        </sql>
+        <!--
+            A manual link is an investigator's assertion, and an unattributed assertion is
+            not admissible as anything. The database enforces the attribution rather than
+            trusting the service layer, on the same principle as ck_evidence_item_status.
+        -->
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_manual_attribution
+                CHECK (link_method &lt;&gt; 'MANUAL' OR linked_by IS NOT NULL);
+        </sql>
+        <!--
+            Dismissal is always a human judgement — nothing automated may decide that
+            evidence is irrelevant — so it must name who made it and when.
+
+            Note the deliberate asymmetry: CONFIRMED is NOT held to the same rule, because a
+            CAUSAL link is confirmed on creation by observation rather than by review. A
+            constraint requiring a reviewer for every CONFIRMED row would force the
+            ingestion path to invent one.
+        -->
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_dismissal_attribution
+                CHECK (disposition &lt;&gt; 'DISMISSED' OR (reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL));
+        </sql>
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_review_pair
+                CHECK ((reviewed_by IS NULL) = (reviewed_at IS NULL));
+        </sql>
+        <rollback>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_review_pair;</sql>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_dismissal_attribution;</sql>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_manual_attribution;</sql>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_disposition;</sql>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_method;</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-5" author="dfraas-team">
+        <comment>Index the reverse lookup: which incidents does this item belong to</comment>
+        <!--
+            Only evidence_item_id needs its own index — trigger_event_id leads
+            uq_evidence_link_pair and is already served by it.
+
+            The reverse direction is the query that makes the "still review items
+            individually" half of the design work: an investigator looking at one artifact
+            must be able to see every incident it has been gathered into, which under
+            many-to-many is a real question with a possibly surprising answer.
+        -->
+        <createIndex tableName="evidence_link" indexName="ix_evidence_link_evidence_item_id">
+            <column name="evidence_item_id"/>
+        </createIndex>
+        <rollback>
+            <dropIndex tableName="evidence_link" indexName="ix_evidence_link_evidence_item_id"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-6" author="dfraas-team">
+        <comment>Migrate existing causal associations out of evidence_item.trigger_event_id</comment>
+        <!--
+            Every existing FK value means "this item was preserved because that alert
+            fired", which is precisely CAUSAL. It is recorded CONFIRMED rather than PROPOSED
+            because it was an observation at ingest, not an inference drawn afterwards, and
+            linked_by is left NULL because it was the ingestion pipeline, not a person.
+
+            rationale states plainly where the row came from, so a link created by this
+            migration is never mistaken for one a correlation pass produced.
+        -->
+        <sql>
+            INSERT INTO evidence_link
+                (trigger_event_id, evidence_item_id, link_method, disposition, rationale, late_arrival)
+            SELECT ei.trigger_event_id, ei.id, 'CAUSAL', 'CONFIRMED',
+                   'Migrated from evidence_item.trigger_event_id by changeset 0005-6; '
+                   || 'the item was ingested as a direct result of this alert.',
+                   FALSE
+            FROM evidence_item ei
+            WHERE ei.trigger_event_id IS NOT NULL;
+        </sql>
+        <rollback>
+            <sql>
+                DELETE FROM evidence_link
+                WHERE link_method = 'CAUSAL'
+                  AND rationale LIKE 'Migrated from evidence_item.trigger_event_id by changeset 0005-6;%';
+            </sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-7" author="dfraas-team">
+        <comment>Drop evidence_item.trigger_event_id — the association now lives in evidence_link</comment>
+        <!--
+            Dropped rather than left in place. Keeping both would give the schema two
+            answers to "what is this item related to", and they would drift the first time
+            anything wrote to one and not the other. There is no read path left: the entity
+            no longer maps it, and with ddl-auto=validate a stale column that Hibernate does
+            not map is tolerated but a mapped column that is gone is a startup failure — so
+            entity and changeset move together, as everywhere else here.
+
+            The FK and its index are dropped explicitly rather than relying on Postgres to
+            take them with the column, so the rollback has something exact to restore.
+        -->
+        <dropForeignKeyConstraint baseTableName="evidence_item" constraintName="fk_evidence_item_trigger_event"/>
+        <dropIndex tableName="evidence_item" indexName="ix_evidence_item_trigger_event_id"/>
+        <dropColumn tableName="evidence_item" columnName="trigger_event_id"/>
+        <rollback>
+            <sql>ALTER TABLE evidence_item ADD COLUMN trigger_event_id UUID;</sql>
+            <!--
+                Repopulated from the links 0005-6 created. LIMIT 1 is not arbitrary: the old
+                column could only hold one value, so restoring a many-to-many into it is
+                lossy by construction. That lossiness is the point of the refactor, and it
+                is stated here rather than hidden.
+            -->
+            <sql>
+                UPDATE evidence_item ei
+                SET trigger_event_id = (
+                    SELECT el.trigger_event_id
+                    FROM evidence_link el
+                    WHERE el.evidence_item_id = ei.id AND el.link_method = 'CAUSAL'
+                    ORDER BY el.linked_at
+                    LIMIT 1);
+            </sql>
+            <sql>
+                ALTER TABLE evidence_item
+                    ADD CONSTRAINT fk_evidence_item_trigger_event
+                    FOREIGN KEY (trigger_event_id) REFERENCES trigger_event (id)
+                    ON DELETE RESTRICT ON UPDATE RESTRICT;
+            </sql>
+            <sql>CREATE INDEX ix_evidence_item_trigger_event_id ON evidence_item (trigger_event_id);</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-8" author="dfraas-team">
+        <comment>trigger_event gains the correlation state and the window parameters each alert was correlated under</comment>
+        <!--
+            This is README open question 3, arriving in the shape the refactor gives it.
+
+            The original bug was that ingestion deduped on "has this alert been recorded"
+            when it needed "has this alert been fully processed", so a crash between the
+            trigger-event commit and the blob write lost the evidence permanently and
+            silently. The proposed fix was a processing state on trigger_event.
+
+            Under continuous collection the alert no longer causes ingestion, so there is no
+            blob write to resume — but the same gap reappears one step along, as "this alert
+            was recorded and never correlated". The state is therefore about correlation
+            rather than preservation, and it answers the same audit question the original
+            was reaching for: which alerts came in and produced nothing.
+
+            One reversal to note. Open question 3 argued for a native Postgres enum here, on
+            the grounds that a processing state is closed and internal. Correlation status
+            is not internal — an investigator sees "correlation still pending" on an
+            incident and will reasonably ask for states this list does not have. That puts
+            it in the same category as evidence_item.status, so it gets the same treatment:
+            VARCHAR plus a CHECK, which can shrink as well as grow.
+        -->
+        <addColumn tableName="trigger_event">
+            <!--
+                PENDING     recorded, not yet correlated
+                CORRELATED  a pass has completed; later passes may still add late arrivals
+                CLOSED      no further links will be added automatically — the collection
+                            lag has elapsed and the bundle is settled
+                FAILED      a pass errored; terminal until retried, and the row a readiness
+                            audit must not find sitting quietly
+            -->
+            <column name="correlation_status" type="VARCHAR(32)" defaultValue="PENDING">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                The window actually used for this alert, frozen onto the row rather than
+                read from configuration at query time.
+
+                Recording it is what makes a correlation reproducible. Configuration changes;
+                if the parameters lived only in application.properties then re-running a
+                correlation next year would produce a different bundle with nothing to
+                explain the difference, and an investigator could not state on the record
+                what the system had been asked to look for.
+
+                Defaults reflect the two asymmetric reasons an alert's window is wider than
+                its instant. Lookback is the larger by far (30 minutes) because the activity
+                that matters — reconnaissance, initial access, staging — precedes detection,
+                and preserving only from the moment of detection is the failure the whole
+                move to continuous collection exists to fix. Lookahead (15 minutes) covers
+                the immediate aftermath and the collection lag of sources that batch.
+
+                Both also absorb clock skew between sources, since event_start/event_end are
+                sender-asserted and share none of trigger_event.received_at's authority.
+
+                Per-trigger-type policy — a data-exfiltration alert wants hours of lookback,
+                a failed-login alert minutes — is the obvious next step and is deliberately
+                not modelled yet. It belongs with the detection catalogue, not on this table.
+            -->
+            <column name="correlation_lookback_seconds" type="INTEGER" defaultValueNumeric="1800">
+                <constraints nullable="false"/>
+            </column>
+            <column name="correlation_lookahead_seconds" type="INTEGER" defaultValueNumeric="900">
+                <constraints nullable="false"/>
+            </column>
+
+            <!-- When the first correlation pass completed. NULL while PENDING, and what
+                 late_arrival on a link is judged against. -->
+            <column name="correlated_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                The non-time half of the correlation rule, as JSON — work groups, source
+                keys, hosts, accounts.
+
+                Time alone is not a usable predicate here, and this column is where that is
+                admitted. Under continuous collection every source is producing constantly,
+                so a 45-minute window across the whole estate returns a bundle measured in
+                tens of thousands of items, which is not evidence gathering but a different
+                way of finding nothing. A scope narrows it to what could plausibly bear on
+                the alert.
+
+                TEXT holding JSON rather than JSONB, following trigger_event.payload: this is
+                read back and displayed, not queried into, and TEXT needs no Hibernate type
+                mapping. Revisit if scopes ever need to be searched across.
+            -->
+            <column name="correlation_scope" type="TEXT">
+                <constraints nullable="true"/>
+            </column>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="trigger_event" columnName="correlation_scope"/>
+            <dropColumn tableName="trigger_event" columnName="correlated_at"/>
+            <dropColumn tableName="trigger_event" columnName="correlation_lookahead_seconds"/>
+            <dropColumn tableName="trigger_event" columnName="correlation_lookback_seconds"/>
+            <dropColumn tableName="trigger_event" columnName="correlation_status"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0005-9" author="dfraas-team">
+        <comment>Constrain correlation status and window parameters, and index the correlation work queue</comment>
+        <sql>
+            ALTER TABLE trigger_event
+                ADD CONSTRAINT ck_trigger_event_correlation_status
+                CHECK (correlation_status IN ('PENDING', 'CORRELATED', 'CLOSED', 'FAILED'));
+        </sql>
+        <!--
+            Zero is permitted on both — an alert type whose evidence is strictly
+            contemporaneous is a legitimate configuration — but a negative window would
+            invert the range and silently match nothing.
+        -->
+        <sql>
+            ALTER TABLE trigger_event
+                ADD CONSTRAINT ck_trigger_event_correlation_window
+                CHECK (correlation_lookback_seconds &gt;= 0 AND correlation_lookahead_seconds &gt;= 0);
+        </sql>
+        <!--
+            correlated_at is the record of a pass having completed, so status and timestamp
+            must not contradict each other: a PENDING row carrying a correlated_at is
+            unreadable, because either the status or the timestamp is lying and nothing says
+            which.
+
+            FAILED is deliberately unconstrained, and that is not laziness. A first pass can
+            fail before ever completing (correlated_at NULL), and a re-correlation can fail
+            on an alert that was correlated successfully last week (correlated_at set, and
+            it must be kept — the earlier bundle is still valid). Both are real states, so
+            FAILED is the one status where the timestamp genuinely carries no implication.
+        -->
+        <sql>
+            ALTER TABLE trigger_event
+                ADD CONSTRAINT ck_trigger_event_correlated_at
+                CHECK (
+                    (correlation_status = 'PENDING' AND correlated_at IS NULL)
+                    OR (correlation_status IN ('CORRELATED', 'CLOSED') AND correlated_at IS NOT NULL)
+                    OR correlation_status = 'FAILED'
+                );
+        </sql>
+        <!--
+            The correlation work queue, and a partial index for the same reason
+            ix_evidence_item_status_exceptional is partial: in steady state almost every row
+            is CORRELATED or CLOSED, and the question actually asked of this column is the
+            opposite one — what still needs doing, and what failed and was never retried.
+        -->
+        <sql>
+            CREATE INDEX ix_trigger_event_correlation_pending
+                ON trigger_event (received_at)
+                WHERE correlation_status IN ('PENDING', 'FAILED');
+        </sql>
+        <rollback>
+            <sql>DROP INDEX ix_trigger_event_correlation_pending;</sql>
+            <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlated_at;</sql>
+            <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlation_window;</sql>
+            <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlation_status;</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

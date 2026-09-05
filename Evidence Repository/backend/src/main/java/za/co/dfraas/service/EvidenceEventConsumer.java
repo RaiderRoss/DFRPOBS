@@ -23,11 +23,23 @@ import za.co.dfraas.dto.TriggerEventIngestResult;
  * Ingestion entry point: consumes SIEM/IDS trigger events from the {@code evidence-events}
  * topic and drives the preservation pipeline.
  *
- * <p>The first two rules this class exists to enforce are now in place. Idempotency lives
- * in {@link TriggerEventService#recordIfAbsent}, which dedupes on the source's own event
- * id inside a single transaction backed by a unique constraint; hashing happens in that
- * same call, before the payload is written anywhere. What remains is the storage half —
- * see TODO 3.
+ * <p><strong>The alert no longer drives preservation.</strong> Evidence streams in
+ * continuously from registered {@code EvidenceSource}s, so what an alert triggers is
+ * <em>correlation</em> — gathering the evidence already preserved whose coverage window
+ * overlaps it. This listener's job therefore ends at recording the alert; see TODO 3 for
+ * where the rest goes and why it is not inline.
+ *
+ * <p>The two rules this class exists to enforce are in place. Idempotency lives in
+ * {@link TriggerEventService#recordIfAbsent}, which dedupes on the source's own event id
+ * inside a single transaction backed by a unique constraint; hashing happens in that same
+ * call, before the payload is written anywhere.
+ *
+ * <p><strong>The topic name is now wrong and should be split.</strong>
+ * {@code evidence-events} carries alerts, not evidence — a legacy of the reactive design,
+ * where the two were the same message. Streamed artifacts and SIEM alerts differ by orders
+ * of magnitude in volume, want different partition keys (source or asset, versus work
+ * group) and different retention, and a slow artifact stream must not be able to stall
+ * alert processing behind it. Two topics, and this listener keeps the alert one.
  *
  * <p>Payload is consumed as {@code String} until the schema decision (Avro/Protobuf +
  * schema registry) is made; swap the deserializer in application.properties at that point,
@@ -80,8 +92,19 @@ public class EvidenceEventConsumer {
 				result.triggerEvent().id(), request.sourceSystem(), request.externalEventId(),
 				result.triggerEvent().payloadSha256());
 
-		// TODO 3: store the blob in MinIO, persist the EvidenceItem with its storageRef and
-		//         currentHash, and append the opening CustodyEvent — all in one transaction.
+		// TODO 3: hand the recorded alert to correlation — resolve its window from firedAt
+		//         plus the lookback/lookahead frozen onto the row, find evidence whose
+		//         coverage window overlaps it (EvidenceItemRepository.findOverlappingCoverage),
+		//         write an EvidenceLink per match, and move correlationStatus to CORRELATED.
+		//
+		//         Deliberately not done inline here. Correlation is a query over evidence
+		//         that arrived independently of this message, so it does not belong in the
+		//         listener's transaction: a slow or over-broad scope would stall the alert
+		//         partition behind it, and evidence covering the window may not even have
+		//         been preserved yet. It is a separate pass over the work queue
+		//         (TriggerEventRepository.findByCorrelationStatusInOrderByReceivedAtAsc),
+		//         which is also what makes re-correlation for late arrivals the same code
+		//         path rather than a special case.
 	}
 
 	/**

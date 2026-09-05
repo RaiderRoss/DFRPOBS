@@ -4,6 +4,7 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 import io.swagger.v3.oas.annotations.media.Schema;
+import za.co.dfraas.entity.CorrelationStatus;
 
 /**
  * Read model for {@link za.co.dfraas.entity.TriggerEvent}.
@@ -46,5 +47,25 @@ public record TriggerEventDto(
 
 		@Schema(description = "Lowercase hex SHA-256 of the raw payload, computed on ingest",
 				example = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
-		String payloadSha256) {
+		String payloadSha256,
+
+		/*
+		 * Exposed because an investigator reading a bundle needs to know whether they are
+		 * looking at everything. Under continuous collection "correlated" does not mean
+		 * "finished" — evidence covering the alert's window can still be preserved after the
+		 * pass ran — so a bundle presented without its correlation state invites the reader
+		 * to assume completeness the system has not claimed.
+		 */
+		@Schema(description = """
+				How far correlation has got: PENDING (recorded, not yet correlated), CORRELATED \
+				(a pass completed; late-arriving evidence may still be linked), CLOSED (the \
+				collection lag has elapsed and the bundle is settled), FAILED (a pass errored \
+				and has not been retried).
+				""",
+				example = "CORRELATED")
+		CorrelationStatus correlationStatus,
+
+		@Schema(description = "When the first correlation pass completed. Null while PENDING.",
+				example = "2026-09-03T08:16:02.114Z")
+		OffsetDateTime correlatedAt) {
 }

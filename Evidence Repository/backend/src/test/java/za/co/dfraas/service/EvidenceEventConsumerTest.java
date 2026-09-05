@@ -28,6 +28,7 @@ import tools.jackson.databind.json.JsonMapper;
 import za.co.dfraas.dto.TriggerEventDto;
 import za.co.dfraas.dto.TriggerEventIngestRequest;
 import za.co.dfraas.dto.TriggerEventIngestResult;
+import za.co.dfraas.entity.CorrelationStatus;
 
 /**
  * Message-handling behaviour of {@link EvidenceEventConsumer}: what it forwards, what it
@@ -136,7 +137,11 @@ class EvidenceEventConsumerTest {
 				"BRUTE_FORCE_LOGIN",
 				OffsetDateTime.parse("2026-01-01T09:00:00Z"),
 				OffsetDateTime.parse("2026-01-01T09:00:05Z"),
-				"c82fb88239e96ae95bfdc7fc1b17a9ef3015a8ac3135bc8955850e0da4398ae8");
+				"c82fb88239e96ae95bfdc7fc1b17a9ef3015a8ac3135bc8955850e0da4398ae8",
+				// PENDING with a null correlatedAt: the consumer's job ends at recording the
+				// alert, and correlation is a later, separate pass.
+				CorrelationStatus.PENDING,
+				null);
 		return new TriggerEventIngestResult(dto, created);
 	}
 }

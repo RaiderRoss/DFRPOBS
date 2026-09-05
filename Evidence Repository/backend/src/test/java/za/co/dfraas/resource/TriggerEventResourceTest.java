@@ -29,6 +29,7 @@ import org.springframework.test.web.servlet.MockMvc;
 
 import za.co.dfraas.config.SecurityConfiguration;
 import za.co.dfraas.dto.TriggerEventDto;
+import za.co.dfraas.entity.CorrelationStatus;
 import za.co.dfraas.exception.ResourceNotFoundException;
 import za.co.dfraas.service.TriggerEventService;
 
@@ -139,6 +140,8 @@ class TriggerEventResourceTest {
 				"BRUTE_FORCE_LOGIN",
 				OffsetDateTime.parse("2026-01-01T09:00:00Z"),
 				OffsetDateTime.parse("2026-01-01T09:00:05Z"),
-				DIGEST);
+				DIGEST,
+				CorrelationStatus.CORRELATED,
+				OffsetDateTime.parse("2026-01-01T09:01:00Z"));
 	}
 }

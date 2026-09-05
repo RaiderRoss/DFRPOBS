@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.jupiter.api.DisplayName;
@@ -16,6 +17,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.PageRequest;
 
 import za.co.dfraas.TestcontainersConfiguration;
+import za.co.dfraas.entity.CorrelationStatus;
 import za.co.dfraas.entity.TriggerEvent;
 
 /**
@@ -117,6 +119,109 @@ class TriggerEventRepositoryTest {
 				.hasSize(2)
 				.extracting(TriggerEvent::getExternalEventId)
 				.containsExactlyInAnyOrder("EVT-A", "EVT-B");
+	}
+
+	@Test
+	@DisplayName("A recorded alert starts PENDING, with the default correlation window frozen onto it")
+	void correlationDefaultsAreRecordedOnInsert() {
+		TriggerEvent saved = repository.saveAndFlush(
+				newEvent("splunk", "EVT-PENDING", OffsetDateTime.parse("2026-01-01T09:00:00Z")));
+
+		assertThat(saved.getCorrelationStatus()).isEqualTo(CorrelationStatus.PENDING);
+		assertThat(saved.getCorrelatedAt()).isNull();
+
+		// The parameters are written onto the row rather than read from configuration when a
+		// correlation runs. Configuration changes; a bundle that cannot say what the system
+		// was asked to look for cannot be reproduced or defended.
+		assertThat(saved.getCorrelationLookbackSeconds()).isEqualTo(TriggerEvent.DEFAULT_LOOKBACK_SECONDS);
+		assertThat(saved.getCorrelationLookaheadSeconds()).isEqualTo(TriggerEvent.DEFAULT_LOOKAHEAD_SECONDS);
+
+		// Asymmetric on purpose: reconnaissance, initial access and staging precede
+		// detection, so reaching back matters more than reaching forward. Gathering only
+		// from the moment of detection is the blind spot continuous collection exists to fix.
+		assertThat(saved.getCorrelationLookbackSeconds())
+				.isGreaterThan(saved.getCorrelationLookaheadSeconds());
+	}
+
+	@Test
+	@DisplayName("The correlation work queue returns pending and failed alerts, oldest first")
+	void correlationQueueReturnsWhatStillNeedsDoing() {
+		OffsetDateTime firedAt = OffsetDateTime.parse("2026-01-01T09:00:00Z");
+		repository.saveAndFlush(newEvent("splunk", "EVT-PENDING", firedAt));
+
+		TriggerEvent failed = newEvent("splunk", "EVT-FAILED", firedAt);
+		failed.setCorrelationStatus(CorrelationStatus.FAILED);
+		repository.saveAndFlush(failed);
+
+		TriggerEvent done = newEvent("splunk", "EVT-DONE", firedAt);
+		done.setCorrelationStatus(CorrelationStatus.CORRELATED);
+		done.setCorrelatedAt(OffsetDateTime.parse("2026-01-01T09:05:00Z"));
+		repository.saveAndFlush(done);
+
+		// PENDING and FAILED need the same work done, which is why the partial index covers
+		// exactly that pair. They are still distinct states: an alert never attempted and one
+		// whose attempt broke say entirely different things about the system.
+		assertThat(repository.findByCorrelationStatusInOrderByReceivedAtAsc(
+				List.of(CorrelationStatus.PENDING, CorrelationStatus.FAILED), PageRequest.of(0, 10)))
+				.extracting(TriggerEvent::getExternalEventId)
+				.containsExactly("EVT-PENDING", "EVT-FAILED");
+
+		assertThat(repository.countByCorrelationStatus(CorrelationStatus.CORRELATED)).isEqualTo(1);
+	}
+
+	@Test
+	@DisplayName("An alert cannot claim to be correlated without saying when")
+	void correlatedWithoutTimestampIsRejected() {
+		TriggerEvent event = newEvent("splunk", "EVT-INCONSISTENT", OffsetDateTime.parse("2026-01-01T09:00:00Z"));
+		event.setCorrelationStatus(CorrelationStatus.CORRELATED);
+		// correlatedAt deliberately left null.
+
+		// Either the status or the missing timestamp is lying, and nothing in the row says
+		// which — so the database refuses the combination outright.
+		assertThatThrownBy(() -> repository.saveAndFlush(event))
+				.isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	@DisplayName("A pending alert cannot carry a completion timestamp")
+	void pendingWithTimestampIsRejected() {
+		TriggerEvent event = newEvent("splunk", "EVT-BACKDATED", OffsetDateTime.parse("2026-01-01T09:00:00Z"));
+		event.setCorrelatedAt(OffsetDateTime.parse("2026-01-01T09:05:00Z"));
+
+		assertThatThrownBy(() -> repository.saveAndFlush(event))
+				.isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
+	@DisplayName("A failed alert may or may not have been correlated before")
+	void failedIsTheOneStatusTheTimestampSaysNothingAbout() {
+		OffsetDateTime firedAt = OffsetDateTime.parse("2026-01-01T09:00:00Z");
+
+		// Failed on the first attempt: nothing was ever completed.
+		TriggerEvent neverCorrelated = newEvent("splunk", "EVT-FAILED-FIRST", firedAt);
+		neverCorrelated.setCorrelationStatus(CorrelationStatus.FAILED);
+		repository.saveAndFlush(neverCorrelated);
+
+		// Failed on a re-correlation: last week's pass succeeded and its bundle is still
+		// valid, so the timestamp must survive the later failure.
+		TriggerEvent reCorrelationFailed = newEvent("splunk", "EVT-FAILED-LATER", firedAt);
+		reCorrelationFailed.setCorrelationStatus(CorrelationStatus.FAILED);
+		reCorrelationFailed.setCorrelatedAt(OffsetDateTime.parse("2026-01-01T09:05:00Z"));
+		repository.saveAndFlush(reCorrelationFailed);
+
+		assertThat(repository.countByCorrelationStatus(CorrelationStatus.FAILED)).isEqualTo(2);
+	}
+
+	@Test
+	@DisplayName("A negative correlation window is rejected")
+	void negativeCorrelationWindowIsRejected() {
+		TriggerEvent event = newEvent("splunk", "EVT-NEGATIVE", OffsetDateTime.parse("2026-01-01T09:00:00Z"));
+		// Zero is legitimate — an alert type whose evidence is strictly contemporaneous —
+		// but a negative window inverts the range and silently matches nothing.
+		event.setCorrelationLookbackSeconds(-1);
+
+		assertThatThrownBy(() -> repository.saveAndFlush(event))
+				.isInstanceOf(DataIntegrityViolationException.class);
 	}
 
 	private static TriggerEvent newEvent(String sourceSystem, String externalEventId, OffsetDateTime firedAt) {
