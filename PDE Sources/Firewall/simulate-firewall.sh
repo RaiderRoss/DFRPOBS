@@ -102,6 +102,8 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ $MALICIOUS_USERS -lt $USERS ]] || die "--malicious-users must be less than --users"
 command -v ufw >/dev/null || die "ufw not installed"
 command -v ip >/dev/null || die "iproute2 not installed"
+# Used directly for verdict logging; see the note where the LOG rules are installed.
+command -v iptables >/dev/null || die "iptables not installed"
 command -v python3 >/dev/null || die "python3 not installed"
 
 # --dry-run is what someone runs *before* deciding to let this touch their firewall, so
@@ -136,18 +138,40 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	Would apply:
 	  ufw --force enable
 	  ufw logging full                       # unrate-limited; see note below
+
+	  # Order matters, and these are applied in this order:
 	  ufw allow from $SUBNET to any port <${BENIGN_PORTS}> proto tcp
-	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp   # keep dev stack reachable
-	  (everything else from $SUBNET falls to the default DROP and is logged as BLOCK)
+	  ufw deny  from $SUBNET                                 # everything else = the attacker
+	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp    # keep dev stack reachable
+
+	  PRESERVE_PORTS overlaps the attacker's port list (22, 5432), so the subnet rules
+	  must come first — otherwise attacker traffic to those ports matches a permit rule
+	  and is logged as allowed, mislabelling part of the dataset.
+
+	  Then, into ufw's own chain, two unrate-limited LOG rules:
+	  iptables -I ufw-user-input 1 -s $SUBNET -p tcp -m multiport --dports <${BENIGN_PORTS}> \\
+	           -j LOG --log-prefix "[UFW ALLOW] "
+	  iptables -I ufw-user-input 2 -s $SUBNET -p tcp -m multiport ! --dports <${BENIGN_PORTS}> \\
+	           -j LOG --log-prefix "[UFW BLOCK] "
+
+	  ufw's own 'log' keyword hardcodes -m limit --limit 3/min --limit-burst 10 with no
+	  loglevel check, so it caps verdict lines at ~11 per rule per 30s no matter what
+	  'logging full' says. These replace it. They are removed when ufw reloads on restore.
 
 	  ip netns add $NS
 	  veth $VETH_HOST <-> $VETH_NS, host $HOST_IP/24
 	  namespace addresses: ${USER_IPS[*]}
 	  attackers: ${MALICIOUS_IPS[*]:-none}
 
-	ufw logging must be 'full' rather than the default 'low'. At low/medium/high ufw
-	rate-limits its own LOG rules to 3/min, which would reduce a ${DURATION}s window to a
-	handful of lines regardless of how much traffic is generated.
+	ufw rate-limits logging in two independent places, and both would gut a ${DURATION}s window:
+
+	  1. the AUDIT chains, limited below loglevel 'high' — lifted by 'logging full'
+	  2. the per-rule 'log' keyword, limited unconditionally with no loglevel check
+	     — not lifted by anything, which is why the LOG rules above are installed
+	     directly instead
+
+	Without both, a run returns roughly 11 verdict lines per rule and looks like a
+	firewall that saw almost no traffic.
 	EOF
 	exit 0
 fi
@@ -214,16 +238,13 @@ log "configuring ufw (logging=full, default deny incoming)"
 # only ever match traffic from somewhere else.
 IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
 for p in "${_benign[@]}"; do
-	# `log` is required for an [UFW ALLOW] line. Permitted traffic is otherwise only
-	# visible as the generic [UFW AUDIT] entry, leaving the benign half of the dataset
-	# without an explicit verdict.
-	ufw allow log from "$SUBNET" to any port "$p" proto tcp >/dev/null
+	ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 done
 
 # Everything else from the test subnet is the attacker. An explicit deny is clearer
 # than relying on the default policy and, unlike the default, it is unambiguously
 # attributable to this run.
-ufw deny log from "$SUBNET" >/dev/null
+ufw deny from "$SUBNET" >/dev/null
 
 IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
 for p in "${_preserve[@]}"; do
@@ -231,7 +252,30 @@ for p in "${_preserve[@]}"; do
 done
 ufw logging full >/dev/null
 ufw --force enable >/dev/null
-log "ufw active"
+
+# ---------------------------------------------------------------------------
+# Verdict logging, installed directly rather than through ufw's `log` keyword.
+#
+# ufw hardcodes `-m limit --limit 3/min --limit-burst 10` onto every per-rule log,
+# with no loglevel check (backend_iptables.py: `limit_args` in the rule-snippet
+# builder). `ufw logging full` only lifts the limit from the AUDIT chains, which take
+# their own branch. The result is that a 30s window yields ~11 verdict lines per rule —
+# burst 10 plus 3/min for half a minute — however much traffic crosses the firewall,
+# while the AUDIT lines beside them are complete. A dataset labelled from that is
+# missing 95% of its verdicts.
+#
+# These rules live in ufw's own chain, use the same kernel LOG target and the same
+# prefixes; the only difference is the absence of a rate limit that exists to protect
+# syslog on a production host and has no place in a 30-second measurement. LOG does not
+# terminate a packet's traversal, so the allow/deny rules below still decide its fate.
+# ufw reloads its chains from user.rules on enable/disable, so these do not survive the
+# restore in the exit trap.
+# ---------------------------------------------------------------------------
+iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$BENIGN_PORTS" \
+	-j LOG --log-prefix "[UFW ALLOW] " --log-level 4
+iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$BENIGN_PORTS" \
+	-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
+log "ufw active (verdict logging installed without ufw's 3/min cap)"
 
 # ---------------------------------------------------------------------------
 # Capture window
@@ -278,7 +322,13 @@ sleep 3
 tail -c "+$((LOG_OFFSET + 1))" "$SRC_LOG" 2>/dev/null \
 	| grep -F "SRC=${USER_IP_BASE}" > "$OUT_LOG" || true
 
-LINES=$(wc -l < "$OUT_LOG")
+# NOT named LINES. `LINES` is a bash special variable: with `checkwinsize` on — the
+# default since bash 5.0, and it applies to scripts too whenever the shell has a
+# terminal — bash rewrites LINES with the terminal's height after *every* external
+# command. The assignment below is correct and the value is destroyed one command later,
+# so the manifest silently records the height of whoever's window ran it. It only
+# reproduces on a tty, which is why piped tests never caught it.
+LOG_LINES=$(wc -l < "$OUT_LOG")
 BYTES=$(stat -c %s "$OUT_LOG")
 
 # `grep -c` prints "0" *and* exits 1 when nothing matches, so `|| echo 0` emits "0\n0"
@@ -296,7 +346,17 @@ ALLOWED=$(count_lines 'UFW ALLOW')
 # the totals reconcile: a blocked packet produces both an AUDIT and a BLOCK line.
 AUDITED=$(count_lines 'UFW AUDIT')
 
-if [[ $LINES -eq 0 ]]; then
+# Every captured line carries exactly one ufw prefix, so the verdicts must account for
+# all of them. This is cheap and it is what would have caught LINES being silently
+# replaced by the terminal height: 11 + 33 + 1136 against a reported 17.
+TALLIED=$((BLOCKED + ALLOWED + AUDITED))
+if [[ $TALLIED -ne $LOG_LINES ]]; then
+	echo "warning: verdict counts do not reconcile with the line count" >&2
+	echo "         ${BLOCKED} BLOCK + ${ALLOWED} ALLOW + ${AUDITED} AUDIT = ${TALLIED}, but the file has ${LOG_LINES} lines." >&2
+	echo "         The manifest may be wrong; treat this run as suspect." >&2
+fi
+
+if [[ $LOG_LINES -eq 0 ]]; then
 	echo "warning: no ufw log lines captured. Check that ufw logging is not being" >&2
 	echo "         rate-limited and that $SRC_LOG is being written to." >&2
 fi
@@ -338,7 +398,7 @@ manifest = {
     "output": {
         "log_file": "firewall_${STAMP}.log",
         "ground_truth_file": "firewall_${STAMP}.groundtruth.json",
-        "lines": ${LINES},
+        "lines": ${LOG_LINES},
         "bytes": ${BYTES},
         "ufw_block_lines": ${BLOCKED},
         "ufw_allow_lines": ${ALLOWED},
@@ -356,6 +416,14 @@ manifest = {
         "at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any "
         "verdict line, so lines exceeds the event count: a blocked attempt produces both "
         "an AUDIT and a BLOCK entry",
+        "verdict logging ([UFW ALLOW] / [UFW BLOCK]) was installed as unrate-limited LOG "
+        "rules in ufw's own ufw-user-input chain rather than via ufw's 'log' keyword, "
+        "which hardcodes --limit 3/min --limit-burst 10 regardless of logging level and "
+        "would cap a 30s window at roughly 11 verdict lines per rule. Same kernel LOG "
+        "target, same prefixes, no rate limit",
+        "a blocked SYN is retransmitted by the client kernel, so one blocked attempt can "
+        "produce several BLOCK lines; count distinct SPT values, not lines, to recover "
+        "the attempt count",
     ],
 }
 json.dump(manifest, open(sys.argv[1], "w"), indent=2)
@@ -366,7 +434,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
 fi
 
-log "captured $LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
+log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
 log "sha256 $SHA256"
 log "  log      $OUT_LOG"
 log "  manifest $MANIFEST"
