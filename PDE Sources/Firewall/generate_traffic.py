@@ -18,6 +18,7 @@ import random
 import socket
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 
@@ -168,7 +169,12 @@ def attempt(src_ip, dst_ip, dport, timeout):
     """
     One TCP connection attempt. The outcome is incidental — a blocked SYN times out and
     that is fine. What matters is that the packet crossed the firewall and was logged.
+
+    Returns the moment the SYN actually went out as well, on both clocks: wall time for
+    the record, monotonic for measuring drift against the plan.
     """
+    sent_mono = time.monotonic()
+    sent_at = utc_now()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
@@ -176,14 +182,15 @@ def attempt(src_ip, dst_ip, dport, timeout):
         sport = s.getsockname()[1]
         try:
             s.connect((dst_ip, dport))
-            return sport, "connected"
+            outcome = "connected"
         except socket.timeout:
-            return sport, "timeout"
+            outcome = "timeout"
         except ConnectionRefusedError:
-            # Passed the firewall, nothing listening. Still an ALLOW in the log.
-            return sport, "refused"
+            # Passed the firewall, nothing listening. Still permitted, still logged.
+            outcome = "refused"
         except OSError as exc:
-            return sport, "error:%s" % (exc.errno,)
+            outcome = "error:%s" % (exc.errno,)
+        return sport, outcome, sent_at, sent_mono
     finally:
         s.close()
 
@@ -206,6 +213,9 @@ def main():
     ap.add_argument("--benign-ports", help="comma-separated, firewall-permitted")
     ap.add_argument("--malicious-ports", help="comma-separated, firewall-denied")
     ap.add_argument("--connect-timeout", type=float, default=0.25)
+    ap.add_argument("--max-inflight", type=int, default=64,
+                    help="concurrent connection attempts; must exceed rate * "
+                         "connect-timeout or blocked attempts will queue and drift")
     ap.add_argument("--seed", type=int, help="makes a run reproducible")
     ap.add_argument("--out", help="path for the ground-truth event JSON")
     ap.add_argument("--plan-only", action="store_true",
@@ -255,21 +265,43 @@ def main():
 
     started = utc_now()
     t0 = time.monotonic()
-    executed = []
     late = 0
+    pending = []
 
-    for e in plan:
-        target_t = t0 + e["t_offset"]
-        delay = target_t - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-        else:
-            late += 1
-        sent_at = utc_now()
-        sport, outcome = attempt(e["src"], args.target, e["dport"], args.connect_timeout)
+    # Attempts are dispatched to a pool rather than run in series. A blocked SYN has
+    # nothing to answer it and so occupies the whole connect timeout; run serially, a
+    # 30s window at 10% malicious spent roughly 15s of its budget waiting and fired
+    # 275 of 600 events behind schedule. That compression flattens precisely the timing
+    # differences the attack profiles exist to encode — stealth's even spacing and
+    # syn-burst's spike both collapse toward the same shape.
+    with ThreadPoolExecutor(max_workers=args.max_inflight) as pool:
+        for e in plan:
+            delay = (t0 + e["t_offset"]) - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                late += 1
+            pending.append((e, pool.submit(attempt, e["src"], args.target,
+                                           e["dport"], args.connect_timeout)))
+
+    finished = utc_now()
+
+    executed = []
+    drift_total = 0.0
+    drift_max = 0.0
+    for e, future in pending:
+        sport, outcome, sent_at, sent_mono = future.result()
+        # How far the SYN actually went out from where the plan wanted it. Measured
+        # rather than assumed: a saturated pool queues silently, and a queued attempt
+        # is late in a way the scheduling loop above cannot see.
+        drift = abs((sent_mono - t0) - e["t_offset"])
+        drift_total += drift
+        drift_max = max(drift_max, drift)
         executed.append({
             "seq": e["seq"],
             "sent_at": iso(sent_at),
+            "scheduled_offset": round(e["t_offset"], 3),
+            "actual_offset": round(sent_mono - t0, 3),
             "src": e["src"],
             "sport": sport,
             "dst": args.target,
@@ -277,8 +309,7 @@ def main():
             "label": e["label"],
             "outcome": outcome,
         })
-
-    finished = utc_now()
+    executed.sort(key=lambda x: x["seq"])
 
     ground_truth = {
         "started_utc": iso(started),
@@ -290,10 +321,13 @@ def main():
         "executed_events": len(executed),
         "malicious_events": sum(1 for e in executed if e["label"] == "malicious"),
         "benign_events": sum(1 for e in executed if e["label"] == "benign"),
-        # Attempts that could not be issued on schedule. A non-zero count means the
-        # requested rate outran what the host could drive, and the realised arrival
-        # pattern is compressed relative to the plan.
+        # Attempts the scheduling loop reached after their slot had already passed.
         "events_behind_schedule": late,
+        # What the packets actually did, which is the number that matters: if mean
+        # drift approaches the inter-arrival gap, the realised traffic no longer has
+        # the temporal shape the profile specified and the run should be rated down.
+        "dispatch_drift_mean_s": round(drift_total / max(1, len(executed)), 4),
+        "dispatch_drift_max_s": round(drift_max, 4),
         "users": [{"ip": u, "role": "malicious" if u in malicious else "benign"} for u in users],
         "events": executed,
     }
@@ -301,9 +335,12 @@ def main():
     with open(args.out, "w") as fh:
         json.dump(ground_truth, fh, indent=2)
 
-    print("generated %d events (%d malicious, %d benign) in %.1fs; %d behind schedule"
+    print("generated %d events (%d malicious, %d benign) in %.1fs; "
+          "dispatch drift mean %.3fs max %.3fs"
           % (len(executed), ground_truth["malicious_events"],
-             ground_truth["benign_events"], ground_truth["elapsed_seconds"], late))
+             ground_truth["benign_events"], ground_truth["elapsed_seconds"],
+             ground_truth["dispatch_drift_mean_s"],
+             ground_truth["dispatch_drift_max_s"]))
 
 
 if __name__ == "__main__":

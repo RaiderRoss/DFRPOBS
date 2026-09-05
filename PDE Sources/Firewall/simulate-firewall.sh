@@ -205,13 +205,29 @@ ip netns exec "$NS" ip link set "$VETH_NS" up
 # Firewall
 # ---------------------------------------------------------------------------
 log "configuring ufw (logging=full, default deny incoming)"
+# Rule ORDER carries the labelling, and ufw evaluates in the order rules are added.
+# PRESERVE_PORTS deliberately overlaps MALICIOUS_PORTS (22 and 5432 are both a service
+# this host needs reachable and a port an attacker probes). If the preserve rules came
+# first they would match the simulated attacker too, and those attempts would be logged
+# as permitted — silently mislabelling part of the dataset. So the test subnet's rules
+# are added first and are scoped to the subnet, and the host-wide preserve rules can
+# only ever match traffic from somewhere else.
+IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
+for p in "${_benign[@]}"; do
+	# `log` is required for an [UFW ALLOW] line. Permitted traffic is otherwise only
+	# visible as the generic [UFW AUDIT] entry, leaving the benign half of the dataset
+	# without an explicit verdict.
+	ufw allow log from "$SUBNET" to any port "$p" proto tcp >/dev/null
+done
+
+# Everything else from the test subnet is the attacker. An explicit deny is clearer
+# than relying on the default policy and, unlike the default, it is unambiguously
+# attributable to this run.
+ufw deny log from "$SUBNET" >/dev/null
+
 IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
 for p in "${_preserve[@]}"; do
 	ufw allow "$p/tcp" >/dev/null
-done
-IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
-for p in "${_benign[@]}"; do
-	ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 done
 ufw logging full >/dev/null
 ufw --force enable >/dev/null
@@ -264,10 +280,21 @@ tail -c "+$((LOG_OFFSET + 1))" "$SRC_LOG" 2>/dev/null \
 
 LINES=$(wc -l < "$OUT_LOG")
 BYTES=$(stat -c %s "$OUT_LOG")
-# `|| echo 0` rather than `|| true`: grep exits 1 on zero matches and prints nothing,
-# which would leave these empty and produce invalid JSON in the manifest below.
-BLOCKED=$(grep -c 'UFW BLOCK' "$OUT_LOG" || echo 0)
-ALLOWED=$(grep -c 'UFW ALLOW' "$OUT_LOG" || echo 0)
+
+# `grep -c` prints "0" *and* exits 1 when nothing matches, so `|| echo 0` emits "0\n0"
+# — two values where the manifest expects one, which is a JSON syntax error rather than
+# a wrong number. `|| true` keeps grep's own "0" and only suppresses the exit status.
+count_lines() {
+	local n
+	n=$(grep -c "$1" "$OUT_LOG" 2>/dev/null || true)
+	printf '%s' "${n:-0}"
+}
+BLOCKED=$(count_lines 'UFW BLOCK')
+ALLOWED=$(count_lines 'UFW ALLOW')
+# At `logging full` ufw also emits an [UFW AUDIT] line for every packet it sees, from
+# the ufw-before-logging chains, in addition to any verdict line. Counted separately so
+# the totals reconcile: a blocked packet produces both an AUDIT and a BLOCK line.
+AUDITED=$(count_lines 'UFW AUDIT')
 
 if [[ $LINES -eq 0 ]]; then
 	echo "warning: no ufw log lines captured. Check that ufw logging is not being" >&2
@@ -315,15 +342,20 @@ manifest = {
         "bytes": ${BYTES},
         "ufw_block_lines": ${BLOCKED},
         "ufw_allow_lines": ${ALLOWED},
+        "ufw_audit_lines": ${AUDITED},
         "sha256": "${SHA256}",
     },
     "caveats": [
         "syslog timestamps carry no year and no sub-second precision; the authoritative "
         "window bounds are window.start_utc/end_utc recorded by the generator",
         "lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the "
-        "same window is excluded",
+        "same window is excluded. Both directions are kept, so the host's RST replies to "
+        "refused connections appear alongside the inbound attempts",
         "ufw logging was set to 'full' for the run; at the default 'low' its LOG rules are "
         "rate-limited to 3/min and most of the window would be lost",
+        "at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any "
+        "verdict line, so lines exceeds the event count: a blocked attempt produces both "
+        "an AUDIT and a BLOCK entry",
     ],
 }
 json.dump(manifest, open(sys.argv[1], "w"), indent=2)

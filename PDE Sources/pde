@@ -374,11 +374,15 @@ print()
 kv("log lines", o["lines"])
 kv("  UFW BLOCK", o["ufw_block_lines"])
 kv("  UFW ALLOW", o["ufw_allow_lines"])
+# At logging full every packet also gets an AUDIT line, so lines will exceed the
+# event count. Shown rather than hidden, otherwise the totals look wrong.
+kv("  UFW AUDIT", o.get("ufw_audit_lines", "-"))
 kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/firewall_${run}.manifest.json"
 
 	head_ "Evidence — first 12 lines"
 	sed -e "s/\[UFW BLOCK\]/${C_ERR}[UFW BLOCK]${R}/g" \
 		-e "s/\[UFW ALLOW\]/${C_OK}[UFW ALLOW]${R}/g" \
+		-e "s/\[UFW AUDIT\]/${C_DIM}[UFW AUDIT]${R}/g" \
 		-e "s/\(SRC=[0-9.]*\)/${C_TITLE}\1${R}/g" \
 		-e "s/\(DPT=[0-9]*\)/${C_KEY}\1${R}/g" \
 		"$OUTDIR/firewall_${run}.log" 2>/dev/null | head -12 | sed 's/^/    /'
