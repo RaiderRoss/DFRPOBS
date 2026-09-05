@@ -1,0 +1,40 @@
+// Workaround for Fineract 1.9.0 build breakage after the JCenter shutdown.
+//
+// The asciidoctor-gradle-jvm-gems plugin pulls in, transitively:
+//   org.asciidoctor.jvm.gems 3.3.2
+//     -> jruby-gradle-core-plugin 2.0.2
+//       -> http-builder-ng-okhttp 1.0.3
+//         -> com.burgstaller:okhttp-digest:1.10
+//
+// com.burgstaller:okhttp-digest was published only to JCenter and no longer
+// exists in any live repository — the Gradle Plugin Portal redirects to Maven
+// Central, which 404s. The library was relocated to the groupId
+// io.github.rburgst (same com.burgstaller.okhttp.* packages), oldest published
+// version 1.21.
+//
+// Fineract's root buildscript block (build.gradle:55) declares only
+// plugins.gradle.org/m2, so mavenCentral() is also needed on the buildscript
+// classpath to find the substitute.
+//
+// This affects only the *build plugin* classpath. okhttp-digest is used solely
+// for HTTP digest auth when jruby-gradle downloads gems for the docs tasks,
+// which jibDockerBuild never executes.
+//
+// Applied with --init-script so the Fineract working tree stays unmodified:
+//
+//   ./gradlew --no-daemon --console=plain \
+//     --init-script <this file> \
+//     :fineract-provider:jibDockerBuild -x test
+
+gradle.projectsLoaded { g ->
+    g.rootProject.allprojects { project ->
+        project.buildscript.repositories {
+            mavenCentral()
+        }
+        project.buildscript.configurations.all { cfg ->
+            cfg.resolutionStrategy.dependencySubstitution {
+                substitute module('com.burgstaller:okhttp-digest') using module('io.github.rburgst:okhttp-digest:1.21')
+            }
+        }
+    }
+}
