@@ -35,21 +35,18 @@ enabled, and `rsyslogd` running with the stock `/etc/rsyslog.d/20-ufw.conf` rule
 
 ## Usage
 
-Normally you drive this through the CLI one level up, which adds environment checks,
-attack selection and output access — see [../README.md](../README.md):
+Normally you drive this through the console one level up, which adds the environment
+check, attack selection, previews and evidence viewing — see [../README.md](../README.md):
 
 ```bash
-../pde doctor
-../pde preview
-../pde run --duration 30 --profile port-scan
+cd .. && ./pde
 ```
 
-The script is also usable directly:
+The script stays flag-driven so runs can be scripted or reproduced without the console:
 
 ```bash
 ./simulate-firewall.sh --dry-run          # review the firewall changes first — no root needed
-sudo ./simulate-firewall.sh --users 10 --duration 30 --malicious-pct 10 \
-     --attack-profile brute-force
+sudo ./simulate-firewall.sh --users 10 --duration 30 --attack-profile brute-force
 ```
 
 Output lands in `PDE Sources/output/`:
@@ -82,8 +79,13 @@ the script keeps the dev stack's ports reachable; extend it if you add services.
 
 ## Parameters
 
-`--users`, `--duration`, `--rate`, `--malicious-pct`, `--malicious-users`, `--seed`,
-`--outdir`.
+`--users`, `--duration`, `--rate`, `--malicious-pct`, `--malicious-users`,
+`--attack-profile`, `--seed`, `--outdir`.
+
+`--attack-profile` is one of `port-scan`, `brute-force`, `db-probe`, `stealth`,
+`syn-burst`, `mixed`. Each changes both the ports the attacker reaches for and how the
+attempts are spread in time; `generate_traffic.py --list-profiles` describes them, and
+`--plan-only` prints the resulting port histogram without sending anything.
 
 `--malicious-pct` (share of *events*) and `--malicious-users` (how many *users* attack)
 are independent knobs. The brief's "10%, 10:1" conflates them — 10:1 users is 9.09% of
@@ -94,8 +96,9 @@ users, which is not 10% of events. Defaults here are 1 attacker in 10 users gene
 
 ## Status
 
-Verified: syntax, `--dry-run`, and the traffic generator end to end (30 events in 3.0s
-against loopback, correct source-port binding and outcomes).
+Verified without root: syntax, `--dry-run`, the traffic generator end to end (30 events
+in 3.0s against loopback, correct source-port binding and outcomes), and all six attack
+profiles producing distinct port distributions.
 
 Not yet verified: the privileged path — namespace creation, `ufw enable`, and the log
 capture itself. That needs a `sudo` run, which is the next step.

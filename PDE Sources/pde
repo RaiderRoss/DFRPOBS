@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
+# ==============================================================
+#  PDE SOURCE CONSOLE
 #
-# pde — CLI for the DFRaaS PDE (Potential Digital Evidence) source simulators.
+#  Interactive front end for the Potential Digital Evidence
+#  simulators: configure a scenario, choose how the attacker
+#  behaves, capture a window, and read the evidence back.
 #
-# Wraps the per-source simulation scripts with configuration, environment checks,
-# attack selection and access to the captured output.
+#  The simulators themselves stay flag-driven and scriptable —
+#  this console drives them, it does not replace them.
 #
-#   ./pde doctor              can this machine actually capture firewall logs?
-#   ./pde preview             what would a run do, without touching anything
-#   ./pde run                 run it (prompts for sudo)
-#   ./pde ls                  what has been captured
-#
-set -euo pipefail
+#  Usage:  bash "PDE Sources/pde"
+# ==============================================================
+set -u
 
-PDE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FW_DIR="$PDE_ROOT/Firewall"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FW_DIR="$SCRIPT_DIR/Firewall"
 FW_SCRIPT="$FW_DIR/simulate-firewall.sh"
 FW_GEN="$FW_DIR/generate_traffic.py"
-CONFIG_FILE="${PDE_CONFIG:-$PDE_ROOT/pde.conf}"
+CONFIG_FILE="${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}"
 
-# ---------- Defaults (overridden by pde.conf, then by flags) ----------
+# ---- scenario defaults ---------------------------------------
 USERS=10
 DURATION=30
 RATE=20
@@ -26,546 +27,505 @@ MALICIOUS_PCT=10
 MALICIOUS_USERS=1
 ATTACK_PROFILE=port-scan
 SEED=1337
-OUTDIR="$PDE_ROOT/output"
+OUTDIR="$SCRIPT_DIR/output"
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
-# `if` rather than `[[ ... ]] && source`: under `set -e` a failing && compound is itself
-# a failure, so the common case of "no config file yet" would exit before main() ran.
-if [[ -f "$CONFIG_FILE" ]]; then
-	# shellcheck source=/dev/null
-	source "$CONFIG_FILE"
-fi
+# ---- palette -------------------------------------------------
+# Matches Anomaly Detection/Scripts/slips-cli.sh so the two consoles read as
+# one product rather than two tools that happen to share a repo.
+C_TITLE=$'\033[1;38;5;74m'
+C_DIM=$'\033[38;5;244m'
+C_OK=$'\033[38;5;72m'
+C_WARN=$'\033[38;5;179m'
+C_ERR=$'\033[38;5;167m'
+C_KEY=$'\033[38;5;179m'
+C_NUM=$'\033[1;38;5;110m'
+C_RULE=$'\033[38;5;238m'
+R=$'\033[0m'
 
-CONFIG_KEYS=(USERS DURATION RATE MALICIOUS_PCT MALICIOUS_USERS ATTACK_PROFILE SEED OUTDIR)
+rule() { printf '%s%s%s\n' "$C_RULE" "──────────────────────────────────────────────────────────────" "$R"; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$R"; }
+ok()   { printf '  %s✓%s %s\n' "$C_OK" "$R" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_WARN" "$R" "$*"; }
+err()  { printf '  %s✗%s %s\n' "$C_ERR" "$R" "$*"; }
+head_(){ printf '\n%s%s%s\n' "$C_TITLE" "$*" "$R"; }
+pause(){ printf '\n%s  press enter to continue%s' "$C_DIM" "$R"; read -r _; }
+kv()   { printf '    %s%-28s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
 
-# ---------- Presentation ----------
-# Colour only when a human is reading. Honours NO_COLOR (https://no-color.org).
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-	C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
-	C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
-	C_BLUE=$'\033[34m'; C_MAGENTA=$'\033[35m'; C_CYAN=$'\033[36m'
-else
-	C_RESET=""; C_BOLD=""; C_DIM=""
-	C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
-fi
+# ---- state ---------------------------------------------------
+ufw_enabled()  { grep -E '^ENABLED='  /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
+ufw_loglevel() { grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
+rsyslog_up()   { pgrep -x rsyslogd >/dev/null 2>&1; }
 
-hdr()  { printf '\n%s%s%s\n' "${C_BOLD}${C_CYAN}" "$*" "$C_RESET"; }
-sub()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
-ok()   { printf '  %s✓%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
-bad()  { printf '  %s✗%s %s\n' "$C_RED" "$C_RESET" "$*"; }
-warn() { printf '  %s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-inf()  { printf '  %s·%s %s\n' "$C_DIM" "$C_RESET" "$*"; }
-note() { printf '    %s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
-kv()   { printf '  %-20s %s%s%s\n' "$1" "$C_BOLD" "$2" "$C_RESET"; }
-die()  { printf '%serror:%s %s\n' "${C_BOLD}${C_RED}" "$C_RESET" "$*" >&2; exit 1; }
-
-confirm() {
-	local prompt="$1"
-	[[ "${ASSUME_YES:-0}" == "1" ]] && return 0
-	printf '%s%s%s [y/N] ' "$C_BOLD" "$prompt" "$C_RESET"
-	local reply; read -r reply
-	[[ "$reply" =~ ^[Yy]$ ]]
+# `grep -c` prints 0 *and* exits 1 with no matches, so `grep -c ... || echo 0`
+# emits "0\n0" and shifts every later printf argument. Count into a variable.
+run_count() {
+	local n=0
+	[ -d "$OUTDIR" ] && n=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | wc -l)
+	printf '%s' "${n:-0}"
 }
 
-# ---------- Help ----------
-cmd_help() {
-	case "${1:-}" in
-		run)      help_run; return ;;
-		attacks)  cmd_attacks; return ;;
-		config)   help_config; return ;;
-		"")       : ;;
-		*)        die "no help topic for '$1'" ;;
+latest_run() {
+	[ -d "$OUTDIR" ] || return 1
+	local f
+	f=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort | tail -1)
+	[ -n "$f" ] || return 1
+	basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
+}
+
+# Reads one value out of a run's manifest. The expression is evaluated against
+# `m`, the parsed manifest.
+manifest_field() {
+	python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' \
+		"$OUTDIR/firewall_$1.manifest.json" "$2" 2>/dev/null
+}
+
+# ---- status banner -------------------------------------------
+banner() {
+	clear
+	rule
+	printf '%s  PDE SOURCE CONSOLE%s\n' "$C_TITLE" "$R"
+	rule
+
+	local fw rs en
+	en="$(ufw_enabled)"
+	if [ "$en" = "yes" ]; then fw="${C_WARN}active${R}"; else fw="${C_DIM}inactive${R}"; fi
+	if rsyslog_up; then rs="${C_OK}running${R}"; else rs="${C_ERR}stopped${R}"; fi
+	printf '  %sufw%s %-22b %srsyslog%s %-22b %sloglevel%s %s\n' \
+		"$C_DIM" "$R" "$fw" "$C_DIM" "$R" "$rs" "$C_DIM" "$R" "$(ufw_loglevel)"
+
+	# Assembled as single strings then printed with one %s each, so an argument
+	# count can never drift out of step with the format.
+	printf '  %s\n' "${C_DIM}users${R} ${C_KEY}${USERS}${R} ${C_DIM}(${MALICIOUS_USERS} attacking)${R}   ${C_DIM}window${R} ${C_KEY}${DURATION}s${R}   ${C_DIM}rate${R} ${C_KEY}${RATE}/s${R}   ${C_DIM}malicious${R} ${C_KEY}${MALICIOUS_PCT}%${R}"
+	printf '  %s\n' "${C_DIM}profile${R} ${C_KEY}${ATTACK_PROFILE}${R}   ${C_DIM}seed${R} ${C_KEY}${SEED}${R}"
+
+	local n; n="$(run_count)"
+	if [ "${n:-0}" -gt 0 ]; then
+		local last lines blocked
+		last="$(latest_run)"
+		lines="$(manifest_field "$last" 'm["output"]["lines"]')"
+		blocked="$(manifest_field "$last" 'm["output"]["ufw_block_lines"]')"
+		printf '  %s\n' "${C_DIM}captured${R} ${C_KEY}${n}${R}   ${C_DIM}latest${R} ${C_KEY}${last}${R} ${C_DIM}(${lines:-?} lines, ${C_ERR}${blocked:-?} BLOCK${C_DIM})${R}"
+	else
+		printf '  %s\n' "${C_DIM}captured${R} ${C_DIM}nothing yet${R}"
+	fi
+	rule
+}
+
+# ---- profile catalogue ---------------------------------------
+# Short signature lines rather than shelling to the generator on every redraw:
+# the menu has to stay instant, and this is what the log actually shows.
+profile_signature() {
+	case "$1" in
+		port-scan)   printf 'one SRC, many different DPTs — a wide BLOCK fan-out' ;;
+		brute-force) printf 'one SRC, one DPT, many SPTs — repeated BLOCKs on 22' ;;
+		db-probe)    printf 'database ports only — narrow and deliberate' ;;
+		stealth)     printf 'evenly spaced, maximal gaps — slips rate thresholds' ;;
+		syn-burst)   printf 'every attempt in one short spike against one port' ;;
+		mixed)       printf 'sweep first, then pressure on a single port' ;;
+		*)           printf 'unknown profile' ;;
 	esac
-
-	printf '%s%spde%s — PDE source simulators for DFRaaS\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-	sub "Generates real evidence files from controlled traffic scenarios."
-
-	hdr "Simulation"
-	printf '  %-24s %s\n' "sources"            "list PDE sources and what is implemented"
-	printf '  %-24s %s\n' "run [SOURCE]"       "run a simulation (default: firewall)"
-	printf '  %-24s %s\n' "attacks"            "attack profiles, and how each looks in the log"
-	printf '  %-24s %s\n' "preview"            "show the firewall changes and event plan; no root, no packets"
-
-	hdr "Captured output"
-	printf '  %-24s %s\n' "ls"                 "list captured runs"
-	printf '  %-24s %s\n' "show [RUN]"         "summary of a run  (--log, --truth for detail)"
-	printf '  %-24s %s\n' "verify [RUN]"       "re-hash the log and check it against the manifest"
-	printf '  %-24s %s\n' "path [RUN]"         "print file paths, one per line (pipe-friendly)"
-	printf '  %-24s %s\n' "clean"              "delete captured runs"
-
-	hdr "Setup"
-	printf '  %-24s %s\n' "doctor"             "check this machine can actually capture ufw logs"
-	printf '  %-24s %s\n' "config"             "show or change defaults  (config set KEY VALUE)"
-	printf '  %-24s %s\n' "help [COMMAND]"     "this, or detail for one command"
-
-	hdr "Examples"
-	note "pde doctor                                 # start here"
-	note "pde preview --profile stealth              # see the plan before committing"
-	note "pde run --duration 60 --profile brute-force"
-	note "pde show latest --log                      # colourised ufw lines"
-	note "pde verify latest                          # integrity check"
-	printf '\n'
-	sub "RUN is a run id (e.g. 20260905143000) or 'latest'. Defaults to latest."
-	printf '\n'
 }
 
-help_run() {
-	printf '%s%spde run%s [SOURCE] [options]\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-	sub "Runs a simulation and captures its evidence file. Needs root, so it will"
-	sub "prompt for sudo. The host firewall is restored on exit, including on Ctrl-C."
-	hdr "Options"
-	printf '  %-26s %s (%s)\n' "--users N"            "simulated users, one source IP each" "$USERS"
-	printf '  %-26s %s (%s)\n' "--duration S"         "capture window, seconds" "$DURATION"
-	printf '  %-26s %s (%s)\n' "--rate R"             "connection attempts per second" "$RATE"
-	printf '  %-26s %s (%s)\n' "--malicious-pct P"    "share of events that are malicious" "$MALICIOUS_PCT"
-	printf '  %-26s %s (%s)\n' "--malicious-users N"  "how many users are attackers" "$MALICIOUS_USERS"
-	printf '  %-26s %s (%s)\n' "--profile P"          "attacker behaviour; see 'pde attacks'" "$ATTACK_PROFILE"
-	printf '  %-26s %s (%s)\n' "--seed N"             "makes the run reproducible" "$SEED"
-	printf '  %-26s %s\n'      "--outdir DIR"         "where output lands"
-	printf '  %-26s %s\n'      "--yes"                "skip the confirmation prompt"
-	hdr "On the two ratio knobs"
-	note "--malicious-pct controls the share of *events*; --malicious-users controls how"
-	note "many *users* attack. They are independent. '10%' and '10:1' are different"
-	note "claims — 10:1 users is 9.09% — so say which one the write-up means."
-	printf '\n'
-}
+profile_menu() {
+	local names="port-scan brute-force db-probe stealth syn-burst mixed"
+	while true; do
+		banner
+		head_ "Choose how the attacker behaves"
+		dim "  A firewall log has no 'malicious' column — only a source, a destination"
+		dim "  port and a verdict. An attack is therefore only ever a shape."
+		echo
+		local i=1 p mark
+		for p in $names; do
+			if [ "$p" = "$ATTACK_PROFILE" ]; then mark="${C_OK}◂ selected${R}"; else mark=""; fi
+			printf '  %s%s%s  %-13s %s%-46s%s %b\n' "$C_NUM" "$i" "$R" "$p" \
+				"$C_DIM" "$(profile_signature "$p")" "$R" "$mark"
+			i=$((i + 1))
+		done
+		echo
+		printf '  %s7%s  Preview this profile %s(port histogram, no packets sent)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		echo
+		printf '  %s0%s  back\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r a
 
-help_config() {
-	printf '%s%spde config%s [show | set KEY VALUE | reset]\n\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
-	sub "Defaults live in $CONFIG_FILE and are overridden by flags on any run."
-	hdr "Keys"
-	for k in "${CONFIG_KEYS[@]}"; do printf '  %-20s %s\n' "$k" "${!k}"; done
-	printf '\n'
-	note "pde config set DURATION 60"
-	note "pde config set ATTACK_PROFILE stealth"
-	printf '\n'
-}
-
-# ---------- Sources ----------
-cmd_sources() {
-	hdr "PDE sources"
-	printf '  %-16s %-14s %s\n' "SOURCE" "PRODUCT" "STATUS"
-	if [[ -x "$FW_SCRIPT" ]]; then
-		printf '  %-16s %-14s %s%s%s\n' "firewall" "ufw" "$C_GREEN" "implemented" "$C_RESET"
-	else
-		printf '  %-16s %-14s %s%s%s\n' "firewall" "ufw" "$C_RED" "script missing" "$C_RESET"
-	fi
-	printf '  %-16s %-14s %s%s%s\n' "ids" "Slips" "$C_DIM" "not built yet" "$C_RESET"
-	printf '  %-16s %-14s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$C_RESET"
-	printf '\n'
-	sub "One EvidenceItem per source per window; the three windows correlate."
-	printf '\n'
-}
-
-# ---------- Attacks ----------
-cmd_attacks() {
-	command -v python3 >/dev/null || die "python3 required"
-	hdr "Attack profiles"
-	sub "A firewall log has no 'malicious' column — only a source, a port and a verdict."
-	sub "Each profile changes which ports the attacker reaches for and how the attempts"
-	sub "are spread in time, which is what gives it a distinguishable shape."
-	printf '\n'
-	python3 "$FW_GEN" --list-profiles | python3 -c '
-import json, sys, textwrap
-d = json.load(sys.stdin)
-bold, dim, cyan, reset = "'"$C_BOLD"'", "'"$C_DIM"'", "'"$C_CYAN"'", "'"$C_RESET"'"
-for name, desc in d["profiles"].items():
-    tag = "  (default)" if name == d["default"] else ""
-    print("  %s%s%s%s%s%s" % (bold, cyan, name, reset, dim, tag), end="")
-    print(reset)
-    for line in textwrap.wrap(desc, 72):
-        print("      " + line)
-    print()
-'
-	sub "Select with:  pde run --profile NAME     preview with:  pde preview --profile NAME"
-	printf '\n'
-}
-
-# ---------- Doctor ----------
-cmd_doctor() {
-	local failures=0
-	hdr "Environment"
-	kv "kernel" "$(uname -r)"
-	kv "distro"  "$(. /etc/os-release && echo "$PRETTY_NAME")"
-
-	hdr "Requirements"
-	if command -v ufw >/dev/null; then ok "ufw installed — $(ufw --version 2>/dev/null | head -1)"
-	else bad "ufw not installed"; note "sudo apt install ufw"; failures=$((failures + 1)); fi
-
-	for tool in ip python3 sha256sum; do
-		if command -v "$tool" >/dev/null; then ok "$tool available"
-		else bad "$tool missing"; failures=$((failures + 1)); fi
-	done
-
-	if pgrep -x rsyslogd >/dev/null; then
-		ok "rsyslogd running — ufw lines will reach /var/log/ufw.log"
-	else
-		bad "rsyslogd not running — the kernel would log, but nothing would file it"
-		note "sudo systemctl start rsyslog"
-		failures=$((failures + 1))
-	fi
-
-	# The single most load-bearing check: without this target there is no log at all.
-	if [[ -f /proc/config.gz ]] && zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_NETFILTER_XT_TARGET_LOG=[my]'; then
-		ok "kernel has the netfilter LOG target"
-	elif [[ -f "/lib/modules/$(uname -r)/kernel/net/netfilter/xt_LOG.ko" ]]; then
-		ok "kernel has the netfilter LOG target (module present)"
-	else
-		bad "netfilter LOG target not found — ufw could filter but never log"
-		failures=$((failures + 1))
-	fi
-
-	hdr "State"
-	local enabled; enabled=$(grep -E '^ENABLED=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2 || echo "?")
-	local loglevel; loglevel=$(grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2 || echo "?")
-	kv "ufw enabled" "$enabled"
-	kv "ufw loglevel" "$loglevel"
-	if [[ "$loglevel" != "full" ]]; then
-		warn "loglevel is '$loglevel'; a run sets it to 'full' and restores it after"
-		note "at low/medium/high ufw rate-limits its own LOG rules to 3/min, which would"
-		note "reduce a ${DURATION}s window to a handful of lines"
-	fi
-	if [[ "$enabled" == "yes" ]]; then
-		warn "ufw is already active — a run will add rules and restore your ruleset after"
-	fi
-
-	if [[ $EUID -eq 0 ]]; then ok "running as root"
-	else inf "not root; 'pde run' will prompt for sudo"; fi
-
-	local containers=0
-	if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
-		containers=$(docker ps -q | wc -l)
-	fi
-	if [[ "$containers" -gt 0 ]]; then
-		warn "$containers Docker container(s) running"
-		note "enabling ufw sets FORWARD policy to DROP, which can disturb container"
-		note "networking while the run is in progress"
-	fi
-
-	hdr "Output"
-	if mkdir -p "$OUTDIR" 2>/dev/null && [[ -w "$OUTDIR" ]]; then ok "writable — $OUTDIR"
-	else bad "cannot write to $OUTDIR"; failures=$((failures + 1)); fi
-
-	printf '\n'
-	if [[ $failures -eq 0 ]]; then
-		printf '  %s%sReady.%s Next: %spde preview%s\n\n' "$C_BOLD" "$C_GREEN" "$C_RESET" "$C_CYAN" "$C_RESET"
-	else
-		printf '  %s%s%d check(s) failed.%s Fix those before running.\n\n' "$C_BOLD" "$C_RED" "$failures" "$C_RESET"
-		return 1
-	fi
-}
-
-# ---------- Run / preview ----------
-parse_run_flags() {
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--users) USERS="$2"; shift 2 ;;
-			--duration) DURATION="$2"; shift 2 ;;
-			--rate) RATE="$2"; shift 2 ;;
-			--malicious-pct) MALICIOUS_PCT="$2"; shift 2 ;;
-			--malicious-users) MALICIOUS_USERS="$2"; shift 2 ;;
-			--profile|--attack-profile) ATTACK_PROFILE="$2"; shift 2 ;;
-			--seed) SEED="$2"; shift 2 ;;
-			--outdir) OUTDIR="$2"; shift 2 ;;
-			--yes|-y) ASSUME_YES=1; shift ;;
-			-h|--help) help_run; exit 0 ;;
-			*) die "unknown option '$1' (try: pde help run)" ;;
+		case "$a" in
+			1) ATTACK_PROFILE=port-scan;   persist ATTACK_PROFILE ;;
+			2) ATTACK_PROFILE=brute-force; persist ATTACK_PROFILE ;;
+			3) ATTACK_PROFILE=db-probe;    persist ATTACK_PROFILE ;;
+			4) ATTACK_PROFILE=stealth;     persist ATTACK_PROFILE ;;
+			5) ATTACK_PROFILE=syn-burst;   persist ATTACK_PROFILE ;;
+			6) ATTACK_PROFILE=mixed;       persist ATTACK_PROFILE ;;
+			7) preview_plan ;;
+			0|q) return ;;
+			*) ;;
 		esac
 	done
 }
 
-run_summary() {
-	kv "source"          "firewall (ufw)"
-	kv "users"           "$USERS  ($MALICIOUS_USERS attacking)"
-	kv "window"          "${DURATION}s at ${RATE} events/s  (~$((DURATION * RATE)) events)"
-	kv "malicious share" "${MALICIOUS_PCT}% of events"
-	kv "attack profile"  "$ATTACK_PROFILE"
-	kv "seed"            "$SEED"
-	kv "output"          "$OUTDIR"
+# ---- configuration -------------------------------------------
+persist() {
+	local key="$1" value="${!1}"
+	touch "$CONFIG_FILE" 2>/dev/null || return 0
+	if grep -qE "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+		sed -i "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE"
+	else
+		printf '%s=%s\n' "$key" "$value" >> "$CONFIG_FILE"
+	fi
 }
 
-cmd_preview() {
-	parse_run_flags "$@"
-	[[ -x "$FW_SCRIPT" ]] || die "$FW_SCRIPT not found or not executable"
+ask_number() {
+	local var="$1" prompt="$2" hint="$3" current="${!1}" reply
+	printf '\n  %s%s%s\n' "$C_TITLE" "$prompt" "$R"
+	dim "  $hint"
+	printf '  %scurrent%s %s%s%s   %snew value (enter to keep)>%s ' \
+		"$C_DIM" "$R" "$C_KEY" "$current" "$R" "$C_DIM" "$R"
+	read -r reply
+	[ -z "$reply" ] && return
+	case "$reply" in
+		*[!0-9.]*|'') err "not a number — keeping $current"; sleep 1; return ;;
+	esac
+	printf -v "$var" '%s' "$reply"
+	persist "$var"
+}
 
-	hdr "Planned run"
-	run_summary
+configure_menu() {
+	while true; do
+		banner
+		head_ "Scenario configuration"
+		dim "  Saved to pde.conf and passed to the simulator on every run."
+		echo
+		printf '  %s1%s  Users            %s%-7s%s %sone source IP each; a user in a firewall log IS an IP%s\n' "$C_NUM" "$R" "$C_KEY" "$USERS" "$R" "$C_DIM" "$R"
+		printf '  %s2%s  Duration         %s%-7s%s %sseconds captured — this is the EvidenceItem window%s\n'    "$C_NUM" "$R" "$C_KEY" "${DURATION}s" "$R" "$C_DIM" "$R"
+		printf '  %s3%s  Rate             %s%-7s%s %sattempts per second, all users combined%s\n'               "$C_NUM" "$R" "$C_KEY" "${RATE}/s" "$R" "$C_DIM" "$R"
+		printf '  %s4%s  Malicious share  %s%-7s%s %spercentage of EVENTS that are malicious%s\n'               "$C_NUM" "$R" "$C_KEY" "${MALICIOUS_PCT}%" "$R" "$C_DIM" "$R"
+		printf '  %s5%s  Attackers        %s%-7s%s %show many USERS attack — a separate knob from 4%s\n'        "$C_NUM" "$R" "$C_KEY" "$MALICIOUS_USERS" "$R" "$C_DIM" "$R"
+		printf '  %s6%s  Seed             %s%-7s%s %ssame seed, same run — keep it for reproducibility%s\n'     "$C_NUM" "$R" "$C_KEY" "$SEED" "$R" "$C_DIM" "$R"
+		echo
+		local total mal
+		total=$(awk "BEGIN{printf \"%d\", $DURATION * $RATE}")
+		mal=$(awk "BEGIN{printf \"%d\", $DURATION * $RATE * $MALICIOUS_PCT / 100}")
+		printf '  %s\n' "${C_DIM}this scenario produces${R} ${C_KEY}${total}${R} ${C_DIM}events, of which${R} ${C_KEY}${mal}${R} ${C_DIM}are malicious${R}"
+		echo
+		printf '  %s0%s  back\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r a
 
-	hdr "Firewall changes"
+		case "$a" in
+			1) ask_number USERS           "Number of simulated users" "the brief says 10" ;;
+			2) ask_number DURATION        "Capture window in seconds" "the brief says 30" ;;
+			3) ask_number RATE            "Events per second"         "20 gives 600 events across a 30s window" ;;
+			4) ask_number MALICIOUS_PCT   "Malicious share of events" "the brief says 10%" ;;
+			5) ask_number MALICIOUS_USERS "How many users attack"     "1 of 10. Note 10:1 users is 9.09%, not 10% — these are different claims" ;;
+			6) ask_number SEED            "Random seed"               "any integer; the whole run is reproducible from it" ;;
+			0|q) return ;;
+			*) ;;
+		esac
+	done
+}
+
+# ---- preview -------------------------------------------------
+preview_plan() {
+	banner
+	head_ "Event plan for '$ATTACK_PROFILE'"
+	dim "  Built from seed $SEED. No packets are sent and nothing is changed."
+	echo
+	local ips="" mal="" i
+	for i in $(seq 1 "$USERS"); do ips="${ips}${ips:+,}10.99.0.$((10 + i))"; done
+	for i in $(seq 0 $((MALICIOUS_USERS - 1))); do mal="${mal}${mal:+,}10.99.0.$((10 + USERS - i))"; done
+
+	python3 "$FW_GEN" --plan-only \
+		--users "$ips" --malicious-users "$mal" --target 10.99.0.1 \
+		--duration "$DURATION" --rate "$RATE" --malicious-pct "$MALICIOUS_PCT" \
+		--attack-profile "$ATTACK_PROFILE" \
+		--benign-ports 80,443,8080 \
+		--malicious-ports 21,22,23,135,139,445,1433,3306,3389,5432,5900,6379,9200,27017 \
+		--seed "$SEED" --out /dev/null 2>&1 \
+	| python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("    %-20s %s" % ("planned events", d["planned_events"]))
+print("    %-20s %s" % ("malicious", d["malicious_events"]))
+print("    %-20s %s" % ("benign", d["benign_events"]))
+h = d["malicious_port_histogram"]
+if h:
+    print()
+    print("    malicious attempts by destination port:")
+    top = max(h.values())
+    for p, n in sorted(h.items(), key=lambda kv: -kv[1]):
+        print("      %-7s %-4s %s" % (p, n, "#" * max(1, int(n * 34 / top))))'
+	echo
+	dim "  This shape is all detection has to work with. Worth comparing profiles"
+	dim "  before committing to one for the dataset."
+	pause
+}
+
+preview_firewall() {
+	banner
+	head_ "What a run would change"
+	dim "  Nothing below has been applied — this is the dry run."
+	echo
 	"$FW_SCRIPT" --dry-run --users "$USERS" --duration "$DURATION" \
 		--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
 		--attack-profile "$ATTACK_PROFILE" 2>&1 | sed 's/^/  /'
-
-	hdr "Event plan (no packets sent)"
-	local ips=() mal=()
-	for ((i = 1; i <= USERS; i++)); do ips+=("10.99.0.$((10 + i))"); done
-	for ((i = 0; i < MALICIOUS_USERS; i++)); do mal+=("${ips[$((USERS - 1 - i))]}"); done
-	python3 "$FW_GEN" --plan-only \
-		--users "$(IFS=,; echo "${ips[*]}")" \
-		--malicious-users "$(IFS=,; echo "${mal[*]:-}")" \
-		--target 10.99.0.1 --duration "$DURATION" --rate "$RATE" \
-		--malicious-pct "$MALICIOUS_PCT" --attack-profile "$ATTACK_PROFILE" \
-		--benign-ports 80,443,8080 \
-		--malicious-ports 21,22,23,135,139,445,1433,3306,3389,5432,5900,6379,9200,27017 \
-		--seed "$SEED" --out /dev/null | sed 's/^/  /'
-	printf '\n'
-	sub "Nothing was changed. Run it with:  pde run"
-	printf '\n'
+	pause
 }
 
-cmd_run() {
-	local source="firewall"
-	if [[ $# -gt 0 && "$1" != -* ]]; then source="$1"; shift; fi
-	case "$source" in
-		firewall) : ;;
-		ids|auth) die "the '$source' source is not built yet (see: pde sources)" ;;
-		*) die "unknown source '$source' (see: pde sources)" ;;
-	esac
-
-	parse_run_flags "$@"
-	[[ -x "$FW_SCRIPT" ]] || die "$FW_SCRIPT not found or not executable"
-
-	hdr "About to run"
-	run_summary
-	printf '\n'
+# ---- capture -------------------------------------------------
+run_capture() {
+	banner
+	head_ "Capture a window"
+	dim "  Real packets cross the real INPUT chain, and the log lines are written by"
+	dim "  the kernel rather than by us. Only the scenario is synthetic."
+	echo
+	kv "source"    "firewall (ufw)"
+	kv "users"     "$USERS ($MALICIOUS_USERS attacking)"
+	kv "window"    "${DURATION}s at ${RATE}/s"
+	kv "profile"   "$ATTACK_PROFILE"
+	kv ""          "$(profile_signature "$ATTACK_PROFILE")"
+	kv "malicious" "${MALICIOUS_PCT}% of events"
+	echo
 	warn "This enables ufw and modifies the host firewall for ${DURATION}s."
-	note "Your ruleset, ENABLED and LOGLEVEL are snapshotted and restored on exit,"
-	note "including on Ctrl-C. Run 'pde preview' first to see the exact changes."
-	printf '\n'
-	confirm "Proceed?" || { sub "Cancelled."; return 0; }
-
-	local sudo_prefix=()
-	if [[ $EUID -ne 0 ]]; then sudo_prefix=(sudo); fi
-
-	hdr "Running"
-	"${sudo_prefix[@]}" "$FW_SCRIPT" \
-		--users "$USERS" --duration "$DURATION" --rate "$RATE" \
-		--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
-		--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR"
-
-	printf '\n'
-	sub "Next:  pde show latest      pde verify latest      pde path latest"
-	printf '\n'
-}
-
-# ---------- Output access ----------
-resolve_run() {
-	local want="${1:-latest}"
-	[[ -d "$OUTDIR" ]] || die "no output directory yet ($OUTDIR) — run a simulation first"
-	if [[ "$want" == "latest" ]]; then
-		local newest
-		newest=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' -printf '%f\n' 2>/dev/null | sort | tail -1)
-		[[ -n "$newest" ]] || die "no runs captured yet — try: pde run"
-		echo "${newest#firewall_}" | sed 's/\.manifest\.json$//'
-	else
-		[[ -f "$OUTDIR/firewall_${want}.manifest.json" ]] || die "no such run: $want (see: pde ls)"
-		echo "$want"
+	dim "    Your ruleset, ENABLED and LOGLEVEL are snapshotted and restored on exit,"
+	dim "    including on Ctrl-C. Option 4 shows the exact changes first."
+	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+		local c; c=$(docker ps -q 2>/dev/null | wc -l)
+		[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while it is active."
 	fi
-}
-
-cmd_ls() {
-	[[ -d "$OUTDIR" ]] || { sub "No runs yet. Try: pde run"; return 0; }
-	local manifests
-	manifests=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' | sort)
-	[[ -n "$manifests" ]] || { sub "No runs yet. Try: pde run"; return 0; }
-
-	hdr "Captured runs"
-	printf '  %s%-16s %-12s %6s %6s %7s %7s %9s%s\n' "$C_BOLD" \
-		"RUN" "PROFILE" "USERS" "DUR" "LINES" "BLOCK" "SIZE" "$C_RESET"
-	echo "$manifests" | while read -r m; do
-		python3 -c '
-import json, sys
-m = json.load(open(sys.argv[1]))
-c, o, w = m["configuration"], m["output"], m["window"]
-size = o["bytes"]
-human = "%.1fK" % (size/1024) if size >= 1024 else "%dB" % size
-print("  %-16s %-12s %6s %6s %7s %7s %9s" % (
-    o["log_file"].replace("firewall_","").replace(".log",""),
-    c.get("attack_profile","-"), c["users"], "%ss" % w["duration_seconds"],
-    o["lines"], o["ufw_block_lines"], human))
-' "$m"
-	done
-	printf '\n'
-	sub "Detail:  pde show RUN        Integrity:  pde verify RUN"
-	printf '\n'
-}
-
-cmd_show() {
-	local run="" mode="summary"
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--log)   mode="log"; shift ;;
-			--truth) mode="truth"; shift ;;
-			--manifest) mode="manifest"; shift ;;
-			-*) die "unknown option '$1'" ;;
-			*) run="$1"; shift ;;
-		esac
-	done
-	run=$(resolve_run "$run")
-	local log="$OUTDIR/firewall_${run}.log"
-	local manifest="$OUTDIR/firewall_${run}.manifest.json"
-	local truth="$OUTDIR/firewall_${run}.groundtruth.json"
-
-	case "$mode" in
-		manifest) cat "$manifest"; return ;;
-		truth)
-			hdr "Ground truth — run $run"
-			python3 -c '
-import json,sys
-d=json.load(open(sys.argv[1]))
-print("  profile        %s" % d.get("attack_profile","-"))
-print("  seed           %s" % d["seed"])
-print("  planned        %s   executed %s   behind schedule %s"
-      % (d["planned_events"], d["executed_events"], d["events_behind_schedule"]))
-print("  malicious      %s" % d["malicious_events"])
-print("  benign         %s" % d["benign_events"])
-print("\n  users:")
-for u in d["users"]:
-    print("    %-14s %s" % (u["ip"], u["role"]))
-hist={}
-for e in d["events"]:
-    if e["label"]=="malicious": hist[e["dport"]]=hist.get(e["dport"],0)+1
-if hist:
-    print("\n  malicious attempts by port:")
-    for p,n in sorted(hist.items(), key=lambda kv:-kv[1]):
-        print("    %-8s %s" % (p, "#"*min(n,50)))
-' "$truth"
-			printf '\n'; return ;;
-		log)
-			hdr "ufw log — run $run"
-			# BLOCK red, ALLOW green, and the two fields that carry the meaning.
-			sed -e "s/\[UFW BLOCK\]/${C_RED}[UFW BLOCK]${C_RESET}/g" \
-				-e "s/\[UFW ALLOW\]/${C_GREEN}[UFW ALLOW]${C_RESET}/g" \
-				-e "s/\(SRC=[0-9.]*\)/${C_CYAN}\1${C_RESET}/g" \
-				-e "s/\(DPT=[0-9]*\)/${C_YELLOW}\1${C_RESET}/g" "$log"
-			return ;;
+	echo
+	printf '  %sproceed? [y/N]>%s ' "$C_TITLE" "$R"; read -r go
+	case "$go" in
+		y|Y) ;;
+		*) dim "  cancelled"; pause; return ;;
 	esac
 
-	hdr "Run $run"
-	python3 -c '
-import json,sys
-m=json.load(open(sys.argv[1]))
-s,c,w,o = m["source"], m["configuration"], m["window"], m["output"]
-def kv(k,v): print("  %-20s %s" % (k,v))
+	echo
+	local rc=0
+	if [ "$(id -u)" -ne 0 ]; then
+		sudo "$FW_SCRIPT" --users "$USERS" --duration "$DURATION" --rate "$RATE" \
+			--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
+			--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR" || rc=$?
+	else
+		"$FW_SCRIPT" --users "$USERS" --duration "$DURATION" --rate "$RATE" \
+			--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
+			--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR" || rc=$?
+	fi
+	echo
+	if [ "$rc" -eq 0 ]; then ok "capture complete — option 6 reads it back"
+	else err "the simulator exited with status $rc"; fi
+	pause
+}
+
+# ---- evidence ------------------------------------------------
+require_run() {
+	if ! latest_run >/dev/null 2>&1; then
+		banner
+		head_ "Nothing captured yet"
+		dim "  Option 1 runs a capture."
+		pause
+		return 1
+	fi
+	return 0
+}
+
+# Lists runs and returns the chosen id. With only one run it returns that one
+# without asking, so the common case stays a single keypress.
+pick_run() {
+	local runs count
+	runs=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort)
+	count=$(printf '%s\n' "$runs" | grep -c . 2>/dev/null)
+	if [ "${count:-0}" -le 1 ]; then latest_run; return; fi
+
+	banner
+	head_ "Captured runs"
+	echo
+	local i=1 f id detail
+	while IFS= read -r f; do
+		[ -n "$f" ] || continue
+		id=$(basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//')
+		detail=$(manifest_field "$id" 'm["configuration"]["attack_profile"]+"   "+str(m["output"]["lines"])+" lines, "+str(m["output"]["ufw_block_lines"])+" BLOCK"')
+		printf '  %s%s%s  %-16s %s%s%s\n' "$C_NUM" "$i" "$R" "$id" "$C_DIM" "$detail" "$R"
+		i=$((i + 1))
+	done <<< "$runs"
+	echo
+	printf '  %sselect (enter for latest)>%s ' "$C_TITLE" "$R"; read -r sel
+	if [ -z "$sel" ]; then latest_run; return; fi
+	local chosen
+	chosen=$(printf '%s\n' "$runs" | sed -n "${sel}p")
+	if [ -z "$chosen" ]; then latest_run; return; fi
+	basename "$chosen" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
+}
+
+view_evidence() {
+	require_run || return
+	local run; run="$(pick_run)"
+	[ -n "$run" ] || return
+	banner
+	head_ "Run $run"
+	python3 -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+s, c, w, o = m["source"], m["configuration"], m["window"], m["output"]
+def kv(k, v): print("    %-22s %s" % (k, v))
 kv("source", "%s (%s)" % (s["pde_source"], s["version"]))
-kv("window", "%s -> %s  (%ss)" % (w["start_utc"], w["end_utc"], w["duration_seconds"]))
+kv("window", "%s -> %s" % (w["start_utc"], w["end_utc"]))
 kv("users", "%s (%s attacking)" % (c["users"], c["malicious_users"]))
-kv("profile", c.get("attack_profile","-"))
-kv("malicious share", "%s%% of events" % c["malicious_event_pct"])
+kv("profile", c.get("attack_profile", "-"))
 kv("seed", c["seed"])
 print()
 kv("log lines", o["lines"])
 kv("  UFW BLOCK", o["ufw_block_lines"])
 kv("  UFW ALLOW", o["ufw_allow_lines"])
-kv("size", "%s bytes" % o["bytes"])
-kv("sha256", o["sha256"])
-' "$manifest"
+kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/firewall_${run}.manifest.json"
 
-	if [[ -s "$log" ]]; then
-		hdr "First 3 lines"
-		head -3 "$log" | sed -e "s/\[UFW BLOCK\]/${C_RED}[UFW BLOCK]${C_RESET}/g" \
-			-e "s/\[UFW ALLOW\]/${C_GREEN}[UFW ALLOW]${C_RESET}/g" | sed 's/^/  /'
-	else
-		printf '\n'; warn "log file is empty — see 'pde doctor'"
-	fi
-	printf '\n'
-	sub "Full log:  pde show $run --log        Labels:  pde show $run --truth"
-	printf '\n'
+	head_ "Evidence — first 12 lines"
+	sed -e "s/\[UFW BLOCK\]/${C_ERR}[UFW BLOCK]${R}/g" \
+		-e "s/\[UFW ALLOW\]/${C_OK}[UFW ALLOW]${R}/g" \
+		-e "s/\(SRC=[0-9.]*\)/${C_TITLE}\1${R}/g" \
+		-e "s/\(DPT=[0-9]*\)/${C_KEY}\1${R}/g" \
+		"$OUTDIR/firewall_${run}.log" 2>/dev/null | head -12 | sed 's/^/    /'
+	echo
+	dim "  full log:  $OUTDIR/firewall_${run}.log"
+	dim "  labels:    $OUTDIR/firewall_${run}.groundtruth.json"
+	pause
 }
 
-cmd_verify() {
-	local run; run=$(resolve_run "${1:-latest}")
-	local log="$OUTDIR/firewall_${run}.log"
-	local manifest="$OUTDIR/firewall_${run}.manifest.json"
-
-	hdr "Integrity — run $run"
+verify_evidence() {
+	require_run || return
+	local run; run="$(pick_run)"
+	[ -n "$run" ] || return
+	banner
+	head_ "Integrity — run $run"
+	dim "  The manifest digest was taken before anything else touched the file, which"
+	dim "  is the SecureRS rule the Evidence Repository follows on ingest."
+	echo
 	local recorded actual
-	recorded=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["output"]["sha256"])' "$manifest")
-	actual=$(sha256sum "$log" | cut -d' ' -f1)
-	kv "recorded" "$recorded"
-	kv "recomputed" "$actual"
-	printf '\n'
-	if [[ "$recorded" == "$actual" ]]; then
-		ok "match — the log is unmodified since capture"
-		printf '\n'
+	recorded="$(manifest_field "$run" 'm["output"]["sha256"]')"
+	actual="$(sha256sum "$OUTDIR/firewall_${run}.log" 2>/dev/null | cut -d' ' -f1)"
+	kv "recorded"   "${recorded:-missing}"
+	kv "recomputed" "${actual:-missing}"
+	echo
+	if [ -n "$actual" ] && [ "$recorded" = "$actual" ]; then
+		ok "match — unmodified since capture"
 	else
-		bad "MISMATCH — the log has changed since it was captured"
-		printf '\n'
-		return 1
+		err "MISMATCH — the log has changed since it was captured"
 	fi
+	pause
 }
 
-cmd_path() {
-	local run; run=$(resolve_run "${1:-latest}")
-	echo "$OUTDIR/firewall_${run}.log"
-	echo "$OUTDIR/firewall_${run}.manifest.json"
-	echo "$OUTDIR/firewall_${run}.groundtruth.json"
+# ---- teaching ------------------------------------------------
+explain() {
+	banner
+	head_ "What a firewall contributes as evidence"
+	dim "  Cheap, high-volume, and strong on reconnaissance. It records WHO connected,"
+	dim "  WHAT they reached for, WHEN, and whether it was permitted. It cannot tell"
+	dim "  you the payload, the application context, or the identity behind an address"
+	dim "  — which is the argument for correlating it with the IDS and authentication"
+	dim "  sources over the same window."
+
+	head_ "Anatomy of a ufw log line"
+	printf '    %s%s%s\n' "$C_DIM" "Sep  5 19:58:03 host kernel: [8821.443021] [UFW BLOCK] IN=veth-pde-h" "$R"
+	printf '    %s%s%s\n' "$C_DIM" "SRC=10.99.0.20 DST=10.99.0.1 PROTO=TCP SPT=51234 DPT=3306 SYN" "$R"
+	echo
+	kv "Sep  5 19:58:03" "syslog time — no year, no sub-second"
+	kv "[8821.443021]"   "kernel uptime — this one does have microseconds"
+	kv "[UFW BLOCK]"     "the verdict: BLOCK, ALLOW, AUDIT or LIMIT BLOCK"
+	kv "SRC="            "source address — this is what a 'user' is here"
+	kv "DPT="            "destination port — what was being reached for"
+	kv "SPT="            "source port — a fresh one per attempt"
+	kv "SYN"             "TCP flags; SYN alone is an attempt, not a session"
+
+	head_ "Why these logs are real and not generated"
+	dim "    The traffic is synthetic — users, window and ratios are all ours to set."
+	dim "    The log lines are not: the kernel's netfilter LOG target writes them as"
+	dim "    the packets cross the INPUT chain. The format is authentic by"
+	dim "    construction, so \"is this really what ufw emits?\" has an answer."
+
+	head_ "The setting that quietly ruins a capture"
+	dim "    ufw rate-limits its own LOG rules to 3/min at low, medium and high. A 30s"
+	dim "    window would yield about four lines however much traffic you generate."
+	dim "    Every run sets logging to full, then restores your previous level."
+	pause
 }
 
-cmd_clean() {
-	if [[ "${1:-}" == "--yes" || "${1:-}" == "-y" ]]; then ASSUME_YES=1; fi
-	[[ -d "$OUTDIR" ]] || { sub "Nothing to clean."; return 0; }
-	local count
-	count=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*' | wc -l)
-	[[ "$count" -gt 0 ]] || { sub "Nothing to clean."; return 0; }
-	warn "$count file(s) in $OUTDIR"
-	confirm "Delete them?" || { sub "Cancelled."; return 0; }
-	# Logs are chmod 444 by design. Deletion depends on the directory being writable,
-	# not the file mode, and find's -delete does not prompt the way `rm` would.
-	find "$OUTDIR" -maxdepth 1 -name 'firewall_*' -delete
-	ok "deleted"
+doctor() {
+	banner
+	head_ "Environment"
+	kv "kernel" "$(uname -r)"
+	kv "ufw"    "$(ufw --version 2>/dev/null | head -1 || echo 'not installed')"
+
+	head_ "Can this machine capture ufw logs?"
+	if command -v ufw     >/dev/null 2>&1; then ok "ufw installed";      else err "ufw missing — sudo apt install ufw"; fi
+	if command -v ip      >/dev/null 2>&1; then ok "iproute2 available"; else err "ip missing"; fi
+	if command -v python3 >/dev/null 2>&1; then ok "python3 available";  else err "python3 missing"; fi
+	if rsyslog_up; then ok "rsyslogd running"; else err "rsyslogd stopped — sudo systemctl start rsyslog"; fi
+
+	if [ -f /proc/config.gz ] && zcat /proc/config.gz 2>/dev/null | grep -q '^CONFIG_NETFILTER_XT_TARGET_LOG=[my]'; then
+		ok "kernel has the netfilter LOG target"
+	elif [ -f "/lib/modules/$(uname -r)/kernel/net/netfilter/xt_LOG.ko" ]; then
+		ok "kernel has the netfilter LOG target (module present)"
+	else
+		err "no netfilter LOG target — ufw could filter but never log"
+	fi
+
+	mkdir -p "$OUTDIR" 2>/dev/null
+	if [ -w "$OUTDIR" ]; then ok "output directory writable"; else err "cannot write to $OUTDIR"; fi
+
+	head_ "Current firewall state"
+	kv "ufw enabled"  "$(ufw_enabled)"
+	kv "ufw loglevel" "$(ufw_loglevel)"
+	[ "$(ufw_loglevel)" != "full" ] && dim "    a run sets this to full, then restores it"
+	[ "$(id -u)" -ne 0 ] && dim "    not root — capturing will prompt for sudo"
+	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+		local c; c=$(docker ps -q 2>/dev/null | wc -l)
+		[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while active"
+	fi
+	pause
 }
 
-# ---------- Config ----------
-cmd_config() {
-	case "${1:-show}" in
-		show)
-			hdr "Configuration"
-			sub "$CONFIG_FILE$([[ -f "$CONFIG_FILE" ]] || echo '  (not created yet; showing built-in defaults)')"
-			printf '\n'
-			for k in "${CONFIG_KEYS[@]}"; do kv "$k" "${!k}"; done
-			printf '\n'
-			note "pde config set KEY VALUE"
-			printf '\n' ;;
-		set)
-			local key="${2:-}" value="${3:-}"
-			[[ -n "$key" && -n "$value" ]] || die "usage: pde config set KEY VALUE"
-			local valid=0
-			for k in "${CONFIG_KEYS[@]}"; do [[ "$k" == "$key" ]] && valid=1; done
-			[[ $valid -eq 1 ]] || die "unknown key '$key' (see: pde config show)"
-			touch "$CONFIG_FILE"
-			if grep -qE "^${key}=" "$CONFIG_FILE"; then
-				sed -i "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE"
-			else
-				echo "${key}=${value}" >> "$CONFIG_FILE"
-			fi
-			ok "$key = $value"
-			note "$CONFIG_FILE" ;;
-		reset)
-			confirm "Delete $CONFIG_FILE and return to built-in defaults?" || { sub "Cancelled."; return 0; }
-			rm -f "$CONFIG_FILE"; ok "reset" ;;
-		*) die "usage: pde config [show | set KEY VALUE | reset]" ;;
-	esac
+# ---- main menu -----------------------------------------------
+main_menu() {
+	while true; do
+		banner
+		printf '  %s1%s  Capture a window %s(runs the simulator; prompts for sudo)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		echo
+		printf '  %s2%s  Choose attack profile    %s%s%s\n' "$C_NUM" "$R" "$C_KEY" "$ATTACK_PROFILE" "$R"
+		printf '  %s3%s  Configure the scenario   %s%s users, %ss, %s%% malicious%s\n' "$C_NUM" "$R" "$C_DIM" "$USERS" "$DURATION" "$MALICIOUS_PCT" "$R"
+		echo
+		printf '  %s4%s  Preview firewall changes %s(dry run, nothing applied)%s\n'   "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s5%s  Preview the event plan   %s(port histogram, no packets)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		echo
+		printf '  %s6%s  Read evidence back\n' "$C_NUM" "$R"
+		printf '  %s7%s  Verify integrity         %s(sha256 against the manifest)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		echo
+		printf '  %s8%s  How firewall evidence works %s(log anatomy, why it is real)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s9%s  Environment check\n' "$C_NUM" "$R"
+		echo
+		printf '  %s0%s  Quit\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r choice || return
+
+		case "$choice" in
+			1) run_capture ;;
+			2) profile_menu ;;
+			3) configure_menu ;;
+			4) preview_firewall ;;
+			5) preview_plan ;;
+			6) view_evidence ;;
+			7) verify_evidence ;;
+			8) explain ;;
+			9) doctor ;;
+			0|q|Q) clear; return ;;
+			*) ;;
+		esac
+	done
 }
 
-# ---------- Dispatch ----------
-main() {
-	local cmd="${1:-help}"
-	if [[ $# -gt 0 ]]; then shift; fi
-	case "$cmd" in
-		run)      cmd_run "$@" ;;
-		preview)  cmd_preview "$@" ;;
-		attacks)  cmd_attacks ;;
-		sources)  cmd_sources ;;
-		doctor)   cmd_doctor ;;
-		ls|list)  cmd_ls ;;
-		show)     cmd_show "$@" ;;
-		verify)   cmd_verify "$@" ;;
-		path)     cmd_path "$@" ;;
-		clean)    cmd_clean "$@" ;;
-		config)   cmd_config "$@" ;;
-		help|-h|--help) cmd_help "$@" ;;
-		*) die "unknown command '$cmd' (try: pde help)" ;;
-	esac
-}
+# ---- preflight -----------------------------------------------
+if [ ! -x "$FW_SCRIPT" ]; then
+	err "simulator not found or not executable: $FW_SCRIPT"
+	dim "  chmod +x \"$FW_SCRIPT\" \"$FW_GEN\""
+	exit 1
+fi
+command -v python3 >/dev/null 2>&1 || { err "python3 not found on PATH"; exit 1; }
+command -v ufw     >/dev/null 2>&1 || warn "ufw not found — capturing will fail, everything else works"
 
-main "$@"
+main_menu
