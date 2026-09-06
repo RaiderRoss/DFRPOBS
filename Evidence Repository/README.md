@@ -17,10 +17,63 @@ Backend (Java, Spring Boot) is layered as:
 - **WorkGroup** — `id, name, classificationCode` — the business-unit classification evidence is tagged with (K-FFRaaS concept).
 - **TriggerEvent** — `id, sourceSystem, triggerType, firedAt` — the SIEM/IDS alert that caused ingestion.
 - **EvidenceItem** — `id, workGroupId, triggerEventId, storageRef, currentHash, status` — the hub entity; references the stored object and its current integrity state.
-- **CustodyEvent** — `id, evidenceItemId, action, performedBy, previousHash, newHash, occurredAt` — append-only chain-of-custody ledger; every state-changing action on evidence creates one.
+- **CustodyEvent** — `id, evidenceItemId, sequence, action, performedBy, performedByUsername, previousHash, newHash, occurredAt` — append-only chain-of-custody ledger, hash-chained per evidence item. Every action on an item appends one. See [Chain of custody](#chain-of-custody) for the chaining rule and what it does and does not prove. `performedByUsername` is a denormalised snapshot alongside the `performedBy` FK: the AppUser row can be renamed or removed, and a custody entry has to remain readable on its own years later.
 - **IntegrityCheck** — `id, evidenceItemId, computedHash, matchesStored, checkedAt` — periodic/on-demand re-verification, separate from custody events, matching SecureRS's verify-on-read pattern.
 - **AppUser** — `id, username, role, mfaEnabled`.
-- **AccessLog** — `id, evidenceItemId, userId, action, occurredAt` — every read/view, logged separately from custody-changing actions (compliance requirement).
+- **AccessLog** — `id, evidenceItemId, userId, action, occurredAt` — every read/view, logged separately from custody-changing actions (compliance requirement). **Unresolved:** this overlaps the custody chain now that reads are custody events — see open question 4.
+
+## Chain of custody
+
+Every EvidenceItem owns one chain, and the chain answers **what**, **when** and **by
+whom** for everything that happens to that item — creation, hashing, reading, export,
+relocation, status change. One ordered ledger per item, not a log per action type.
+
+**The chaining rule.** Each entry's hash covers the previous entry's hash:
+
+```
+newHash = H( previousHash ‖ canonical(event) )
+```
+
+- The **first** entry is the item's own `CREATED` event, not an empty file. An item that
+  exists with an empty chain has an unexplained origin.
+- Genesis uses a **fixed constant** for `previousHash` rather than null, so verification
+  is one uniform loop instead of a special case that has to be right twice.
+- `canonical(event)` must be **frozen and versioned** — field order, encoding, timestamp
+  precision. The day serialisation changes, every historical chain stops verifying and
+  you cannot distinguish tampering from a format change.
+
+**Ordering.** `sequence` is per item, with a unique constraint on
+`(evidenceItemId, sequence)`. Without it two concurrent actions both read the same
+`previousHash` and the chain forks — the same check-then-act gap the ingestion consumer
+has to close on `triggerEventId`, and a unique constraint is again what actually closes
+it rather than a preceding lookup.
+
+**Transactionality.** A custody entry is written in the *same transaction* as the action
+it records. A crash between "moved the object" and "logged the move" leaves evidence with
+an unexplained gap, which is the one thing custody must never have. This is the reason
+the ledger is a **table and not a file**: a file write cannot enlist in the Postgres
+transaction. A custody *file* is derived on demand for export or handover — the table
+stays authoritative, so there is never a question of which one wins.
+
+**What the chain proves, and what it does not.** Linked hashes make *modification of an
+interior entry* detectable. On their own they do not detect:
+
+- **Truncation** — remove the last N entries and what remains still verifies cleanly.
+  Nothing inside the chain states how long it ought to be.
+- **Wholesale re-chaining** — anyone who can write the ledger can recompute every hash
+  from genesis and produce a valid chain saying whatever they like.
+
+Which means the chain alone is defeated by precisely the actor forensic readiness exists
+to catch: the insider with write access. It needs at least one of:
+
+- append-only enforced **below** the application (Postgres permissions or a trigger
+  rejecting `UPDATE`/`DELETE` on the custody table; MinIO object-lock for exported files)
+- the head hash **anchored** somewhere the writer does not control — a WORM bucket, a
+  signed timestamp, a second system. Even periodic anchoring bounds how much history can
+  be silently rewritten
+- **per-entry signatures**, so forging requires a key rather than database access
+
+Until one of those exists, the honest claim is "a consistent chain", not "the chain".
 
 ## Storage & infrastructure
 - **MinIO** — evidence blob storage (object storage), referenced by `EvidenceItem.storageRef`. Should use envelope encryption via a real KMS/HSM (not a static key in config, which is what the SecureRS prototype does).
@@ -85,4 +138,17 @@ All credentials above are dev-only placeholders
 ## Open questions
 1. Whether WorkGroup classification on ingest is fully automated (mapping table from SIEM alert type) or requires human review before storage.
 2. Final Kafka partition key strategy (`workGroupId` alone vs. composite key).
-3. `WorkGroup` is now implemented end to end (entity → repository → DTO → mapper → service → resource, at `/api/work-groups`) and serves as the template for the entities that follow. It exposes read and create only: update/delete need the soft-delete and custody semantics described above, which are not built yet. `TriggerEvent`, `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first.
+3. How the custody chain is anchored, and how append-only is enforced beneath the
+   application. Without one of these the chain is tamper-evident against partial edits
+   only, and re-chaining by anyone with write access stays undetectable. Deciding this
+   is what turns "hash chained" into a defensible admissibility claim, so it is a
+   prerequisite for the custody work rather than a follow-up to it.
+4. Whether reads live in the custody chain or in `AccessLog`. The two currently overlap:
+   the data model says reads are logged separately, while the custody design treats
+   reading as a custody event. Two records of who-read-what will drift, and a court
+   asking "who accessed this" should not get two answers. Leaning towards one chain per
+   item with `AccessLog` as a projection over it — a read genuinely is custody-relevant,
+   and one ordered ledger is easier to defend than two logs that must be reconciled. The
+   cost is volume, since reads dominate, so verification would need to be incremental
+   rather than re-hashing from genesis on every check.
+5. `WorkGroup` is now implemented end to end (entity → repository → DTO → mapper → service → resource, at `/api/work-groups`) and serves as the template for the entities that follow. It exposes read and create only: update/delete need the soft-delete and custody semantics described above, which are not built yet. `TriggerEvent`, `EvidenceItem`, `CustodyEvent`, `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first.
