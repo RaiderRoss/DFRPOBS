@@ -6,11 +6,12 @@ Simulators for the three Potential Digital Evidence sources in the compliance sc
 | Source | Product | Status |
 |---|---|---|
 | Firewall | ufw (Ubuntu Firewall) | implemented |
-| IDS/IPS | Slips | see `Anomaly Detection/Scripts/slips-cli.sh` |
+| IDS/IPS | Slips | implemented — correlated with the firewall over one window |
 | Authentication | Keycloak | not built yet |
 
-Each run captures one time window from one source. Three sources over the same window
-are what a single evidence group should reference.
+A capture takes one time window. With IDS correlation on, the firewall and Slips observe
+**the same packets** over that window and produce independent evidence, tied together by
+`window_<ts>.group.json` — the record an `EvidenceGroup` row would be built from.
 
 ## Launch
 
@@ -24,7 +25,7 @@ cd "PDE Sources" && ./pde
 ──────────────────────────────────────────────────────────────
   ufw inactive       rsyslog running       loglevel low
   users 10 (1 attacking)   window 30s   rate 20/s   malicious 10%
-  profile port-scan   seed 1337
+  profile port-scan   seed 1337   sources firewall + ids
   captured 3   latest 20260905143000 (612 lines, 61 BLOCK)
 ──────────────────────────────────────────────────────────────
   1  Capture a window
@@ -71,6 +72,21 @@ many *users* attack) are independent knobs — the brief's "10%, 10:1" conflates
 
 `SEED` makes a run reproducible, which matters if the dataset ends up in a paper.
 
+## IDS correlation (option 3 → 7)
+
+With it on, Slips sniffs the veth while the firewall window runs, so both sources
+observe the same packets and each writes its own evidence. This is the piece that makes
+the evidence model real: one attack, one window, two independent accounts of it.
+
+```
+▲ high   new vertical port scan to IP 10.99.0.1 from 10.99.0.20.
+         Total 10 TCP ports were scanned. Confidence: 1.0. by Slips
+```
+
+A correlated run costs about `60 + duration + drain` seconds — most of it Slips loading
+its modules before the window can open. See [IDS/README.md](IDS/README.md) for the
+ordering constraints and why `MALICIOUS_PORTS` is deliberately wide.
+
 ## Output
 
 Three files per run, in `output/`:
@@ -80,6 +96,9 @@ Three files per run, in `output/`:
 | `firewall_<ts>.log` | the ufw lines, `chmod 444` — **this is the evidence** |
 | `firewall_<ts>.manifest.json` | provenance, window bounds, counts, **sha256** |
 | `firewall_<ts>.groundtruth.json` | every event with its label, known before sending |
+| `ids_<ts>.alerts.log` | Slips evidence for the same window (IDS correlation on) |
+| `ids_<ts>/` | Slips' working tree, including `zeek_files/conn.log` |
+| `window_<ts>.group.json` | both sources, shared window bounds, both digests |
 
 The sha256 is computed before anything else touches the file, per the SecureRS ingestion
 rule — it is what the `EvidenceItem` should carry. Option **7** recomputes it.
@@ -94,10 +113,14 @@ can be scripted or reproduced without it — the same split as `slips-cli.sh` an
 Firewall/simulate-firewall.sh --dry-run
 sudo Firewall/simulate-firewall.sh --users 10 --duration 30 \
      --malicious-pct 10 --attack-profile brute-force --seed 1337
+
+# firewall + IDS over one window
+sudo Firewall/simulate-firewall.sh --with-ids --duration 30 --attack-profile port-scan
 ```
 
 See [Firewall/README.md](Firewall/README.md) for why the logs are real rather than
-synthesised, the Docker interaction, and why `ufw logging full` is mandatory.
+synthesised, the Docker interaction, and why `ufw logging full` is mandatory, and
+[IDS/README.md](IDS/README.md) for how Slips is attached to the same window.
 
 ## Note
 
@@ -105,5 +128,5 @@ If you edit these scripts from Windows rather than inside WSL, the executable bi
 dropped. Restore it **from inside WSL** (a `chmod` over `\\wsl.localhost` does not take):
 
 ```bash
-chmod +x pde Firewall/simulate-firewall.sh Firewall/generate_traffic.py
+chmod +x pde Firewall/simulate-firewall.sh Firewall/generate_traffic.py IDS/slips-lib.sh
 ```

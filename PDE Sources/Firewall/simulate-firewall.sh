@@ -30,6 +30,15 @@ OUTDIR="$SCRIPT_DIR/../output"
 DRY_RUN=0
 KEEP_FIREWALL=0
 
+# IDS correlation. When enabled, Slips sniffs the veth this script creates, so both
+# sources observe the same packets over the same window.
+WITH_IDS=0
+IDS_READY_TIMEOUT=240
+# Slips raises evidence in batches after it has seen the flows, so stopping it the
+# instant the window closes reliably collects nothing. This is how long to keep it
+# running past the window before collecting.
+IDS_DRAIN=45
+
 # Test subnet. Deliberately not a range anything else on this host uses, so extraction
 # can separate simulated traffic from whatever else the firewall happens to log.
 SUBNET="10.99.0.0/24"
@@ -44,7 +53,14 @@ VETH_NS="veth-pde-n"
 # Ports the firewall permits — ordinary application traffic.
 BENIGN_PORTS="80,443,8080"
 # Ports the firewall denies — the sweep an attacker runs looking for a way in.
-MALICIOUS_PORTS="21,22,23,135,139,445,1433,3306,3389,5432,5900,6379,9200,27017"
+#
+# Deliberately wide. The firewall logs a BLOCK however few ports are touched, but an
+# IDS decides "vertical port scan" from the number of DISTINCT ports one source reaches
+# for on one host inside a timewindow. The earlier 14-port list is thin enough to sit
+# under that threshold, which would leave the IDS silent about an attack the firewall
+# recorded plainly — the opposite of the correlation this is built to show.
+# (slips-cli.sh's own working demo sweeps 70 ports.) None may overlap BENIGN_PORTS.
+MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,873,993,995,1080,1433,1521,2049,2375,3306,3389,5060,5432,5900,6379,8443,9200,11211,27017"
 
 # Host services kept reachable while ufw is up, so enabling a default-deny firewall
 # does not cut off the dev stack or the Windows host's access to it.
@@ -69,6 +85,11 @@ usage() {
 	  --outdir DIR           where the log and manifest land       (default $OUTDIR)
 	  --dry-run              print the firewall changes and exit
 	  --keep-firewall        skip teardown (debugging only)
+	  --with-ids             also run Slips on the veth, so the IDS observes the
+	                         same packets over the same window (adds ~2 min of
+	                         startup before the window, and --ids-drain after)
+	  --ids-drain S          seconds to keep Slips running past the window so it
+	                         can raise evidence for it       (default $IDS_DRAIN)
 
 	Note that --malicious-pct and --malicious-users are independent knobs. "10%" of
 	events and a 10:1 user ratio are not the same statement, and a brief should say
@@ -88,6 +109,8 @@ while [[ $# -gt 0 ]]; do
 		--outdir) OUTDIR="$2"; shift 2 ;;
 		--dry-run) DRY_RUN=1; shift ;;
 		--keep-firewall) KEEP_FIREWALL=1; shift ;;
+		--with-ids) WITH_IDS=1; shift ;;
+		--ids-drain) IDS_DRAIN="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -112,6 +135,16 @@ if [[ $DRY_RUN -eq 0 ]]; then
 	[[ $EUID -eq 0 ]] || die "must run as root (firewall rules and network namespaces)"
 	pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw log lines would not \
 reach $UFW_LOG. Start it with: systemctl start rsyslog"
+fi
+
+IDS_LIB="$SCRIPT_DIR/../IDS/slips-lib.sh"
+if [[ $WITH_IDS -eq 1 ]]; then
+	[[ -f "$IDS_LIB" ]] || die "--with-ids needs $IDS_LIB"
+	# shellcheck source=../IDS/slips-lib.sh
+	source "$IDS_LIB"
+	if [[ $DRY_RUN -eq 0 ]]; then
+		slips_preflight || die "IDS preflight failed"
+	fi
 fi
 
 # The LOG target is a module on the WSL kernel and is loaded on demand, but failing here
@@ -190,6 +223,10 @@ restore() {
 	local rc=$?
 	[[ $KEEP_FIREWALL -eq 1 ]] && { echo "--keep-firewall: leaving firewall and namespace in place"; return 0; }
 	echo "restoring firewall and tearing down namespace..."
+	# Slips must let go of the interface before it is deleted underneath it.
+	if [[ $WITH_IDS -eq 1 ]] && declare -F slips_stop >/dev/null; then
+		slips_stop
+	fi
 	ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
 	ip netns del "$NS" 2>/dev/null || true
 	ip link del "$VETH_HOST" 2>/dev/null || true
@@ -224,6 +261,31 @@ for ip_addr in "${USER_IPS[@]}"; do
 	ip netns exec "$NS" ip addr add "$ip_addr/24" dev "$VETH_NS"
 done
 ip netns exec "$NS" ip link set "$VETH_NS" up
+
+# ---------------------------------------------------------------------------
+# IDS
+#
+# Started here, between creating the interface and opening the window: Slips can only
+# attach to a veth that already exists, and it must be reading packets before any are
+# generated. Its ~80s of module and threat-feed loading is why this cannot be deferred
+# to just before the traffic — a window opened during startup is simply not observed.
+#
+# ufw is configured *after* this, so `logging full` is active for the window rather
+# than for the couple of minutes Slips spends starting up.
+# ---------------------------------------------------------------------------
+
+# Named for the run only once the window has a timestamp; until then Slips writes to a
+# scratch directory, because STAMP is deliberately taken from the window start and the
+# window has not opened yet.
+if [[ $WITH_IDS -eq 1 ]]; then
+	SLIPS_OUT="$OUTDIR/ids-run"
+	rm -rf "$SLIPS_OUT"
+	log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
+	slips_start_redis || die "could not start the Slips redis"
+	slips_start "$VETH_HOST" "$SLIPS_OUT" || die "could not start Slips"
+	slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
+	log "Slips is reading $VETH_HOST"
+fi
 
 # ---------------------------------------------------------------------------
 # Firewall
@@ -429,9 +491,115 @@ manifest = {
 json.dump(manifest, open(sys.argv[1], "w"), indent=2)
 PY
 
+# ---------------------------------------------------------------------------
+# IDS evidence for the same window
+# ---------------------------------------------------------------------------
+IDS_LOG="$OUTDIR/ids_${STAMP}.alerts.log"
+GROUP_MANIFEST="$OUTDIR/window_${STAMP}.group.json"
+IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"
+
+if [[ $WITH_IDS -eq 1 ]]; then
+	# Slips raises evidence in batches once it has seen the flows, so the window's
+	# findings do not exist yet at this point. Draining is not politeness, it is the
+	# difference between collecting the evidence and collecting an empty file.
+	log "draining Slips for ${IDS_DRAIN}s so it can raise evidence for the window"
+	sleep "$IDS_DRAIN"
+
+	# Stopped before anything is read: alerts.log is being appended to while Slips
+	# runs, and evidence is what this file is for — it should not be collected from a
+	# moving target.
+	slips_stop
+	log "Slips stopped; collecting"
+
+	# Defended rather than trusted: `read` returns non-zero on an empty herestring,
+	# which under `set -e` would abort the run at the point where the evidence has been
+	# collected but nothing has been written down about it.
+	IDS_COUNTS=$(slips_collect "$SLIPS_OUT" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$IDS_LOG" || echo "0 0")
+	read -r IDS_TOTAL IDS_KEPT <<< "$IDS_COUNTS" || true
+	IDS_TOTAL=${IDS_TOTAL:-0}
+	IDS_KEPT=${IDS_KEPT:-0}
+	IDS_SEVERITIES=$(slips_severity_counts "$IDS_LOG")
+	IDS_SHA=$(sha256sum "$IDS_LOG" | cut -d' ' -f1)
+	chmod 444 "$IDS_LOG"
+	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} findings fall inside the window"
+
+	# Keep Slips' full working tree per run, not just the alerts: zeek_files/conn.log
+	# is the flow record behind the findings, and an investigator asking "on what basis"
+	# needs it. Safe to move now that the container is stopped.
+	if [[ -d "$SLIPS_OUT" ]]; then
+		rm -rf "$OUTDIR/ids_${STAMP}"
+		mv "$SLIPS_OUT" "$OUTDIR/ids_${STAMP}"
+		SLIPS_OUT="$OUTDIR/ids_${STAMP}"
+	fi
+
+	# The group is the point of the exercise: one window, one attack, two independent
+	# sources that saw it. This is the record an EvidenceGroup row would be built from.
+	python3 - "$GROUP_MANIFEST" <<PY
+import json, sys
+crit, high, med, low, info = "${IDS_SEVERITIES}".split()
+group = {
+    "group_id": "${STAMP}",
+    "window": {
+        "start_utc": "${WINDOW_START_ISO}",
+        "end_utc": "${WINDOW_END_ISO}",
+        "duration_seconds": ${DURATION},
+    },
+    "scenario": {
+        "users": ${USERS},
+        "malicious_users": ${MALICIOUS_USERS},
+        "malicious_event_pct": ${MALICIOUS_PCT},
+        "attack_profile": "${ATTACK_PROFILE}",
+        "seed": ${SEED},
+        "subnet": "${SUBNET}",
+    },
+    "items": [
+        {
+            "pde_source": "firewall",
+            "product": "ufw",
+            "file": "firewall_${STAMP}.log",
+            "sha256": "${SHA256}",
+            "lines": ${LOG_LINES},
+            "ufw_block_lines": ${BLOCKED},
+            "ufw_allow_lines": ${ALLOWED},
+            "ufw_audit_lines": ${AUDITED},
+        },
+        {
+            "pde_source": "ids",
+            "product": "slips",
+            "file": "ids_${STAMP}.alerts.log",
+            "sha256": "${IDS_SHA}",
+            "evidence_lines": ${IDS_KEPT},
+            "evidence_lines_seen_total": ${IDS_TOTAL},
+            "threat_levels": {
+                "critical": int(crit), "high": int(high),
+                "medium": int(med), "low": int(low), "info": int(info),
+            },
+        },
+    ],
+    "correlation": (
+        "Both items describe the same packets. Slips sniffed ${VETH_HOST} live while "
+        "ufw logged the same traffic crossing the INPUT chain, so the two are "
+        "independent accounts of one attack rather than one record split in two."
+    ),
+    "caveats": [
+        "IDS findings are sliced to the window by the timestamp on each evidence line; "
+        "Slips keeps its own 1-hour timewindows internally and its alert threshold "
+        "accumulates per profile across that hour, not across this ${DURATION}s window",
+        "a line whose timestamp cannot be parsed is kept rather than dropped",
+    ],
+}
+json.dump(group, open(sys.argv[1], "w"), indent=2)
+PY
+fi
+
 # Files are created by root; hand them back to whoever invoked sudo.
 if [[ -n "${SUDO_USER:-}" ]]; then
 	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
+	if [[ $WITH_IDS -eq 1 ]]; then
+		chown "$SUDO_USER" "$IDS_LOG" "$GROUP_MANIFEST" 2>/dev/null || true
+		# Slips writes its working tree as root inside the container.
+		chown -R "$SUDO_USER" "$SLIPS_OUT" 2>/dev/null || true
+	fi
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"

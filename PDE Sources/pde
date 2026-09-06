@@ -28,6 +28,12 @@ MALICIOUS_USERS=1
 ATTACK_PROFILE=port-scan
 SEED=1337
 OUTDIR="$SCRIPT_DIR/output"
+
+# IDS correlation: run Slips on the veth during the window so the firewall and the
+# IDS produce independent evidence for the same packets.
+WITH_IDS=0
+IDS_DRAIN=45
+
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 # ---- palette -------------------------------------------------
@@ -97,7 +103,13 @@ banner() {
 	# Assembled as single strings then printed with one %s each, so an argument
 	# count can never drift out of step with the format.
 	printf '  %s\n' "${C_DIM}users${R} ${C_KEY}${USERS}${R} ${C_DIM}(${MALICIOUS_USERS} attacking)${R}   ${C_DIM}window${R} ${C_KEY}${DURATION}s${R}   ${C_DIM}rate${R} ${C_KEY}${RATE}/s${R}   ${C_DIM}malicious${R} ${C_KEY}${MALICIOUS_PCT}%${R}"
-	printf '  %s\n' "${C_DIM}profile${R} ${C_KEY}${ATTACK_PROFILE}${R}   ${C_DIM}seed${R} ${C_KEY}${SEED}${R}"
+	local sources
+	if [ "$WITH_IDS" = "1" ]; then
+		sources="${C_KEY}firewall${R} ${C_DIM}+${R} ${C_KEY}ids${R}"
+	else
+		sources="${C_KEY}firewall${R} ${C_DIM}only${R}"
+	fi
+	printf '  %s\n' "${C_DIM}profile${R} ${C_KEY}${ATTACK_PROFILE}${R}   ${C_DIM}seed${R} ${C_KEY}${SEED}${R}   ${C_DIM}sources${R} ${sources}"
 
 	local n; n="$(run_count)"
 	if [ "${n:-0}" -gt 0 ]; then
@@ -202,6 +214,14 @@ configure_menu() {
 		printf '  %s5%s  Attackers        %s%-7s%s %show many USERS attack — a separate knob from 4%s\n'        "$C_NUM" "$R" "$C_KEY" "$MALICIOUS_USERS" "$R" "$C_DIM" "$R"
 		printf '  %s6%s  Seed             %s%-7s%s %ssame seed, same run — keep it for reproducibility%s\n'     "$C_NUM" "$R" "$C_KEY" "$SEED" "$R" "$C_DIM" "$R"
 		echo
+		echo
+		local ids_state
+		if [ "$WITH_IDS" = "1" ]; then ids_state="${C_OK}on${R}"; else ids_state="${C_DIM}off${R}"; fi
+		printf '  %s7%s  IDS correlation  %-16b %sSlips sniffs the veth during the window%s\n' "$C_NUM" "$R" "$ids_state" "$C_DIM" "$R"
+		if [ "$WITH_IDS" = "1" ]; then
+			printf '  %s8%s  IDS drain        %s%-6s%s %sseconds kept running past the window to raise evidence%s\n' "$C_NUM" "$R" "$C_KEY" "${IDS_DRAIN}s" "$R" "$C_DIM" "$R"
+		fi
+		echo
 		local total mal
 		total=$(awk "BEGIN{printf \"%d\", $DURATION * $RATE}")
 		mal=$(awk "BEGIN{printf \"%d\", $DURATION * $RATE * $MALICIOUS_PCT / 100}")
@@ -218,6 +238,9 @@ configure_menu() {
 			4) ask_number MALICIOUS_PCT   "Malicious share of events" "the brief says 10%" ;;
 			5) ask_number MALICIOUS_USERS "How many users attack"     "1 of 10. Note 10:1 users is 9.09%, not 10% — these are different claims" ;;
 			6) ask_number SEED            "Random seed"               "any integer; the whole run is reproducible from it" ;;
+			7) if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi; persist WITH_IDS ;;
+			8) [ "$WITH_IDS" = "1" ] && ask_number IDS_DRAIN "Seconds to drain Slips after the window" \
+					"Slips raises evidence in batches; collecting immediately gets an empty file" ;;
 			0|q) return ;;
 			*) ;;
 		esac
@@ -277,13 +300,23 @@ run_capture() {
 	dim "  Real packets cross the real INPUT chain, and the log lines are written by"
 	dim "  the kernel rather than by us. Only the scenario is synthetic."
 	echo
-	kv "source"    "firewall (ufw)"
+	if [ "$WITH_IDS" = "1" ]; then
+		kv "sources" "firewall (ufw) + ids (Slips)"
+	else
+		kv "sources" "firewall (ufw)"
+	fi
 	kv "users"     "$USERS ($MALICIOUS_USERS attacking)"
 	kv "window"    "${DURATION}s at ${RATE}/s"
 	kv "profile"   "$ATTACK_PROFILE"
 	kv ""          "$(profile_signature "$ATTACK_PROFILE")"
 	kv "malicious" "${MALICIOUS_PCT}% of events"
 	echo
+	if [ "$WITH_IDS" = "1" ]; then
+		dim "    Slips attaches to the veth before the window opens and keeps running"
+		dim "    ${IDS_DRAIN}s past it, so both sources describe the same packets. Expect roughly"
+		dim "    $(( 60 + DURATION + IDS_DRAIN ))s in total — most of it Slips loading its modules."
+		echo
+	fi
 	warn "This enables ufw and modifies the host firewall for ${DURATION}s."
 	dim "    Your ruleset, ENABLED and LOGLEVEL are snapshotted and restored on exit,"
 	dim "    including on Ctrl-C. Option 4 shows the exact changes first."
@@ -299,15 +332,18 @@ run_capture() {
 	esac
 
 	echo
+	local args=(--users "$USERS" --duration "$DURATION" --rate "$RATE"
+		--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS"
+		--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR")
+	if [ "$WITH_IDS" = "1" ]; then
+		args+=(--with-ids --ids-drain "$IDS_DRAIN")
+	fi
+
 	local rc=0
 	if [ "$(id -u)" -ne 0 ]; then
-		sudo "$FW_SCRIPT" --users "$USERS" --duration "$DURATION" --rate "$RATE" \
-			--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
-			--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR" || rc=$?
+		sudo "$FW_SCRIPT" "${args[@]}" || rc=$?
 	else
-		"$FW_SCRIPT" --users "$USERS" --duration "$DURATION" --rate "$RATE" \
-			--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS" \
-			--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR" || rc=$?
+		"$FW_SCRIPT" "${args[@]}" || rc=$?
 	fi
 	echo
 	if [ "$rc" -eq 0 ]; then ok "capture complete — option 6 reads it back"
@@ -378,6 +414,36 @@ kv("  UFW ALLOW", o["ufw_allow_lines"])
 # event count. Shown rather than hidden, otherwise the totals look wrong.
 kv("  UFW AUDIT", o.get("ufw_audit_lines", "-"))
 kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/firewall_${run}.manifest.json"
+
+	# When the window was captured with --with-ids there is a second, independent
+	# account of the same packets. Showing them together is the whole point.
+	local group="$OUTDIR/window_${run}.group.json"
+	if [ -f "$group" ]; then
+		head_ "IDS — same window, independent source"
+		python3 -c 'import json,sys
+g = json.load(open(sys.argv[1]))
+ids = next((i for i in g["items"] if i["pde_source"] == "ids"), None)
+def kv(k, v): print("    %-22s %s" % (k, v))
+if ids:
+    kv("product", ids["product"])
+    kv("evidence lines", "%s in window (%s seen in total)"
+       % (ids["evidence_lines"], ids["evidence_lines_seen_total"]))
+    t = ids["threat_levels"]
+    kv("threat levels", "  ".join("%s %s" % (n, t[n]) for n in
+        ("critical", "high", "medium", "low", "info")))
+    kv("sha256", (ids["sha256"] or "-")[:40] + ("..." if ids["sha256"] else ""))' "$group"
+
+		local ids_log="$OUTDIR/ids_${run}.alerts.log"
+		if [ -s "$ids_log" ]; then
+			echo
+			python3 "$SCRIPT_DIR/../Anomaly Detection/Scripts/slips-format.py" --brief \
+				< "$ids_log" 2>/dev/null | head -8 | sed 's/^/    /' \
+				|| head -4 "$ids_log" | sed 's/^/    /'
+		else
+			echo
+			dim "    Slips raised nothing inside this window."
+		fi
+	fi
 
 	head_ "Evidence — first 12 lines"
 	sed -e "s/\[UFW BLOCK\]/${C_ERR}[UFW BLOCK]${R}/g" \
