@@ -51,8 +51,11 @@ IDS_DRAIN=45
 # everything else, because the backend runs on the host in some setups and inside
 # WSL in others, and localhost does not always mean the same machine.
 DFRAAS_URL="${DFRAAS_URL:-http://localhost:8080}"
-DFRAAS_SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
 DFRAAS_AUTH="${DFRAAS_AUTH:-admin:admin}"
+# One registered source per PDE source: they are different collectors observing
+# different things, and the repository classifies and retains per source.
+DFRAAS_SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
+DFRAAS_IDS_SOURCE_KEY="${DFRAAS_IDS_SOURCE_KEY:-pde-sim-slips-01}"
 
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -633,33 +636,97 @@ submit_evidence() {
 	require_run || return
 	local run; run="$(pick_run)"
 	[ -n "$run" ] || return
+
+	# One EvidenceItem references one artifact, so a window holding both a firewall log
+	# and an IDS log is two items from two sources — chosen here one at a time rather
+	# than uploaded together, which would misrepresent what an item is.
+	local fw_log="$OUTDIR/$run/firewall_${run}.log"
+	local ids_log="$OUTDIR/$run/ids_${run}.alerts.log"
+	local group="$OUTDIR/$run/window_${run}.group.json"
+
+	local source="" key="" artifact="" file="" digest=""
+	while true; do
+		banner
+		head_ "Submit from window $run"
+		dim "  One EvidenceItem references one artifact. A window captured from two"
+		dim "  sources is therefore two items, filed under two registered sources — sent"
+		dim "  one at a time, not bundled. Both carry the same coverage window, which is"
+		dim "  what lets correlation line them up afterwards."
+		echo
+		kv "window" "$(manifest_field "$run" 'm["window"]["start_utc"] + "  ->  " + m["window"]["end_utc"]')"
+		echo
+		printf '  %s%-3s %-10s %-32s %10s  %s%s\n' "$C_DIM" "" "SOURCE" "ARTIFACT" "BYTES" "FILED UNDER" "$R"
+		if [ -f "$fw_log" ]; then
+			printf '  %s1%s   %-10s %-32s %10s  %s\n' "$C_NUM" "$R" "firewall" \
+				"firewall_${run}.log" "$(stat -c %s "$fw_log")" "$DFRAAS_SOURCE_KEY"
+		else
+			printf '  %s    %-10s %s%s\n' "$C_DIM" "firewall" "missing" "$R"
+		fi
+		if [ -f "$ids_log" ]; then
+			printf '  %s2%s   %-10s %-32s %10s  %s\n' "$C_NUM" "$R" "ids" \
+				"ids_${run}.alerts.log" "$(stat -c %s "$ids_log")" "$DFRAAS_IDS_SOURCE_KEY"
+		else
+			printf '  %s    %-10s %s%s\n' "$C_DIM" "ids" "not captured for this window" "$R"
+		fi
+		printf '  %s    %-10s %s%s\n' "$C_DIM" "auth" "not built yet" "$R"
+		echo
+		dim "  groundtruth.json is never sent: labels known before the packets left are"
+		dim "  research metadata, and the repository has nowhere truthful to put them."
+		echo
+		printf '  %s0%s  back\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"
+		local pick; read -r pick || return
+		case "$pick" in
+			1) [ -f "$fw_log" ] || continue
+			   source=firewall; key="$DFRAAS_SOURCE_KEY"; artifact="firewall_${run}"
+			   file="$fw_log"
+			   digest="$(manifest_field "$run" 'm["output"]["sha256"]')"
+			   break ;;
+			2) [ -f "$ids_log" ] || continue
+			   source=ids; key="$DFRAAS_IDS_SOURCE_KEY"; artifact="ids_${run}"
+			   file="$ids_log"
+			   # The IDS digest lives in the group manifest — the record that says the
+			   # two items describe one window.
+			   digest="$(python3 -c 'import json,sys
+g = json.load(open(sys.argv[1]))
+i = next((x for x in g["items"] if x["pde_source"] == "ids"), None)
+print(i["sha256"] if i else "")' "$group" 2>/dev/null)"
+			   break ;;
+			0|q) return ;;
+			*) ;;
+		esac
+	done
+
 	banner
-	head_ "Submit window $run to the Evidence Repository"
-	dim "  One capture becomes one EvidenceItem. The manifest's window becomes the item's"
-	dim "  coverage window — the axis correlation runs along — and its sha256 goes as a"
-	dim "  claim, which the repository checks against a digest it recomputes itself."
-	dim "  groundtruth.json stays here: labels are research metadata, not evidence."
+	head_ "Submit the $source artifact from window $run"
 	echo
 	kv "endpoint"    "$DFRAAS_URL/api/evidence-items"
-	kv "source key"  "$DFRAAS_SOURCE_KEY"
-	kv "artifact id" "firewall_${run}"
+	kv "source key"  "$key"
+	kv "artifact id" "$artifact"
+	kv "file"        "$(basename "$file")  ($(stat -c %s "$file") bytes)"
 	kv "window"      "$(manifest_field "$run" 'm["window"]["start_utc"] + "  ->  " + m["window"]["end_utc"]')"
-	kv "sha256"      "$(manifest_field "$run" 'm["output"]["sha256"]')"
+	kv "sha256"      "${digest:-unknown}"
+	echo
+	dim "  The digest goes as a claim. The repository recomputes it from the bytes that"
+	dim "  arrive and stores only its own value; a mismatch is a 422 and nothing is kept."
+	dim "  This script re-checks the file locally first, so a log that changed since"
+	dim "  capture is caught here rather than looking like a transport failure."
 	echo
 	dim "  The source must be registered once before its first upload — that is where"
 	dim "  classification is decided, so it needs a work group id:"
-	dim "    ./submit-evidence.sh --register-with <workGroupId>"
+	dim "    ./submit-evidence.sh --source $source --register-with <workGroupId>"
 	echo
 	printf '  %ssubmit? [y/N]>%s ' "$C_TITLE" "$R"
-	# EOF is not consent, as everywhere else a prompt gates an outward-facing action.
 	local go; read -r go || { dim "  cancelled"; pause; return; }
 	case "$go" in
 		y|Y) ;;
 		*) dim "  cancelled"; pause; return ;;
 	esac
 	echo
-	DFRAAS_URL="$DFRAAS_URL" DFRAAS_SOURCE_KEY="$DFRAAS_SOURCE_KEY" DFRAAS_AUTH="$DFRAAS_AUTH" \
-		"$SUBMIT_SCRIPT" --run "$run" --outdir "$OUTDIR" 2>&1 | sed 's/^/  /'
+	DFRAAS_URL="$DFRAAS_URL" DFRAAS_AUTH="$DFRAAS_AUTH" \
+	DFRAAS_SOURCE_KEY="$DFRAAS_SOURCE_KEY" DFRAAS_IDS_SOURCE_KEY="$DFRAAS_IDS_SOURCE_KEY" \
+		"$SUBMIT_SCRIPT" --run "$run" --source "$source" --outdir "$OUTDIR" 2>&1 | sed 's/^/  /'
 	pause
 }
 
@@ -750,16 +817,21 @@ doctor() {
 	esac
 
 	if [ "$health" = "200" ]; then
-		source_code=$(curl -sS -u "$DFRAAS_AUTH" -o /dev/null -w '%{http_code}' --max-time 3 \
-			"$DFRAAS_URL/api/evidence-sources?sourceKey=$DFRAAS_SOURCE_KEY" 2>/dev/null || true)
-		source_code="${source_code:-000}"
-		case "$source_code" in
-			200) ok "source '$DFRAAS_SOURCE_KEY' is registered" ;;
-			404) warn "source '$DFRAAS_SOURCE_KEY' is not registered yet"
-			     dim "    ./submit-evidence.sh --register-with <workGroupId>" ;;
-			401) err "credentials rejected — set DFRAAS_AUTH in pde.conf" ;;
-			*)   warn "source lookup answered HTTP $source_code" ;;
-		esac
+		# Each PDE source registers separately, so each is checked separately: the
+		# firewall being registered says nothing about whether the IDS is.
+		local sk
+		for sk in "$DFRAAS_SOURCE_KEY" "$DFRAAS_IDS_SOURCE_KEY"; do
+			source_code=$(curl -sS -u "$DFRAAS_AUTH" -o /dev/null -w '%{http_code}' --max-time 3 \
+				"$DFRAAS_URL/api/evidence-sources?sourceKey=$sk" 2>/dev/null || true)
+			source_code="${source_code:-000}"
+			case "$source_code" in
+				200) ok "source '$sk' is registered" ;;
+				404) warn "source '$sk' is not registered yet"
+				     dim "    ./submit-evidence.sh --source $([ "$sk" = "$DFRAAS_IDS_SOURCE_KEY" ] && echo ids || echo firewall) --register-with <workGroupId>" ;;
+				401) err "credentials rejected — set DFRAAS_AUTH in pde.conf" ;;
+				*)   warn "lookup for '$sk' answered HTTP $source_code" ;;
+			esac
+		done
 	fi
 	pause
 }
@@ -947,7 +1019,7 @@ main_menu() {
 		echo
 		printf '  %s7%s  Read evidence back\n' "$C_NUM" "$R"
 		printf '  %s8%s  Verify integrity         %s(sha256 against the manifest)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
-		printf '  %ss%s  Submit to the repository %s(hands a window over for preservation)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %ss%s  Submit to the repository %s(one source at a time)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		echo
 		printf '  %s9%s  Help and diagnostics\n' "$C_NUM" "$R"
 		echo

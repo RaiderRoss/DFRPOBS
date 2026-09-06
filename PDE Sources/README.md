@@ -2,7 +2,7 @@
 
 Simulators for the three Potential Digital Evidence sources in the compliance scope,
 `pde`, the console that drives them, and `submit-evidence.sh`, which hands a captured
-window to the Evidence Repository.
+source's evidence to the Evidence Repository.
 
 | Source | Product | Status |
 |---|---|---|
@@ -49,7 +49,7 @@ evidence without any of that:
   6  Preview the event plan
   7  Read evidence back
   8  Verify integrity
-  s  Submit to the repository
+  s  Submit to the repository   (pick the window, then the source)
   9  Help and diagnostics
   0  Quit
 ```
@@ -159,31 +159,49 @@ rule — it is what the `EvidenceItem` should carry. Option **8** recomputes it.
 
 ## Into the Evidence Repository
 
-A capture only becomes evidence once the repository holds it. Option **s** submits one,
-and `submit-evidence.sh` does the same thing without the console:
+A capture only becomes evidence once the repository holds it.
+
+**One `EvidenceItem` references one artifact.** A window captured with the IDS on holds
+two logs from two collectors, so it becomes *two* items filed under *two* registered
+sources — sent one at a time, not bundled into one upload. Option **s** asks for the
+window first and then for the source within it, and `submit-evidence.sh` takes the same
+two choices as flags:
 
 ```bash
-./submit-evidence.sh --dry-run     # exactly what would be sent; sends nothing
-./submit-evidence.sh               # submit the most recent capture
-./submit-evidence.sh --run 20260906204848
+./submit-evidence.sh --list                    # windows on disk, and what each holds
+./submit-evidence.sh --dry-run                 # exactly what would be sent; sends nothing
+./submit-evidence.sh                           # firewall log of the latest window
+./submit-evidence.sh --source ids              # the IDS evidence for that same window
+./submit-evidence.sh --run 20260906204848 --source ids
 ```
 
-The source has to be registered once before its first upload. That is where
-classification is decided, so it takes a work group id and is deliberately not automatic:
+Each source registers separately — they are different collectors observing different
+things, and classification is assigned per source. Registration takes a work group id and
+is deliberately not automatic:
 
 ```bash
 curl -u admin:admin http://localhost:8080/api/work-groups   # find the work group id
-./submit-evidence.sh --register-with <workGroupId>
+./submit-evidence.sh --source firewall --register-with <workGroupId>
+./submit-evidence.sh --source ids      --register-with <workGroupId>
 ```
 
-One captured window becomes one `EvidenceItem`:
+| source | artifact | digest read from | filed under |
+|---|---|---|---|
+| `firewall` | `firewall_<ts>.log` | `firewall_<ts>.manifest.json` | `pde-sim-ufw-01` (`FIREWALL`) |
+| `ids` | `ids_<ts>.alerts.log` | `window_<ts>.group.json` | `pde-sim-slips-01` (`IDS`) |
+
+What each item carries:
 
 | manifest | becomes | |
 |---|---|---|
 | `window.start_utc` / `end_utc` | `eventStart` / `eventEnd` | the coverage window correlation runs along — not when we stored it |
-| `output.sha256` | checked, never stored | the repository recomputes its own digest and compares |
-| `firewall_<ts>.log` | the stored object | re-hashed after storage, before any row is written |
-| `firewall_<ts>` | `sourceArtifactId` | the dedupe key, so re-submitting a run is rejected rather than preserved twice |
+| the recorded `sha256` | checked, never stored | the repository recomputes its own digest and compares |
+| the log file | the stored object | re-hashed after storage, before any row is written |
+| `firewall_<ts>` / `ids_<ts>` | `sourceArtifactId` | the dedupe key, so re-submitting one is rejected rather than preserved twice |
+
+Both items carry the **same** `eventStart`/`eventEnd`, because both collectors observed
+the same packets over the same period. That shared window is what correlation lines them
+up along — the whole point of capturing from more than one source at once.
 
 The work group is not sent: classification is inherited from the registered source, so a
 collector cannot file its own output under a classification nobody assigned it.
