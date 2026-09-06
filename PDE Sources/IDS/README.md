@@ -12,10 +12,12 @@ No separate traffic is generated for it — it watches the firewall run:
 netns + veth created
   └─ Slips starts on veth-pde-h, loads modules      ~46s on this machine
        └─ ufw rules applied, logging full
-            └─ WINDOW: traffic generated             30s
-                 └─ ufw log extracted by byte offset
-            └─ Slips drains, then stops              45s
-                 └─ evidence sliced to the window
+            └─ alerts.log byte offset recorded
+                 └─ WINDOW: traffic generated        30s
+                 └─ ufw log read from its offset
+            └─ Slips drains                          45s
+                 └─ alerts read from their offset, while Slips still runs
+       └─ Slips stopped — teardown, the veth is going away
 ```
 
 The ordering is not incidental:
@@ -27,8 +29,15 @@ The ordering is not incidental:
 - **Slips is drained after the window**, because it raises evidence in batches once it
   has seen the flows. Collecting the instant the window closes reliably gets an empty
   file.
-- **Slips is stopped before its files are read.** `alerts.log` is appended to while it
-  runs, and evidence should not be collected from a moving target.
+- **Slips is never stopped in order to be read.** An IDS is a continuously running
+  system that gets *read against*; no bank halts one to collect from it, and modelling
+  it that way would carry the wrong assumption into the Evidence Repository's ingestion
+  design. Consistency comes from a byte offset recorded before the window plus the
+  timestamp slice — the same mechanism the ufw capture uses while `rsyslog` keeps
+  writing underneath it. A trailing fragment without its newline is a write still in
+  flight, so it is left for the next read rather than recorded as a finding.
+  Slips is stopped afterwards only because the veth it is attached to is being
+  destroyed with the rest of the run.
 
 ## Usage
 

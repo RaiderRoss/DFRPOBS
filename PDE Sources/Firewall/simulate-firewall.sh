@@ -353,6 +353,13 @@ SRC_LOG="$UFW_LOG"
 LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
 log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
 
+# Same mechanism for the IDS, and for the same reason: both sources keep running and
+# writing throughout, and the window is a bounded read against them rather than a pause.
+IDS_ALERTS_OFFSET=0
+if [[ $WITH_IDS -eq 1 ]]; then
+	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
+fi
+
 mkdir -p "$OUTDIR"
 GT_JSON="$OUTDIR/firewall_${STAMP}.groundtruth.json"
 OUT_LOG="$OUTDIR/firewall_${STAMP}.log"
@@ -505,16 +512,17 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	log "draining Slips for ${IDS_DRAIN}s so it can raise evidence for the window"
 	sleep "$IDS_DRAIN"
 
-	# Stopped before anything is read: alerts.log is being appended to while Slips
-	# runs, and evidence is what this file is for — it should not be collected from a
-	# moving target.
-	slips_stop
-	log "Slips stopped; collecting"
-
+	# Collected while Slips is still running. An IDS is a continuously running system
+	# that gets *read* against; halting one to gather evidence is not something a bank
+	# would do, and modelling it that way here would carry the wrong assumption into
+	# the Evidence Repository's ingestion design. Consistency comes from the byte
+	# offset and the timestamp slice, exactly as it does for the ufw log while rsyslog
+	# keeps writing underneath it.
+	#
 	# Defended rather than trusted: `read` returns non-zero on an empty herestring,
 	# which under `set -e` would abort the run at the point where the evidence has been
 	# collected but nothing has been written down about it.
-	IDS_COUNTS=$(slips_collect "$SLIPS_OUT" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$IDS_LOG" || echo "0 0")
+	IDS_COUNTS=$(slips_collect "$SLIPS_OUT" "$IDS_ALERTS_OFFSET" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$IDS_LOG" || echo "0 0")
 	read -r IDS_TOTAL IDS_KEPT <<< "$IDS_COUNTS" || true
 	IDS_TOTAL=${IDS_TOTAL:-0}
 	IDS_KEPT=${IDS_KEPT:-0}
@@ -523,9 +531,14 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	chmod 444 "$IDS_LOG"
 	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} findings fall inside the window"
 
+	# Only now is Slips stopped, and not in order to read it: the veth it is attached
+	# to is about to be torn down with the rest of the run. This is the end of the
+	# capture session, not a step in collecting evidence.
+	slips_stop
+
 	# Keep Slips' full working tree per run, not just the alerts: zeek_files/conn.log
 	# is the flow record behind the findings, and an investigator asking "on what basis"
-	# needs it. Safe to move now that the container is stopped.
+	# needs it. Moved only after the container has let go of the bind mount.
 	if [[ -d "$SLIPS_OUT" ]]; then
 		rm -rf "$OUTDIR/ids_${STAMP}"
 		mv "$SLIPS_OUT" "$OUTDIR/ids_${STAMP}"

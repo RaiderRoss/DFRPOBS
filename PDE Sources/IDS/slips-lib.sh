@@ -93,16 +93,29 @@ slips_stop() {
 	docker rm -f "$SLIPS_REDIS" >/dev/null 2>&1 || true
 }
 
-# Slices Slips' evidence to the capture window and writes it to $4.
-#   $1 slips output dir   $2 window start (ISO)   $3 window end (ISO)   $4 destination
-# Echoes "<total> <in_window>" so the caller can report both.
+# Byte length of the evidence file right now, for use as a later read boundary.
+# Echoes 0 if Slips has not written anything yet.
+slips_alerts_offset() {
+	local f="$1/alerts/alerts.log"
+	if [ -f "$f" ]; then stat -c %s "$f"; else echo 0; fi
+}
+
+# Slices Slips' evidence to the capture window and writes it to $5.
+#   $1 slips output dir   $2 byte offset to read from   $3 window start (ISO)
+#   $4 window end (ISO)   $5 destination
+# Echoes "<total> <in_window>".
+#
+# Reads a bounded byte range rather than requiring Slips to be stopped. A real IDS runs
+# continuously and is *read* against, never halted to be collected from; the offset is
+# the same mechanism the ufw capture uses while rsyslog keeps writing underneath it.
 slips_collect() {
-	local slips_out="$1" start="$2" end="$3" dest="$4"
-	python3 - "$slips_out/alerts/alerts.log" "$start" "$end" "$dest" <<'PY'
+	local slips_out="$1" offset="$2" start="$3" end="$4" dest="$5"
+	python3 - "$slips_out/alerts/alerts.log" "$start" "$end" "$dest" "$offset" <<'PY'
 import sys, os
 from datetime import datetime, timezone
 
 src, start_s, end_s, dest = sys.argv[1:5]
+offset = int(sys.argv[5])
 
 def parse(s):
     s = s.strip().replace("Z", "+00:00")
@@ -118,7 +131,16 @@ start, end = parse(start_s), parse(end_s)
 total = kept = 0
 lines = []
 if os.path.exists(src):
-    for line in open(src, errors="replace"):
+    end_byte = os.path.getsize(src)          # boundary taken once, now
+    with open(src, "rb") as fh:
+        fh.seek(offset)
+        chunk = fh.read(max(0, end_byte - offset)).decode("utf-8", "replace")
+    # A write may be in flight at the boundary, so a trailing fragment without its
+    # newline is not a complete finding yet. Dropping it here means it is picked up
+    # whole by the next read rather than recorded twice, half each time.
+    if chunk and not chunk.endswith("\n"):
+        chunk = chunk[:chunk.rfind("\n") + 1] if "\n" in chunk else ""
+    for line in chunk.splitlines(keepends=True):
         if not line.strip():
             continue
         total += 1
