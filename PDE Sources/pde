@@ -643,20 +643,40 @@ sources_menu() {
 		printf '  %-12s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
 
 		echo
-		local want_ids; [ "$WITH_IDS" = "1" ] && want_ids=enabled || want_ids=disabled
-		printf '  %s1%s  IDS source  %s%-9s%s %sfirewall is the base source and cannot be turned off%s\n' \
-			"$C_NUM" "$R" "$C_KEY" "$want_ids" "$R" "$C_DIM" "$R"
+		dim "  The firewall is the base source — it owns the topology the traffic runs"
+		dim "  on, so it cannot be turned off on its own."
+		echo
+		# The label names what pressing it does, rather than showing a state and leaving
+		# the reader to work out which way it will move.
+		# "setting", not "it": the table above reports what is *running*, and with the
+		# sources stopped the two are different things. Saying "it is on" next to a row
+		# reading "stopped" invites exactly that confusion.
+		if [ "$WITH_IDS" = "1" ]; then
+			printf '  %s1%s  Turn the IDS source OFF  %s(setting: on)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s1%s  Turn the IDS source ON   %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 
-		# Config and reality can disagree, because Slips is attached at start-up.
+		# Setting and reality can disagree, because Slips attaches at start-up and
+		# cannot join or leave sources that are already running.
 		if [ "$state" = "up" ] && [ "$running_ids" != "$WITH_IDS" ]; then
 			echo
-			warn "IDS setting changed — restart the sources to apply it"
+			warn "Changed, but not yet applied."
+			dim "    Slips attaches when the sources start, so the running ones still have"
+			dim "    it $([ "$running_ids" = "1" ] && echo "ON" || echo "OFF"). Option 2 restarts them, which is what applies it."
 		fi
 
 		echo
 		case "$state" in
-			up)    printf '  %s2%s  Restart sources\n  %s3%s  Stop sources        %s(restores your firewall)%s\n' "$C_NUM" "$R" "$C_NUM" "$R" "$C_DIM" "$R" ;;
-			stale) printf '  %s2%s  %sRecover stale session%s %s(restore your firewall)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
+			up)
+				printf '  %s2%s  Restart sources          %s(what applies a change made above)%s\n' \
+					"$C_NUM" "$R" "$C_DIM" "$R"
+				# Naming the values it returns to, rather than saying "restores your
+				# firewall" and leaving the reader to wonder what that means.
+				printf '  %s3%s  Stop sources             %s(ufw back to ENABLED=%s LOGLEVEL=%s)%s\n' \
+					"$C_NUM" "$R" "$C_DIM" "$(lab_field LAB_ORIG_ENABLED)" "$(lab_field LAB_ORIG_LOGLEVEL)" "$R"
+				;;
+			stale) printf '  %s2%s  %sRecover stale session%s %s(put the firewall back)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
 			*)     printf '  %s2%s  Start sources\n' "$C_NUM" "$R" ;;
 		esac
 		echo
@@ -665,7 +685,24 @@ sources_menu() {
 		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r go
 
 		case "$go" in
-			1) if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi; persist WITH_IDS ;;
+			1)
+				if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi
+				persist WITH_IDS
+				# Offer the restart here instead of leaving a warning to act on
+				# separately: the toggle alone does nothing to running sources, and
+				# making someone find that out from a notice is a poor way to say it.
+				if [ "$state" = "up" ]; then
+					echo
+					printf '  %sapply it now? this restarts the sources [y/N]>%s ' "$C_TITLE" "$R"
+					# EOF is not consent — see the stale-recovery prompt.
+					if read -r apply; then
+						case "$apply" in
+							y|Y) echo; lab_take_down && lab_bring_up; pause ;;
+							*)   dim "  left for option 2"; sleep 1 ;;
+						esac
+					fi
+				fi
+				;;
 			2)
 				case "$state" in
 					up)    echo; lab_take_down && lab_bring_up; pause ;;
