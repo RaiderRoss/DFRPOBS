@@ -248,11 +248,15 @@ configure_menu() {
 		printf '  %s6%s  Seed             %s%-7s%s %ssame seed, same run — keep it for reproducibility%s\n'     "$C_NUM" "$R" "$C_KEY" "$SEED" "$R" "$C_DIM" "$R"
 		echo
 		echo
-		local ids_state
-		if [ "$WITH_IDS" = "1" ]; then ids_state="${C_OK}on${R}"; else ids_state="${C_DIM}off${R}"; fi
-		printf '  %s7%s  IDS correlation  %-16b %sSlips sniffs the veth during the window%s\n' "$C_NUM" "$R" "$ids_state" "$C_DIM" "$R"
+		# Whether the IDS runs at all is a question about sources, and lives on the
+		# sources screen. It used to be togglable here too, which left one setting with
+		# two controls and no way to tell which was authoritative. Only the drain stays,
+		# because it describes the capture rather than the source.
 		if [ "$WITH_IDS" = "1" ]; then
-			printf '  %s8%s  IDS drain        %s%-6s%s %sseconds kept running past the window to raise evidence%s\n' "$C_NUM" "$R" "$C_KEY" "${IDS_DRAIN}s" "$R" "$C_DIM" "$R"
+			printf '  %s7%s  IDS drain        %s%-7s%s %sseconds Slips keeps running past the window,%s\n' "$C_NUM" "$R" "$C_KEY" "${IDS_DRAIN}s" "$R" "$C_DIM" "$R"
+			printf '  %s                    %s%-7s%s %sso it can raise evidence for it%s\n' "$C_DIM" "" "" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s   %s IDS drain        %s—       the IDS source is off; option 1 turns it on%s\n' "$C_DIM" "$R" "$C_DIM" "$R"
 		fi
 		echo
 		local total mal
@@ -271,9 +275,10 @@ configure_menu() {
 			4) ask_number MALICIOUS_PCT   "Malicious share of events" "the brief says 10%" ;;
 			5) ask_number MALICIOUS_USERS "How many users attack"     "1 of 10. Note 10:1 users is 9.09%, not 10% — these are different claims" ;;
 			6) ask_number SEED            "Random seed"               "any integer; the whole run is reproducible from it" ;;
-			7) if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi; persist WITH_IDS ;;
-			8) [ "$WITH_IDS" = "1" ] && ask_number IDS_DRAIN "Seconds to drain Slips after the window" \
-					"Slips raises evidence in batches; collecting immediately gets an empty file" ;;
+			7) if [ "$WITH_IDS" = "1" ]; then
+					ask_number IDS_DRAIN "Seconds to drain Slips after the window" \
+						"Slips raises evidence in batches; collecting immediately gets an empty file"
+				fi ;;
 			0|q) return ;;
 			*) ;;
 		esac
