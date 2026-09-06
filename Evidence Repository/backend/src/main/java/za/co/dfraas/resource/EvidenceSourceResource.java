@@ -127,9 +127,6 @@ public class EvidenceSourceResource {
 	@PostMapping
 	public ResponseEntity<EvidenceSourceDto> register(
 			@Valid @RequestBody EvidenceSourceCreateRequest request,
-
-			// Injected by Spring MVC to build the Location header; hidden so springdoc does not
-			// advertise it as something the caller supplies.
 			@Parameter(hidden = true) UriComponentsBuilder uriBuilder) {
 
 		EvidenceSourceDto created = service.register(request);

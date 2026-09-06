@@ -37,6 +37,7 @@ body {
 
 button,
 input,
+select,
 a {
   font: inherit;
 }
@@ -147,6 +148,44 @@ h2 {
   background: #1b2b24;
 }
 
+/* COMPROMISED, ARCHIVED and DELETED — anything the readiness audit exists to surface. */
+.status-pill.warn {
+  color: var(--warning);
+  background: #2b2419;
+}
+
+/* Checkbox in a toolbar: the shared `input` rule stretches one to full width, so the
+   control has to be sized back down and the label kept on one line. */
+.toggle-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.toggle-field input {
+  width: auto;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.pager button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .tab-bar {
   display: flex;
   gap: 4px;
@@ -252,6 +291,55 @@ h2 {
   font-size: 0.82rem;
 }
 
+.metric-row.quad {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.metric-footnote {
+  margin: 16px 0 0;
+  color: var(--faint);
+  font-size: 0.82rem;
+}
+
+/* Overview panels that read as a full-width table rather than a column of the grid. */
+.overview-grid .span-all {
+  grid-column: 1 / -1;
+}
+
+.stat-list {
+  display: grid;
+  gap: 8px;
+}
+
+.stat-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border-left: 2px solid var(--accent);
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.stat-row strong {
+  color: var(--text);
+  font-size: 1.1rem;
+}
+
+.stat-row .status-text {
+  color: var(--accent-light);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.stat-warn {
+  color: var(--warning);
+}
+
 .toolbar,
 .auth-form,
 .lookup-form {
@@ -279,7 +367,8 @@ label input {
   margin-top: 6px;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-width: 0;
   padding: 10px 11px;
@@ -562,6 +651,10 @@ dd {
   .status-card {
     max-width: 360px;
   }
+
+  .metric-row.quad {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 640px) {
@@ -586,7 +679,8 @@ dd {
     flex: 0 0 auto;
   }
 
-  .metric-row {
+  .metric-row,
+  .metric-row.quad {
     grid-template-columns: 1fr;
   }
 

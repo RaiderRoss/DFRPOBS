@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useState } from 'react'
 import { repositoryApi, type TriggerEvent } from '../api/api'
 
 function formatDate(value: string) {

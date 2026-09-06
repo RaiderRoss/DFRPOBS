@@ -5,6 +5,8 @@ import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -12,6 +14,7 @@ import za.co.dfraas.dto.EvidenceIngestRequest;
 import za.co.dfraas.dto.EvidenceItemDto;
 import za.co.dfraas.entity.EvidenceItem;
 import za.co.dfraas.entity.EvidenceSource;
+import za.co.dfraas.entity.EvidenceStatus;
 import za.co.dfraas.exception.DuplicateResourceException;
 import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.exception.ResourceNotFoundException;
@@ -56,6 +59,39 @@ public class EvidenceItemService {
 		return repository.findById(id)
 				.map(mapper::toDto)
 				.orElseThrow(() -> ResourceNotFoundException.of(RESOURCE, id));
+	}
+
+	/**
+	 * The browse listing, optionally narrowed to one classification.
+	 *
+	 * <p>Paged and never a {@code List}, which is the rule {@code EvidenceItemRepository}
+	 * states for every collection-returning read on this table: under continuous collection it
+	 * grows at the rate the whole estate produces, so an unpaged listing is a request to
+	 * materialise the entire evidence store into one response body. Note that the resource's
+	 * {@code @PageableDefault} sets the default page size and not a ceiling: the ceiling is
+	 * Spring's {@code spring.data.web.pageable.max-page-size}, which defaults to 2000 and is
+	 * worth lowering here once this endpoint has a real caller.
+	 *
+	 * <p>{@code includeDeleted} defaults to false at the resource. Soft-deleted items are
+	 * withheld from an ordinary browse because presenting them beside live evidence
+	 * misrepresents what is currently preserved, but they are never unreachable: the record
+	 * that an artifact was destroyed, and when, is itself a finding an investigation may need,
+	 * which is why this is a flag and not a filter baked into the query.
+	 */
+	public Page<EvidenceItemDto> findAll(UUID workGroupId, boolean includeDeleted, Pageable pageable) {
+		return findEntities(workGroupId, includeDeleted, pageable).map(mapper::toDto);
+	}
+
+	private Page<EvidenceItem> findEntities(UUID workGroupId, boolean includeDeleted, Pageable pageable) {
+		if (workGroupId != null) {
+			return includeDeleted
+					? repository.findByWorkGroupId(workGroupId, pageable)
+					: repository.findByWorkGroupIdAndStatusNot(workGroupId, EvidenceStatus.DELETED, pageable);
+		}
+		// findAll(Pageable) rather than the unpaged findAll() the repository warns against.
+		return includeDeleted
+				? repository.findAll(pageable)
+				: repository.findByStatusNot(EvidenceStatus.DELETED, pageable);
 	}
 
 	/**

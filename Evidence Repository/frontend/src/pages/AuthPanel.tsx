@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react'
+import { type FormEvent, useState } from 'react'
 import { clearCredentials, repositoryApi, setCredentials } from '../api/api'
 
 export default function AuthPanel({ onAuthenticated }: { onAuthenticated: () => void }) {
