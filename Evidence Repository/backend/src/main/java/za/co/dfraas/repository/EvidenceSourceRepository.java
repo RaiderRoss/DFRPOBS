@@ -6,6 +6,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -90,4 +91,28 @@ public interface EvidenceSourceRepository extends JpaRepository<EvidenceSource, 
 			ORDER BY COALESCE(s.last_evidence_at, s.registered_at)
 			""", nativeQuery = true)
 	List<EvidenceSource> findSilentSources(@Param("asOf") OffsetDateTime asOf);
+
+	/**
+	 * Stamps {@code last_evidence_at} after a successful ingest — the write half of the
+	 * liveness signal {@link #findSilentSources} reads.
+	 *
+	 * <p><strong>The database clock, not the JVM's</strong>, matching changeset {@code 0004}'s
+	 * statement that this column is stamped on each ingest by the server. It is the same
+	 * discipline the audited timestamps follow, and it costs nothing to keep here: a skewed
+	 * application host would otherwise be able to make a healthy source look overdue, or a dead
+	 * one look current.
+	 *
+	 * <p>A direct UPDATE rather than a setter on the managed entity, because everything else on
+	 * a registration row is immutable by intent. Dirty checking would put the whole row in the
+	 * flush, so any accidental modification elsewhere in the transaction would be written along
+	 * with it; naming the one column that may legitimately change makes that impossible.
+	 *
+	 * <p>Flushes and clears around itself so the persistence context cannot afterwards serve a
+	 * cached source row carrying the stale timestamp this statement just replaced.
+	 *
+	 * @return the number of rows updated: 1 normally, 0 if the source was deleted concurrently
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query(value = "UPDATE evidence_source SET last_evidence_at = now() WHERE id = :id", nativeQuery = true)
+	int touchLastEvidenceAt(@Param("id") UUID id);
 }
