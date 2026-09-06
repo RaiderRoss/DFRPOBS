@@ -481,6 +481,16 @@ if [[ $LOG_LINES -eq 0 ]]; then
 	echo "         rate-limited and that $SRC_LOG is being written to." >&2
 fi
 
+# Facts needed to read the log's own timestamps, which the log itself does not carry.
+#
+# ufw lines come through rsyslog in RFC 3164 format: local time, no year, no timezone,
+# whole seconds. Slips writes RFC 3339: UTC, explicit offset, microseconds. Same instant,
+# two different renderings — 22:48:49 and 20:48:49 here — and nothing in the ufw line
+# says which zone it is in. Rather than rewrite what the source produced, record what is
+# needed to interpret it.
+TZ_NAME=$(date +%Z)
+TZ_OFFSET=$(date +%z)
+
 # Hashed before anything else touches the file, per the SecureRS ingestion rule the
 # Evidence Repository follows. This digest is what the EvidenceItem will carry.
 SHA256=$(sha256sum "$OUT_LOG" | cut -d' ' -f1)
@@ -504,6 +514,28 @@ manifest = {
         "end_utc": "${WINDOW_END_ISO}",
         "duration_seconds": ${DURATION},
     },
+    # How to read the timestamps in the log file, which the log file cannot tell you
+    # itself. Without this a ufw line is genuinely ambiguous: no year, no zone.
+    "timestamps": {
+        "log_line_format": "RFC 3164 syslog: 'Mon DD HH:MM:SS', LOCAL time, no year, "
+                           "no timezone, whole seconds",
+        "log_line_timezone": "${TZ_NAME}",
+        "log_line_utc_offset": "${TZ_OFFSET}",
+        "manifest_and_window_bounds": "UTC (RFC 3339, suffix Z)",
+        "ids_evidence_format": "RFC 3339 with explicit offset, microseconds — already UTC",
+        # Useful for ORDERING, not for conversion. Measured on this host, boot time from
+        # /proc/stat and the boot time implied by printk's own timestamps disagree by
+        # ~694s: WSL2 suspends the VM and printk's clock does not count suspended time.
+        # So this field cannot be turned into an absolute instant, and any manifest
+        # claiming otherwise would be wrong.
+        "kernel_uptime_field": "The bracketed [12345.678901] on each line is a monotonic "
+                               "clock with microsecond resolution. It orders events "
+                               "within the window far more precisely than the "
+                               "whole-second syslog timestamp, and is immune to wall-"
+                               "clock adjustment. It is NOT convertible to an absolute "
+                               "time on this host: the VM suspends, and printk's clock "
+                               "does not advance while it does.",
+    },
     "configuration": {
         "users": ${USERS},
         "malicious_users": ${MALICIOUS_USERS},
@@ -526,6 +558,11 @@ manifest = {
         "sha256": "${SHA256}",
     },
     "caveats": [
+        "the log's own timestamps are LOCAL (${TZ_NAME}, ${TZ_OFFSET}) while every "
+        "timestamp in this manifest, in the ground truth and in the IDS evidence is UTC. "
+        "The same instant therefore reads two hours apart between firewall.log and "
+        "ids.alerts.log; see the timestamps block. Nothing has been rewritten — a "
+        "source's own output is left as the source produced it",
         "syslog timestamps carry no year and no sub-second precision; the authoritative "
         "window bounds are window.start_utc/end_utc recorded by the generator",
         "lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the "
@@ -659,6 +696,12 @@ group = {
         "independent accounts of one attack rather than one record split in two."
     ),
     "caveats": [
+        "the two items timestamp differently: firewall.log is RFC 3164 syslog in LOCAL "
+        "time (${TZ_NAME}, ${TZ_OFFSET}, no year, whole seconds) while ids.alerts.log is "
+        "RFC 3339 in UTC with microseconds. The same instant reads differently between "
+        "them, and neither has been rewritten. window.start_utc/end_utc below are UTC "
+        "and are the common reference; firewall.manifest.json carries the conversion "
+        "facts, including kernel boot time for the microsecond-precision uptime field",
         "IDS findings are sliced to the window by the timestamp on each evidence line; "
         "Slips keeps its own 1-hour timewindows internally and its alert threshold "
         "accumulates per profile across that hour, not across this ${DURATION}s window",
