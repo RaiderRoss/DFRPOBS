@@ -39,35 +39,24 @@ IDS_READY_TIMEOUT=240
 # running past the window before collecting.
 IDS_DRAIN=45
 
-# Test subnet. Deliberately not a range anything else on this host uses, so extraction
-# can separate simulated traffic from whatever else the firewall happens to log.
-SUBNET="10.99.0.0/24"
-HOST_IP="10.99.0.1"
-USER_IP_BASE="10.99.0."
-USER_IP_OFFSET=10          # first user is 10.99.0.11
+# Topology, port lists and lab paths live in one place so this script and lab.sh cannot
+# drift apart on them — see the note there about why the port lists interact.
+PDE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lab-config.sh
+source "$PDE_ROOT/lab-config.sh"
 
-NS="pde-fw"
-VETH_HOST="veth-pde-h"
-VETH_NS="veth-pde-n"
-
-# Ports the firewall permits — ordinary application traffic.
-BENIGN_PORTS="80,443,8080"
-# Ports the firewall denies — the sweep an attacker runs looking for a way in.
-#
-# Deliberately wide. The firewall logs a BLOCK however few ports are touched, but an
-# IDS decides "vertical port scan" from the number of DISTINCT ports one source reaches
-# for on one host inside a timewindow. The earlier 14-port list is thin enough to sit
-# under that threshold, which would leave the IDS silent about an attack the firewall
-# recorded plainly — the opposite of the correlation this is built to show.
-# (slips-cli.sh's own working demo sweeps 70 ports.) None may overlap BENIGN_PORTS.
-MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,873,993,995,1080,1433,1521,2049,2375,3306,3389,5060,5432,5900,6379,8443,9200,11211,27017"
-
-# Host services kept reachable while ufw is up, so enabling a default-deny firewall
-# does not cut off the dev stack or the Windows host's access to it.
-PRESERVE_PORTS="22,5432,5433,8080,9000,9001,19092,8081"
-
-UFW_LOG="/var/log/ufw.log"
-KERN_LOG="/var/log/kern.log"
+# A lab left running by lab.sh owns the topology, the firewall and the IDS. This script
+# then only takes a window against it: no setup, no teardown, and crucially no restoring
+# a firewall it did not configure. With no lab up it does the whole thing itself, which
+# keeps the one-shot path — and its exit trap — exactly as it was.
+LAB_MODE=0
+if [[ -f "$LAB_STATE" ]]; then
+	# shellcheck source=/dev/null
+	source "$LAB_STATE"
+	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${LAB_NS:-$NS}"; then
+		LAB_MODE=1
+	fi
+fi
 
 usage() {
 	sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
@@ -138,11 +127,32 @@ reach $UFW_LOG. Start it with: systemctl start rsyslog"
 fi
 
 IDS_LIB="$SCRIPT_DIR/../IDS/slips-lib.sh"
+
+# A running lab decides whether there is an IDS; --with-ids on a capture cannot conjure
+# one, and asking for it when the lab was built without one is a mistake worth naming
+# rather than silently producing a firewall-only window.
+if [[ $LAB_MODE -eq 1 ]]; then
+	if [[ $WITH_IDS -eq 1 && "${LAB_WITH_IDS:-0}" -ne 1 ]]; then
+		die "the running lab was built without an IDS; './lab.sh down' then './lab.sh up --with-ids'"
+	fi
+	WITH_IDS="${LAB_WITH_IDS:-0}"
+	SLIPS_OUT="${LAB_SLIPS_OUT:-}"
+
+	# The lab created a fixed set of addresses in the namespace. Asking for more users
+	# than exist would bind to addresses that are not there, and the failure would look
+	# like a traffic problem rather than a configuration one.
+	if [[ $USERS -gt "${LAB_USERS:-0}" ]]; then
+		die "the running lab has ${LAB_USERS:-0} user addresses, --users asked for $USERS"
+	fi
+fi
+
 if [[ $WITH_IDS -eq 1 ]]; then
 	[[ -f "$IDS_LIB" ]] || die "--with-ids needs $IDS_LIB"
 	# shellcheck source=../IDS/slips-lib.sh
 	source "$IDS_LIB"
-	if [[ $DRY_RUN -eq 0 ]]; then
+	# Only the one-shot path starts Slips, so only it needs to check it can. In lab
+	# mode Slips is already up and was validated when the lab was built.
+	if [[ $DRY_RUN -eq 0 && $LAB_MODE -eq 0 ]]; then
 		slips_preflight || die "IDS preflight failed"
 	fi
 fi
@@ -210,134 +220,147 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Snapshot the firewall so the run is reversible
+# Infrastructure
+#
+# With a lab up, the topology, the firewall and the IDS already exist and outlive this
+# capture, so there is nothing to build and — importantly — nothing to restore. Without
+# one, this script builds the lot and puts it back on exit, which is the safe one-shot
+# path and the reason the trap below still exists.
 # ---------------------------------------------------------------------------
-STATE_DIR=$(mktemp -d /tmp/pde-fw-state.XXXXXX)
-ORIG_ENABLED=$(grep -E '^ENABLED=' /etc/ufw/ufw.conf | cut -d= -f2)
-ORIG_LOGLEVEL=$(grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf | cut -d= -f2)
-cp -a /etc/ufw/user.rules "$STATE_DIR/user.rules"
-cp -a /etc/ufw/user6.rules "$STATE_DIR/user6.rules"
-log "firewall state saved to $STATE_DIR (was ENABLED=$ORIG_ENABLED LOGLEVEL=$ORIG_LOGLEVEL)"
+if [[ $LAB_MODE -eq 1 ]]; then
+	log "using the running lab (${LAB_NS:-$NS}, started ${LAB_STARTED_UTC:-?})"
+	[[ "${LAB_WITH_IDS:-0}" -eq 1 ]] && log "IDS already running on ${LAB_VETH_HOST:-$VETH_HOST}"
+else
+	# ---------------------------------------------------------------------------
+	# Snapshot the firewall so the run is reversible
+	# ---------------------------------------------------------------------------
+	STATE_DIR=$(mktemp -d /tmp/pde-fw-state.XXXXXX)
+	ORIG_ENABLED=$(grep -E '^ENABLED=' /etc/ufw/ufw.conf | cut -d= -f2)
+	ORIG_LOGLEVEL=$(grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf | cut -d= -f2)
+	cp -a /etc/ufw/user.rules "$STATE_DIR/user.rules"
+	cp -a /etc/ufw/user6.rules "$STATE_DIR/user6.rules"
+	log "firewall state saved to $STATE_DIR (was ENABLED=$ORIG_ENABLED LOGLEVEL=$ORIG_LOGLEVEL)"
 
-restore() {
-	local rc=$?
-	[[ $KEEP_FIREWALL -eq 1 ]] && { echo "--keep-firewall: leaving firewall and namespace in place"; return 0; }
-	echo "restoring firewall and tearing down namespace..."
-	# Slips must let go of the interface before it is deleted underneath it.
-	if [[ $WITH_IDS -eq 1 ]] && declare -F slips_stop >/dev/null; then
-		slips_stop
-	fi
-	ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
+	restore() {
+		local rc=$?
+		[[ $KEEP_FIREWALL -eq 1 ]] && { echo "--keep-firewall: leaving firewall and namespace in place"; return 0; }
+		echo "restoring firewall and tearing down namespace..."
+		# Slips must let go of the interface before it is deleted underneath it.
+		if [[ $WITH_IDS -eq 1 ]] && declare -F slips_stop >/dev/null; then
+			slips_stop
+		fi
+		ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
+		ip netns del "$NS" 2>/dev/null || true
+		ip link del "$VETH_HOST" 2>/dev/null || true
+		cp -a "$STATE_DIR/user.rules" /etc/ufw/user.rules 2>/dev/null || true
+		cp -a "$STATE_DIR/user6.rules" /etc/ufw/user6.rules 2>/dev/null || true
+		ufw logging "$ORIG_LOGLEVEL" >/dev/null 2>&1 || true
+		if [[ "$ORIG_ENABLED" == "no" ]]; then
+			ufw --force disable >/dev/null 2>&1 || true
+		else
+			ufw --force enable >/dev/null 2>&1 || true
+		fi
+		rm -rf "$STATE_DIR"
+		echo "firewall restored to ENABLED=$ORIG_ENABLED LOGLEVEL=$ORIG_LOGLEVEL"
+		return $rc
+	}
+	trap restore EXIT INT TERM
+
+	# ---------------------------------------------------------------------------
+	# Network namespace: one address per simulated user
+	# ---------------------------------------------------------------------------
+	log "creating namespace $NS with $USERS user addresses"
 	ip netns del "$NS" 2>/dev/null || true
 	ip link del "$VETH_HOST" 2>/dev/null || true
-	cp -a "$STATE_DIR/user.rules" /etc/ufw/user.rules 2>/dev/null || true
-	cp -a "$STATE_DIR/user6.rules" /etc/ufw/user6.rules 2>/dev/null || true
-	ufw logging "$ORIG_LOGLEVEL" >/dev/null 2>&1 || true
-	if [[ "$ORIG_ENABLED" == "no" ]]; then
-		ufw --force disable >/dev/null 2>&1 || true
-	else
-		ufw --force enable >/dev/null 2>&1 || true
+
+	ip netns add "$NS"
+	ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+	ip link set "$VETH_NS" netns "$NS"
+	ip addr add "$HOST_IP/24" dev "$VETH_HOST"
+	ip link set "$VETH_HOST" up
+	ip netns exec "$NS" ip link set lo up
+	for ip_addr in "${USER_IPS[@]}"; do
+		ip netns exec "$NS" ip addr add "$ip_addr/24" dev "$VETH_NS"
+	done
+	ip netns exec "$NS" ip link set "$VETH_NS" up
+
+	# ---------------------------------------------------------------------------
+	# IDS
+	#
+	# Started here, between creating the interface and opening the window: Slips can only
+	# attach to a veth that already exists, and it must be reading packets before any are
+	# generated. Its ~80s of module and threat-feed loading is why this cannot be deferred
+	# to just before the traffic — a window opened during startup is simply not observed.
+	#
+	# ufw is configured *after* this, so `logging full` is active for the window rather
+	# than for the couple of minutes Slips spends starting up.
+	# ---------------------------------------------------------------------------
+
+	# Named for the run only once the window has a timestamp; until then Slips writes to a
+	# scratch directory, because STAMP is deliberately taken from the window start and the
+	# window has not opened yet.
+	if [[ $WITH_IDS -eq 1 ]]; then
+		SLIPS_OUT="$OUTDIR/ids-run"
+		rm -rf "$SLIPS_OUT"
+		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
+		slips_start_redis || die "could not start the Slips redis"
+		slips_start "$VETH_HOST" "$SLIPS_OUT" || die "could not start Slips"
+		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
+		log "Slips is reading $VETH_HOST"
 	fi
-	rm -rf "$STATE_DIR"
-	echo "firewall restored to ENABLED=$ORIG_ENABLED LOGLEVEL=$ORIG_LOGLEVEL"
-	return $rc
-}
-trap restore EXIT INT TERM
 
-# ---------------------------------------------------------------------------
-# Network namespace: one address per simulated user
-# ---------------------------------------------------------------------------
-log "creating namespace $NS with $USERS user addresses"
-ip netns del "$NS" 2>/dev/null || true
-ip link del "$VETH_HOST" 2>/dev/null || true
+	# ---------------------------------------------------------------------------
+	# Firewall
+	# ---------------------------------------------------------------------------
+	log "configuring ufw (logging=full, default deny incoming)"
+	# Rule ORDER carries the labelling, and ufw evaluates in the order rules are added.
+	# PRESERVE_PORTS deliberately overlaps MALICIOUS_PORTS (22 and 5432 are both a service
+	# this host needs reachable and a port an attacker probes). If the preserve rules came
+	# first they would match the simulated attacker too, and those attempts would be logged
+	# as permitted — silently mislabelling part of the dataset. So the test subnet's rules
+	# are added first and are scoped to the subnet, and the host-wide preserve rules can
+	# only ever match traffic from somewhere else.
+	IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
+	for p in "${_benign[@]}"; do
+		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
+	done
 
-ip netns add "$NS"
-ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
-ip link set "$VETH_NS" netns "$NS"
-ip addr add "$HOST_IP/24" dev "$VETH_HOST"
-ip link set "$VETH_HOST" up
-ip netns exec "$NS" ip link set lo up
-for ip_addr in "${USER_IPS[@]}"; do
-	ip netns exec "$NS" ip addr add "$ip_addr/24" dev "$VETH_NS"
-done
-ip netns exec "$NS" ip link set "$VETH_NS" up
+	# Everything else from the test subnet is the attacker. An explicit deny is clearer
+	# than relying on the default policy and, unlike the default, it is unambiguously
+	# attributable to this run.
+	ufw deny from "$SUBNET" >/dev/null
 
-# ---------------------------------------------------------------------------
-# IDS
-#
-# Started here, between creating the interface and opening the window: Slips can only
-# attach to a veth that already exists, and it must be reading packets before any are
-# generated. Its ~80s of module and threat-feed loading is why this cannot be deferred
-# to just before the traffic — a window opened during startup is simply not observed.
-#
-# ufw is configured *after* this, so `logging full` is active for the window rather
-# than for the couple of minutes Slips spends starting up.
-# ---------------------------------------------------------------------------
+	IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
+	for p in "${_preserve[@]}"; do
+		ufw allow "$p/tcp" >/dev/null
+	done
+	ufw logging full >/dev/null
+	ufw --force enable >/dev/null
 
-# Named for the run only once the window has a timestamp; until then Slips writes to a
-# scratch directory, because STAMP is deliberately taken from the window start and the
-# window has not opened yet.
-if [[ $WITH_IDS -eq 1 ]]; then
-	SLIPS_OUT="$OUTDIR/ids-run"
-	rm -rf "$SLIPS_OUT"
-	log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
-	slips_start_redis || die "could not start the Slips redis"
-	slips_start "$VETH_HOST" "$SLIPS_OUT" || die "could not start Slips"
-	slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
-	log "Slips is reading $VETH_HOST"
+	# ---------------------------------------------------------------------------
+	# Verdict logging, installed directly rather than through ufw's `log` keyword.
+	#
+	# ufw hardcodes `-m limit --limit 3/min --limit-burst 10` onto every per-rule log,
+	# with no loglevel check (backend_iptables.py: `limit_args` in the rule-snippet
+	# builder). `ufw logging full` only lifts the limit from the AUDIT chains, which take
+	# their own branch. The result is that a 30s window yields ~11 verdict lines per rule —
+	# burst 10 plus 3/min for half a minute — however much traffic crosses the firewall,
+	# while the AUDIT lines beside them are complete. A dataset labelled from that is
+	# missing 95% of its verdicts.
+	#
+	# These rules live in ufw's own chain, use the same kernel LOG target and the same
+	# prefixes; the only difference is the absence of a rate limit that exists to protect
+	# syslog on a production host and has no place in a 30-second measurement. LOG does not
+	# terminate a packet's traversal, so the allow/deny rules below still decide its fate.
+	# ufw reloads its chains from user.rules on enable/disable, so these do not survive the
+	# restore in the exit trap.
+	# ---------------------------------------------------------------------------
+	iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$BENIGN_PORTS" \
+		-j LOG --log-prefix "[UFW ALLOW] " --log-level 4
+	iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$BENIGN_PORTS" \
+		-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
+	log "ufw active (verdict logging installed without ufw's 3/min cap)"
 fi
-
-# ---------------------------------------------------------------------------
-# Firewall
-# ---------------------------------------------------------------------------
-log "configuring ufw (logging=full, default deny incoming)"
-# Rule ORDER carries the labelling, and ufw evaluates in the order rules are added.
-# PRESERVE_PORTS deliberately overlaps MALICIOUS_PORTS (22 and 5432 are both a service
-# this host needs reachable and a port an attacker probes). If the preserve rules came
-# first they would match the simulated attacker too, and those attempts would be logged
-# as permitted — silently mislabelling part of the dataset. So the test subnet's rules
-# are added first and are scoped to the subnet, and the host-wide preserve rules can
-# only ever match traffic from somewhere else.
-IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
-for p in "${_benign[@]}"; do
-	ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
-done
-
-# Everything else from the test subnet is the attacker. An explicit deny is clearer
-# than relying on the default policy and, unlike the default, it is unambiguously
-# attributable to this run.
-ufw deny from "$SUBNET" >/dev/null
-
-IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
-for p in "${_preserve[@]}"; do
-	ufw allow "$p/tcp" >/dev/null
-done
-ufw logging full >/dev/null
-ufw --force enable >/dev/null
-
-# ---------------------------------------------------------------------------
-# Verdict logging, installed directly rather than through ufw's `log` keyword.
-#
-# ufw hardcodes `-m limit --limit 3/min --limit-burst 10` onto every per-rule log,
-# with no loglevel check (backend_iptables.py: `limit_args` in the rule-snippet
-# builder). `ufw logging full` only lifts the limit from the AUDIT chains, which take
-# their own branch. The result is that a 30s window yields ~11 verdict lines per rule —
-# burst 10 plus 3/min for half a minute — however much traffic crosses the firewall,
-# while the AUDIT lines beside them are complete. A dataset labelled from that is
-# missing 95% of its verdicts.
-#
-# These rules live in ufw's own chain, use the same kernel LOG target and the same
-# prefixes; the only difference is the absence of a rate limit that exists to protect
-# syslog on a production host and has no place in a 30-second measurement. LOG does not
-# terminate a packet's traversal, so the allow/deny rules below still decide its fate.
-# ufw reloads its chains from user.rules on enable/disable, so these do not survive the
-# restore in the exit trap.
-# ---------------------------------------------------------------------------
-iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$BENIGN_PORTS" \
-	-j LOG --log-prefix "[UFW ALLOW] " --log-level 4
-iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$BENIGN_PORTS" \
-	-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
-log "ufw active (verdict logging installed without ufw's 3/min cap)"
 
 # ---------------------------------------------------------------------------
 # Capture window
@@ -531,18 +554,24 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	chmod 444 "$IDS_LOG"
 	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} findings fall inside the window"
 
-	# Only now is Slips stopped, and not in order to read it: the veth it is attached
-	# to is about to be torn down with the rest of the run. This is the end of the
-	# capture session, not a step in collecting evidence.
-	slips_stop
+	# Under a lab, Slips outlives this capture and keeps writing into its session
+	# directory: stopping it or moving that directory would end the lab's IDS on the
+	# first window and break every window after it. The alerts slice above is all this
+	# capture takes; lab.sh down hands over the session tree at the end.
+	if [[ $LAB_MODE -eq 0 ]]; then
+		# One-shot only. Stopped now, and not in order to read it — the veth it is
+		# attached to is about to be torn down with the rest of the run. Teardown,
+		# not a step in collecting evidence.
+		slips_stop
 
-	# Keep Slips' full working tree per run, not just the alerts: zeek_files/conn.log
-	# is the flow record behind the findings, and an investigator asking "on what basis"
-	# needs it. Moved only after the container has let go of the bind mount.
-	if [[ -d "$SLIPS_OUT" ]]; then
-		rm -rf "$OUTDIR/ids_${STAMP}"
-		mv "$SLIPS_OUT" "$OUTDIR/ids_${STAMP}"
-		SLIPS_OUT="$OUTDIR/ids_${STAMP}"
+		# Keep Slips' full working tree, not just the alerts: zeek_files/conn.log is
+		# the flow record behind the findings, and an investigator asking "on what
+		# basis" needs it. Moved only after the container has let go of the mount.
+		if [[ -d "$SLIPS_OUT" ]]; then
+			rm -rf "$OUTDIR/ids_${STAMP}"
+			mv "$SLIPS_OUT" "$OUTDIR/ids_${STAMP}"
+			SLIPS_OUT="$OUTDIR/ids_${STAMP}"
+		fi
 	fi
 
 	# The group is the point of the exercise: one window, one attack, two independent
@@ -610,8 +639,11 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
 	if [[ $WITH_IDS -eq 1 ]]; then
 		chown "$SUDO_USER" "$IDS_LOG" "$GROUP_MANIFEST" 2>/dev/null || true
-		# Slips writes its working tree as root inside the container.
-		chown -R "$SUDO_USER" "$SLIPS_OUT" 2>/dev/null || true
+		# Slips writes its working tree as root inside the container. Under a lab that
+		# tree is still in use and is handed over by `lab.sh down` instead.
+		if [[ $LAB_MODE -eq 0 ]]; then
+			chown -R "$SUDO_USER" "$SLIPS_OUT" 2>/dev/null || true
+		fi
 	fi
 fi
 

@@ -17,6 +17,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FW_DIR="$SCRIPT_DIR/Firewall"
 FW_SCRIPT="$FW_DIR/simulate-firewall.sh"
 FW_GEN="$FW_DIR/generate_traffic.py"
+LAB_SH="$SCRIPT_DIR/lab.sh"
+LAB_STATE_FILE="$SCRIPT_DIR/.lab/state.env"
 CONFIG_FILE="${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}"
 
 # ---- scenario defaults ---------------------------------------
@@ -59,6 +61,22 @@ pause(){ printf '\n%s  press enter to continue%s' "$C_DIM" "$R"; read -r _; }
 kv()   { printf '    %s%-28s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
 
 # ---- state ---------------------------------------------------
+# down  — nothing running, the host is untouched
+# up    — infrastructure standing; captures run against it
+# stale — a session was recorded but its namespace is gone (reboot). The firewall may
+#         still be carrying the test rules, and nothing is running that would undo it.
+lab_state() {
+	[ -f "$LAB_STATE_FILE" ] || { echo down; return; }
+	local ns
+	ns=$(grep -E '^LAB_NS=' "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2)
+	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${ns:-pde-fw}"; then
+		echo up
+	else
+		echo stale
+	fi
+}
+lab_field() { grep -E "^$1=" "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2-; }
+
 ufw_enabled()  { grep -E '^ENABLED='  /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
 ufw_loglevel() { grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
 rsyslog_up()   { pgrep -x rsyslogd >/dev/null 2>&1; }
@@ -92,6 +110,13 @@ banner() {
 	rule
 	printf '%s  PDE SOURCE CONSOLE%s\n' "$C_TITLE" "$R"
 	rule
+
+	local lab; lab="$(lab_state)"
+	case "$lab" in
+		up)    printf '  %s\n' "${C_OK}● LAB UP${R}  ${C_DIM}since $(lab_field LAB_STARTED_UTC)   ufw carrying test rules   $([ "$(lab_field LAB_WITH_IDS)" = "1" ] && echo "slips running" || echo "no ids")${R}" ;;
+		stale) printf '  %s\n' "${C_ERR}● LAB STALE${R}  ${C_DIM}session did not survive; your firewall may still be modified — option 1 to recover${R}" ;;
+		*)     printf '  %s\n' "${C_DIM}○ lab down   the host is untouched${R}" ;;
+	esac
 
 	local fw rs en
 	en="$(ufw_enabled)"
@@ -551,51 +576,245 @@ doctor() {
 	pause
 }
 
+# ---- lab lifecycle -------------------------------------------
+sudo_run() {
+	if [ "$(id -u)" -ne 0 ]; then sudo "$@"; else "$@"; fi
+}
+
+# Set when this console started the sources, so it only tears down what it owns. A lab
+# someone else left running is reported and left alone.
+LAB_OWNED=0
+
+lab_bring_up() {
+	local args=(up --users "$USERS")
+	[ "$WITH_IDS" = "1" ] && args+=(--with-ids)
+	if sudo_run "$LAB_SH" "${args[@]}"; then
+		LAB_OWNED=1
+		return 0
+	fi
+	return 1
+}
+
+lab_take_down() {
+	sudo_run "$LAB_SH" down && LAB_OWNED=0
+}
+
+# Runs on quit and on Ctrl-C. Sources are started for you, so they are stopped for you.
+on_exit() {
+	if [ "$LAB_OWNED" = "1" ] && [ "$(lab_state)" = "up" ]; then
+		printf '\n'
+		dim "stopping sources and restoring the firewall..."
+		sudo_run "$LAB_SH" down >/dev/null 2>&1 || \
+			err "could not stop the sources — run: sudo $LAB_SH down"
+	fi
+}
+
+sources_menu() {
+	local go
+	while true; do
+		banner
+		head_ "PDE sources"
+		dim "  The sources the Evidence Repository collects from. They run continuously;"
+		dim "  a capture is a window read against them."
+		echo
+		local state; state="$(lab_state)"
+		local running_ids; running_ids="$(lab_field LAB_WITH_IDS)"
+
+		printf '  %s%-12s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
+		if [ "$state" = "up" ]; then
+			printf '  %-12s %-12s %s%s%s\n' "firewall" "ufw" "$C_OK" "running" "$R"
+			if [ "$running_ids" = "1" ]; then
+				printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_OK" "running" "$R"
+			else
+				printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "disabled" "$R"
+			fi
+		else
+			printf '  %-12s %-12s %s%s%s\n' "firewall" "ufw" "$C_DIM" "stopped" "$R"
+			printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "stopped" "$R"
+		fi
+		printf '  %-12s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
+
+		echo
+		local want_ids; [ "$WITH_IDS" = "1" ] && want_ids=enabled || want_ids=disabled
+		printf '  %s1%s  IDS source  %s%-9s%s %sfirewall is the base source and cannot be turned off%s\n' \
+			"$C_NUM" "$R" "$C_KEY" "$want_ids" "$R" "$C_DIM" "$R"
+
+		# Config and reality can disagree, because Slips is attached at start-up.
+		if [ "$state" = "up" ] && [ "$running_ids" != "$WITH_IDS" ]; then
+			echo
+			warn "IDS setting changed — restart the sources to apply it"
+		fi
+
+		echo
+		case "$state" in
+			up)    printf '  %s2%s  Restart sources\n  %s3%s  Stop sources        %s(restores your firewall)%s\n' "$C_NUM" "$R" "$C_NUM" "$R" "$C_DIM" "$R" ;;
+			stale) printf '  %s2%s  %sRecover stale session%s %s(restore your firewall)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
+			*)     printf '  %s2%s  Start sources\n' "$C_NUM" "$R" ;;
+		esac
+		echo
+		printf '  %s0%s  back\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r go
+
+		case "$go" in
+			1) if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi; persist WITH_IDS ;;
+			2)
+				case "$state" in
+					up)    echo; lab_take_down && lab_bring_up; pause ;;
+					stale) echo; sudo_run "$LAB_SH" down; pause ;;
+					*)     echo; lab_bring_up; pause ;;
+				esac ;;
+			3) [ "$state" = "up" ] && { echo; lab_take_down; pause; } ;;
+			0|q) return ;;
+			*) ;;
+		esac
+	done
+}
+
+help_menu() {
+	while true; do
+		banner
+		head_ "Help and diagnostics"
+		echo
+		printf '  %s1%s  How firewall evidence works %s(log anatomy, why it is real)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s2%s  Environment check           %s(can this machine capture at all)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		echo
+		printf '  %s0%s  back\n' "$C_NUM" "$R"
+		echo
+		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r a
+		case "$a" in
+			1) explain ;;
+			2) doctor ;;
+			0|q) return ;;
+			*) ;;
+		esac
+	done
+}
+
 # ---- main menu -----------------------------------------------
 main_menu() {
 	while true; do
 		banner
-		printf '  %s1%s  Capture a window %s(runs the simulator; prompts for sudo)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		local labs; labs="$(lab_state)"
+		case "$labs" in
+			up)    printf '  %s1%s  PDE sources              %s(running — view, enable, disable)%s\n' "$C_NUM" "$R" "$C_DIM" "$R" ;;
+			stale) printf '  %s1%s  PDE sources              %s%s%s\n' "$C_NUM" "$R" "$C_ERR" "(stale session — needs recovery)" "$R" ;;
+			*)     printf '  %s1%s  PDE sources              %s(stopped — view, enable, start)%s\n' "$C_NUM" "$R" "$C_DIM" "$R" ;;
+		esac
+		if [ "$labs" = "up" ]; then
+			printf '  %s2%s  Capture a window         %s(against the running lab)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s2%s  Capture a window         %s(one-shot: builds and restores its own)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 		echo
-		printf '  %s2%s  Choose attack profile    %s%s%s\n' "$C_NUM" "$R" "$C_KEY" "$ATTACK_PROFILE" "$R"
-		printf '  %s3%s  Configure the scenario   %s%s users, %ss, %s%% malicious%s\n' "$C_NUM" "$R" "$C_DIM" "$USERS" "$DURATION" "$MALICIOUS_PCT" "$R"
+		printf '  %s3%s  Choose attack profile    %s%s%s\n' "$C_NUM" "$R" "$C_KEY" "$ATTACK_PROFILE" "$R"
+		printf '  %s4%s  Configure the scenario   %s%s users, %ss, %s%% malicious%s\n' "$C_NUM" "$R" "$C_DIM" "$USERS" "$DURATION" "$MALICIOUS_PCT" "$R"
 		echo
-		printf '  %s4%s  Preview firewall changes %s(dry run, nothing applied)%s\n'   "$C_NUM" "$R" "$C_DIM" "$R"
-		printf '  %s5%s  Preview the event plan   %s(port histogram, no packets)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s5%s  Preview firewall changes %s(dry run, nothing applied)%s\n'   "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s6%s  Preview the event plan   %s(port histogram, no packets)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		echo
-		printf '  %s6%s  Read evidence back\n' "$C_NUM" "$R"
-		printf '  %s7%s  Verify integrity         %s(sha256 against the manifest)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %s7%s  Read evidence back\n' "$C_NUM" "$R"
+		printf '  %s8%s  Verify integrity         %s(sha256 against the manifest)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		echo
-		printf '  %s8%s  How firewall evidence works %s(log anatomy, why it is real)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
-		printf '  %s9%s  Environment check\n' "$C_NUM" "$R"
+		printf '  %s9%s  Help and diagnostics\n' "$C_NUM" "$R"
 		echo
 		printf '  %s0%s  Quit\n' "$C_NUM" "$R"
 		echo
 		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r choice || return
 
 		case "$choice" in
-			1) run_capture ;;
-			2) profile_menu ;;
-			3) configure_menu ;;
-			4) preview_firewall ;;
-			5) preview_plan ;;
-			6) view_evidence ;;
-			7) verify_evidence ;;
-			8) explain ;;
-			9) doctor ;;
+			1) sources_menu ;;
+			2) run_capture ;;
+			3) profile_menu ;;
+			4) configure_menu ;;
+			5) preview_firewall ;;
+			6) preview_plan ;;
+			7) view_evidence ;;
+			8) verify_evidence ;;
+			9) help_menu ;;
 			0|q|Q) clear; return ;;
 			*) ;;
 		esac
 	done
 }
 
+# ---- arguments -----------------------------------------------
+AUTO_LAB=1
+while [ $# -gt 0 ]; do
+	case "$1" in
+		# For reading evidence back without touching the firewall or asking for sudo.
+		--no-lab) AUTO_LAB=0; shift ;;
+		-h|--help)
+			echo "usage: pde [--no-lab]"
+			echo "  --no-lab   do not start the PDE sources on launch (read-only use)"
+			exit 0 ;;
+		*) err "unknown option '$1'"; exit 2 ;;
+	esac
+done
+
 # ---- preflight -----------------------------------------------
 if [ ! -x "$FW_SCRIPT" ]; then
 	err "simulator not found or not executable: $FW_SCRIPT"
-	dim "  chmod +x \"$FW_SCRIPT\" \"$FW_GEN\""
+	dim "  chmod +x \"$FW_SCRIPT\" \"$FW_GEN\" \"$LAB_SH\""
 	exit 1
 fi
+[ -x "$LAB_SH" ] || { err "lab.sh not found or not executable: $LAB_SH"; exit 1; }
 command -v python3 >/dev/null 2>&1 || { err "python3 not found on PATH"; exit 1; }
 command -v ufw     >/dev/null 2>&1 || warn "ufw not found — capturing will fail, everything else works"
+
+# Quitting, Ctrl-C, or the shell going away all land on the same teardown. INT is
+# re-raised as an exit so the EXIT handler runs exactly once either way.
+trap on_exit EXIT
+trap 'exit 130' INT TERM
+
+# ---- start the sources ---------------------------------------
+case "$(lab_state)" in
+	stale)
+		clear
+		err "A previous session did not shut down cleanly."
+		dim "  Its namespace is gone, but ufw.service is enabled — your firewall has most"
+		dim "  likely come back up still carrying the test rules from that session."
+		echo
+		printf '  %srestore the firewall now? [Y/n]>%s ' "$C_TITLE" "$R"; read -r _r
+		case "$_r" in
+			n|N) dim "  left as is — option 1 can recover it later" ;;
+			*)   sudo_run "$LAB_SH" down || err "recovery failed; run: sudo $LAB_SH down" ;;
+		esac
+		echo
+		;;
+	up)
+		# Someone else's session. Report it and leave it alone — tearing down something
+		# this console did not start would restore a firewall out from under them.
+		clear
+		warn "PDE sources are already running from an earlier session."
+		dim "  Leaving them as they are; this console will not stop them on exit."
+		sleep 2
+		;;
+esac
+
+if [ "$AUTO_LAB" = "1" ] && [ "$(lab_state)" = "down" ]; then
+	clear
+	rule
+	printf '%s  PDE SOURCE CONSOLE%s\n' "$C_TITLE" "$R"
+	rule
+	head_ "Starting the PDE sources"
+	dim "  The sources run for as long as this console does, and are stopped when you"
+	dim "  quit. Your firewall is restored at that point."
+	echo
+	kv "firewall" "ufw — topology, rules and full logging"
+	if [ "$WITH_IDS" = "1" ]; then
+		kv "ids" "Slips on the veth (~50s of startup)"
+	else
+		kv "ids" "disabled — option 1 enables it"
+	fi
+	echo
+	if ! lab_bring_up; then
+		echo
+		err "could not start the sources."
+		dim "  The console still runs; captured evidence can be read back, and option 1"
+		dim "  will retry. Use --no-lab to skip this on launch."
+		pause
+	fi
+fi
 
 main_menu

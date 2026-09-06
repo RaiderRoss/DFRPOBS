@@ -2,7 +2,12 @@
 # chmod 444 — they are reproducible from a seed, so they do not belong in the repo.
 output/
 
-# Local defaults set via `pde config set`.
+# Live session state: which firewall changes are outstanding, plus the backup of your
+# ufw rules used to undo them. Machine-specific and security-sensitive; committing it
+# would publish one machine's firewall configuration and could restore it onto another.
+.lab/
+
+# Local defaults set from the console.
 pde.conf
 
 __pycache__/
