@@ -1,4 +1,4 @@
-export type PageName = 'Overview' | 'Trigger events' | 'Work groups'
+export type PageName = 'Overview' | 'Trigger events' | 'Work groups' | 'Evidence sources' | 'Evidence items'
 
 export type TriggerEvent = {
   id: string
@@ -17,12 +17,43 @@ export type WorkGroup = {
   createdAt: string
 }
 
-export type TriggerEventPage = {
-  content: TriggerEvent[]
+export type EvidenceSource = {
+  id: string
+  sourceKey: string
+  displayName: string
+  workGroupId: string
+  sourceType: string
+  status: string
+  expectedIntervalSeconds: number | null
+  lastEvidenceAt: string | null
+  registeredAt: string
+}
+
+export type EvidenceItem = {
+  id: string
+  workGroupId: string
+  evidenceSourceId: string | null
+  // Null together, and only for manually preserved items: the backend allows an artifact
+  // with no coverage window rather than inventing one from createdAt. The listing has to
+  // render those rows, so the nulls are in the type.
+  eventStart: string | null
+  eventEnd: string | null
+  sourceArtifactId: string
+  currentHash: string
+  status: string
+  createdAt: string
+}
+
+/** Spring's PagedModel wire shape — `content` plus a page descriptor. */
+export type Page<T> = {
+  content: T[]
   page?: { size: number; number: number; totalElements: number; totalPages: number }
 }
 
-export const navTabs: PageName[] = ['Overview', 'Trigger events', 'Work groups']
+export type TriggerEventPage = Page<TriggerEvent>
+export type EvidenceItemPage = Page<EvidenceItem>
+
+export const navTabs: PageName[] = ['Overview', 'Trigger events', 'Work groups', 'Evidence sources', 'Evidence items']
 
 const baseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
 
@@ -46,7 +77,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Accept', 'application/json')
   if (credentials) headers.set('Authorization', `Basic ${credentials}`)
-  if (options.body) headers.set('Content-Type', 'application/json')
+  if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
 
   const response = await fetch(`${baseUrl}${path}`, { ...options, headers })
   if (!response.ok) {
@@ -73,4 +104,35 @@ export const repositoryApi = {
     method: 'POST',
     body: JSON.stringify({ name, classificationCode }),
   }),
+  listEvidenceSources: (sourceKey = '') => request<EvidenceSource[]>(
+    `/api/evidence-sources${sourceKey ? `?${new URLSearchParams({ sourceKey })}` : ''}`,
+  ),
+  getEvidenceSource: (id: string) => request<EvidenceSource>(`/api/evidence-sources/${encodeURIComponent(id)}`),
+  createEvidenceSource: (source: Omit<EvidenceSource, 'id' | 'status' | 'lastEvidenceAt' | 'registeredAt'>) =>
+    request<EvidenceSource>('/api/evidence-sources', {
+      method: 'POST',
+      body: JSON.stringify(source),
+    }),
+  // Paged, not a bare array: evidence_item grows at the rate the whole estate produces, so
+  // the API has no unpaged listing to call. Sorted newest-first on createdAt — the timestamp
+  // the repository stamps — rather than the source-asserted eventStart.
+  listEvidenceItems: (workGroupId = '', includeDeleted = false, page = 0, size = 50) => {
+    const params = new URLSearchParams({ page: String(page), size: String(size), sort: 'createdAt,desc' })
+    if (workGroupId) params.set('workGroupId', workGroupId)
+    if (includeDeleted) params.set('includeDeleted', 'true')
+    return request<EvidenceItemPage>(`/api/evidence-items?${params}`)
+  },
+  getEvidenceItem: (id: string) => request<EvidenceItem>(`/api/evidence-items/${encodeURIComponent(id)}`),
+  preserveEvidenceItem: (metadata: {
+    sourceKey: string
+    sourceArtifactId: string
+    eventStart: string
+    eventEnd: string
+    sourceSha256: string
+  }, file: File) => {
+    const formData = new FormData()
+    formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }))
+    formData.append('file', file)
+    return request<EvidenceItem>('/api/evidence-items', { method: 'POST', body: formData })
+  },
 }

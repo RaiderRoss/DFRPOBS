@@ -6,6 +6,12 @@ import java.util.UUID;
 
 import jakarta.validation.Valid;
 
+import org.springdoc.core.annotations.ParameterObject;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.web.PageableDefault;
+import org.springframework.data.web.PagedModel;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -13,6 +19,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
@@ -69,6 +76,55 @@ public class EvidenceItemResource {
 
 	public EvidenceItemResource(EvidenceItemService service) {
 		this.service = service;
+	}
+
+	/**
+	 * Lists preserved artifacts, newest first, optionally narrowed to one classification.
+	 *
+	 * <p>Wrapped in {@link PagedModel} rather than returning the {@code Page} directly, for
+	 * the reason {@code TriggerEventResource.list} gives: serialising {@code Page} publishes
+	 * Spring Data's internal structure as a wire contract and draws a startup warning saying
+	 * so.
+	 *
+	 * <p><strong>Sorted on {@code createdAt}, not {@code eventStart}.</strong> The same rule
+	 * that makes trigger events order by {@code receivedAt}: {@code createdAt} is stamped by
+	 * the database when this system preserved the artifact, while {@code eventStart} is the
+	 * coverage window the <em>source</em> asserted. Ordering a list by a sender-controlled
+	 * timestamp lets a collector with a wrong clock — or a deliberately wrong one — decide
+	 * where its artifacts appear in an investigator's view.
+	 */
+	@Operation(
+			summary = "List preserved artifacts",
+			description = """
+					Newest first by createdAt — the timestamp this system stamps on preservation, \
+					not the eventStart the source asserts, so a collector with a wrong clock cannot \
+					decide where its artifacts appear in an investigator's list. Soft-deleted items \
+					are omitted unless includeDeleted is set.
+					""")
+	@ApiResponse(responseCode = "200", description = "A page of evidence items, newest first")
+	@ApiResponse(responseCode = "401", description = "Missing or invalid credentials", content = @Content)
+	@GetMapping
+	public ResponseEntity<PagedModel<EvidenceItemDto>> list(
+			@Parameter(description = "Return only artifacts preserved under this classification. Omit for all.",
+					example = "8c1d4f60-5a72-4a3b-9f28-0e6b1d2c4a55")
+			@RequestParam(name = "workGroupId", required = false) UUID workGroupId,
+
+			@Parameter(description = """
+					Include soft-deleted artifacts. Off by default, because showing them beside live \
+					evidence misrepresents what is currently preserved; set it when the question is \
+					what was destroyed rather than what is held.
+					""")
+			@RequestParam(name = "includeDeleted", defaultValue = "false") boolean includeDeleted,
+
+			// Without @ParameterObject springdoc flattens Pageable's bean properties into the
+			// docs (offset, paged, unpaged, sort.sorted...) instead of the three query params
+			// a caller actually sends.
+			@ParameterObject
+			@PageableDefault(size = 50, sort = "createdAt", direction = Sort.Direction.DESC)
+			Pageable pageable) {
+
+		Page<EvidenceItemDto> page = service.findAll(workGroupId, includeDeleted, pageable);
+		return ResponseEntity.ok(new PagedModel<>(page));
 	}
 
 	@Operation(summary = "Fetch one preserved artifact by id",
