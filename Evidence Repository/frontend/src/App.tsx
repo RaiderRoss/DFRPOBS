@@ -7,6 +7,8 @@ export const pageRoutes: Record<PageName, string> = {
     Overview: '/',
     'Trigger events': '/trigger-events',
     'Work groups': '/work-groups',
+    'Evidence sources': '/evidence-sources',
+    'Evidence items': '/evidence-items',
 }
 
 function Dashboard() {
