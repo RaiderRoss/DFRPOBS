@@ -108,7 +108,7 @@ lab_up() {
 	LAB_VETH_HOST="$VETH_HOST"
 	LAB_SUBNET="$SUBNET"
 	LAB_HOST_IP="$HOST_IP"
-	LAB_SLIPS_OUT="$PDE_ROOT/output/ids-session-$lab_stamp"
+	LAB_SLIPS_OUT="$PDE_ROOT/output/sessions/ids-$lab_stamp"
 	EOF
 	log "state recorded in $LAB_STATE (ufw was ENABLED=$orig_enabled LOGLEVEL=$orig_loglevel)"
 
@@ -130,7 +130,7 @@ lab_up() {
 
 	# --- IDS, before the firewall so `logging full` is not on during its startup ---
 	if [[ $WITH_IDS -eq 1 ]]; then
-		local slips_out="$PDE_ROOT/output/ids-session-$lab_stamp"
+		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
 		mkdir -p "$slips_out"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"

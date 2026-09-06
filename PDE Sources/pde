@@ -91,27 +91,32 @@ ufw_enabled()  { grep -E '^ENABLED='  /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f
 ufw_loglevel() { grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
 rsyslog_up()   { pgrep -x rsyslogd >/dev/null 2>&1; }
 
-# `grep -c` prints 0 *and* exits 1 with no matches, so `grep -c ... || echo 0`
-# emits "0\n0" and shifts every later printf argument. Count into a variable.
+# A captured window is a directory named for its timestamp, holding that window's
+# evidence. Finding one means finding its manifest, one level down.
+#
+# `grep -c` prints 0 *and* exits 1 with no matches, so `grep -c ... || echo 0` emits
+# "0\n0" and shifts every later printf argument. Count into a variable.
+run_manifests() {
+	[ -d "$OUTDIR" ] || return 0
+	find "$OUTDIR" -mindepth 2 -maxdepth 2 -name 'firewall.manifest.json' 2>/dev/null | sort
+}
+
 run_count() {
-	local n=0
-	[ -d "$OUTDIR" ] && n=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | wc -l)
+	local n; n=$(run_manifests | grep -c . 2>/dev/null)
 	printf '%s' "${n:-0}"
 }
 
 latest_run() {
-	[ -d "$OUTDIR" ] || return 1
-	local f
-	f=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort | tail -1)
+	local f; f=$(run_manifests | tail -1)
 	[ -n "$f" ] || return 1
-	basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
+	basename "$(dirname "$f")"
 }
 
 # Reads one value out of a run's manifest. The expression is evaluated against
 # `m`, the parsed manifest.
 manifest_field() {
 	python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' \
-		"$OUTDIR/firewall_$1.manifest.json" "$2" 2>/dev/null
+		"$OUTDIR/$1/firewall.manifest.json" "$2" 2>/dev/null
 }
 
 # ---- status banner -------------------------------------------
@@ -486,18 +491,18 @@ require_run() {
 # with more than one capture.
 pick_run() {
 	local runs count
-	runs=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort)
+	runs=$(run_manifests)
 	count=$(printf '%s\n' "$runs" | grep -c . 2>/dev/null)
 	if [ "${count:-0}" -le 1 ]; then latest_run; return; fi
 
 	{
 		banner
-		head_ "Captured runs"
+		head_ "Captured windows"
 		echo
 		local i=1 f id detail
 		while IFS= read -r f; do
 			[ -n "$f" ] || continue
-			id=$(basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//')
+			id=$(basename "$(dirname "$f")")
 			detail=$(manifest_field "$id" 'm["configuration"]["attack_profile"]+"   "+str(m["output"]["lines"])+" lines, "+str(m["output"]["ufw_block_lines"])+" BLOCK"')
 			printf '  %s%s%s  %-16s %s%s%s\n' "$C_NUM" "$i" "$R" "$id" "$C_DIM" "$detail" "$R"
 			i=$((i + 1))
@@ -522,8 +527,7 @@ pick_run() {
 		latest_run; return
 	fi
 
-	basename "$(printf '%s\n' "$runs" | sed -n "${sel}p")" \
-		| sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
+	basename "$(dirname "$(printf '%s\n' "$runs" | sed -n "${sel}p")")"
 }
 
 view_evidence() {
@@ -548,11 +552,11 @@ kv("  UFW ALLOW", o["ufw_allow_lines"])
 # At logging full every packet also gets an AUDIT line, so lines will exceed the
 # event count. Shown rather than hidden, otherwise the totals look wrong.
 kv("  UFW AUDIT", o.get("ufw_audit_lines", "-"))
-kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/firewall_${run}.manifest.json"
+kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/$run/firewall.manifest.json"
 
 	# When the window was captured with --with-ids there is a second, independent
 	# account of the same packets. Showing them together is the whole point.
-	local group="$OUTDIR/window_${run}.group.json"
+	local group="$OUTDIR/$run/group.json"
 	if [ -f "$group" ]; then
 		head_ "IDS — same window, independent source"
 		python3 -c 'import json,sys
@@ -568,7 +572,7 @@ if ids:
         ("critical", "high", "medium", "low", "info")))
     kv("sha256", (ids["sha256"] or "-")[:40] + ("..." if ids["sha256"] else ""))' "$group"
 
-		local ids_log="$OUTDIR/ids_${run}.alerts.log"
+		local ids_log="$OUTDIR/$run/ids.alerts.log"
 		if [ -s "$ids_log" ]; then
 			echo
 			python3 "$SCRIPT_DIR/../Anomaly Detection/Scripts/slips-format.py" --brief \
@@ -586,10 +590,10 @@ if ids:
 		-e "s/\[UFW AUDIT\]/${C_DIM}[UFW AUDIT]${R}/g" \
 		-e "s/\(SRC=[0-9.]*\)/${C_TITLE}\1${R}/g" \
 		-e "s/\(DPT=[0-9]*\)/${C_KEY}\1${R}/g" \
-		"$OUTDIR/firewall_${run}.log" 2>/dev/null | head -12 | sed 's/^/    /'
+		"$OUTDIR/$run/firewall.log" 2>/dev/null | head -12 | sed 's/^/    /'
 	echo
-	dim "  full log:  $OUTDIR/firewall_${run}.log"
-	dim "  labels:    $OUTDIR/firewall_${run}.groundtruth.json"
+	dim "  window:  $OUTDIR/$run/"
+	dim "  files:   firewall.log, firewall.manifest.json, firewall.groundtruth.json"
 	pause
 }
 
@@ -604,7 +608,7 @@ verify_evidence() {
 	echo
 	local recorded actual
 	recorded="$(manifest_field "$run" 'm["output"]["sha256"]')"
-	actual="$(sha256sum "$OUTDIR/firewall_${run}.log" 2>/dev/null | cut -d' ' -f1)"
+	actual="$(sha256sum "$OUTDIR/$run/firewall.log" 2>/dev/null | cut -d' ' -f1)"
 	kv "recorded"   "${recorded:-missing}"
 	kv "recomputed" "${actual:-missing}"
 	echo

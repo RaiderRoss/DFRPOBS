@@ -77,11 +77,16 @@ detections — need several host-side addresses on the veth.
 
 ## Output
 
+Inside the captured window's own directory, `output/<ts>/`:
+
 | File | |
 |---|---|
-| `ids_<ts>.alerts.log` | evidence sliced to the window, `chmod 444` |
-| `ids_<ts>/` | Slips' full working tree, including `zeek_files/conn.log` |
-| `window_<ts>.group.json` | both sources, the shared window, and both digests |
+| `ids.alerts.log` | evidence sliced to the window, `chmod 444` |
+| `group.json` | both sources, the shared window, and both digests |
+| `ids/` | Slips' full working tree — one-shot captures only |
+
+Under a lab, Slips spans many windows, so its working tree lives once per session at
+`output/sessions/ids-<lab-ts>/` rather than being copied into each window.
 
 `conn.log` is kept deliberately: it is the flow record the findings were derived from,
 and "on what basis" is a question an investigation will ask.

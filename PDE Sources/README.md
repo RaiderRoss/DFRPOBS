@@ -9,9 +9,10 @@ Simulators for the three Potential Digital Evidence sources in the compliance sc
 | IDS/IPS | Slips | implemented — correlated with the firewall over one window |
 | Authentication | Keycloak | not built yet |
 
-A capture takes one time window. With IDS correlation on, the firewall and Slips observe
-**the same packets** over that window and produce independent evidence, tied together by
-`window_<ts>.group.json` — the record an `EvidenceGroup` row would be built from.
+A capture takes one time window, and lands in a directory of its own named for that
+window. With IDS correlation on, the firewall and Slips observe **the same packets** over
+it and produce independent evidence, tied together by that directory's `group.json` — the
+record an `EvidenceGroup` row would be built from.
 
 ## Launch
 
@@ -132,16 +133,24 @@ ordering constraints and why `MALICIOUS_PORTS` is deliberately wide.
 
 ## Output
 
-Per captured window, in `output/`:
+One directory per captured window, named for its timestamp. The window is the unit of
+evidence — an `EvidenceGroup` is exactly "these files, this window" — so the filesystem
+says the same thing the group manifest does:
 
-| File | |
-|---|---|
-| `firewall_<ts>.log` | the ufw lines, `chmod 444` — **this is the evidence** |
-| `firewall_<ts>.manifest.json` | provenance, window bounds, counts, **sha256** |
-| `firewall_<ts>.groundtruth.json` | every event with its label, known before sending |
-| `ids_<ts>.alerts.log` | Slips evidence for the same window (IDS correlation on) |
-| `ids_<ts>/` | Slips' working tree, including `zeek_files/conn.log` |
-| `window_<ts>.group.json` | both sources, shared window bounds, both digests |
+```
+output/
+  20260906204848/                  one window
+    firewall.log                   the ufw lines, chmod 444 - this is the evidence
+    firewall.manifest.json         provenance, window bounds, counts, sha256
+    firewall.groundtruth.json      every event with its label, known before sending
+    ids.alerts.log                 IDS evidence for the same window
+    group.json                     both sources, shared bounds, both digests
+    ids/                           Slips' working tree (one-shot captures only)
+  sessions/
+    ids-20260906194723/            Slips' tree for a lab session, spanning its windows
+```
+
+Names inside carry no timestamp: the directory already does.
 
 The sha256 is computed before anything else touches the file, per the SecureRS ingestion
 rule — it is what the `EvidenceItem` should carry. Option **8** recomputes it.

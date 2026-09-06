@@ -319,7 +319,9 @@ else
 	# scratch directory, because STAMP is deliberately taken from the window start and the
 	# window has not opened yet.
 	if [[ $WITH_IDS -eq 1 ]]; then
-		SLIPS_OUT="$OUTDIR/ids-run"
+		# Dotted so the scratch directory does not sit among the window directories.
+		# It is renamed into the window's own directory once the window has a stamp.
+		SLIPS_OUT="$OUTDIR/.ids-run"
 		rm -rf "$SLIPS_OUT"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
@@ -402,10 +404,14 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
 fi
 
-mkdir -p "$OUTDIR"
-GT_JSON="$OUTDIR/firewall_${STAMP}.groundtruth.json"
-OUT_LOG="$OUTDIR/firewall_${STAMP}.log"
-MANIFEST="$OUTDIR/firewall_${STAMP}.manifest.json"
+# One directory per captured window. The window is the unit of evidence — an
+# EvidenceGroup is exactly "these files, this window" — so the filesystem says the same
+# thing the group manifest does. Names inside need no timestamp; the directory carries it.
+RUN_DIR="$OUTDIR/$STAMP"
+mkdir -p "$RUN_DIR"
+GT_JSON="$RUN_DIR/firewall.groundtruth.json"
+OUT_LOG="$RUN_DIR/firewall.log"
+MANIFEST="$RUN_DIR/firewall.manifest.json"
 
 log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PCT}% malicious, profile=${ATTACK_PROFILE}"
 # $LAB_NS, not $NS: under a lab the namespace is whichever one that session recorded,
@@ -510,8 +516,8 @@ manifest = {
         "malicious_ports": [int(p) for p in "${MALICIOUS_PORTS}".split(",")],
     },
     "output": {
-        "log_file": "firewall_${STAMP}.log",
-        "ground_truth_file": "firewall_${STAMP}.groundtruth.json",
+        "log_file": "firewall.log",
+        "ground_truth_file": "firewall.groundtruth.json",
         "lines": ${LOG_LINES},
         "bytes": ${BYTES},
         "ufw_block_lines": ${BLOCKED},
@@ -546,8 +552,8 @@ PY
 # ---------------------------------------------------------------------------
 # IDS evidence for the same window
 # ---------------------------------------------------------------------------
-IDS_LOG="$OUTDIR/ids_${STAMP}.alerts.log"
-GROUP_MANIFEST="$OUTDIR/window_${STAMP}.group.json"
+IDS_LOG="$RUN_DIR/ids.alerts.log"
+GROUP_MANIFEST="$RUN_DIR/group.json"
 IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"
 
 if [[ $WITH_IDS -eq 1 ]]; then
@@ -597,9 +603,9 @@ if [[ $WITH_IDS -eq 1 ]]; then
 		# the flow record behind the findings, and an investigator asking "on what
 		# basis" needs it. Moved only after the container has let go of the mount.
 		if [[ -d "$SLIPS_OUT" ]]; then
-			rm -rf "$OUTDIR/ids_${STAMP}"
-			mv "$SLIPS_OUT" "$OUTDIR/ids_${STAMP}"
-			SLIPS_OUT="$OUTDIR/ids_${STAMP}"
+			rm -rf "$RUN_DIR/ids"
+			mv "$SLIPS_OUT" "$RUN_DIR/ids"
+			SLIPS_OUT="$RUN_DIR/ids"
 		fi
 	fi
 
@@ -627,7 +633,7 @@ group = {
         {
             "pde_source": "firewall",
             "product": "ufw",
-            "file": "firewall_${STAMP}.log",
+            "file": "firewall.log",
             "sha256": "${SHA256}",
             "lines": ${LOG_LINES},
             "ufw_block_lines": ${BLOCKED},
@@ -637,7 +643,7 @@ group = {
         {
             "pde_source": "ids",
             "product": "slips",
-            "file": "ids_${STAMP}.alerts.log",
+            "file": "ids.alerts.log",
             "sha256": "${IDS_SHA}",
             "evidence_lines": ${IDS_KEPT},
             "evidence_lines_seen_total": ${IDS_TOTAL},
@@ -678,6 +684,11 @@ fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
 log "sha256 $SHA256"
-log "  log      $OUT_LOG"
-log "  manifest $MANIFEST"
-log "  truth    $GT_JSON"
+log "window directory: $RUN_DIR"
+log "  firewall.log              the evidence"
+log "  firewall.manifest.json    provenance and digest"
+log "  firewall.groundtruth.json labels, known before sending"
+if [[ $WITH_IDS -eq 1 ]]; then
+	log "  ids.alerts.log            IDS evidence for the same window"
+	log "  group.json                both sources, one window"
+fi
