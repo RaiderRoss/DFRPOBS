@@ -1,12 +1,19 @@
 package za.co.dfraas.config;
 
+import java.util.List;
+
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
 /**
  * Entry point for the security model described in the README.
@@ -31,6 +38,13 @@ public class SecurityConfiguration {
 	@Bean
 	public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
 		return http
+				// Picks up the CorsConfigurationSource bean below. This installs a CorsFilter
+				// ahead of the authentication filters, which matters: a preflight OPTIONS
+				// carries no Authorization header, so if it reached anyRequest().authenticated()
+				// it would be answered with a 401 and the browser would block the real request.
+				// CorsFilter short-circuits preflights itself, so no OPTIONS permitAll is needed
+				// (and adding one would be worse — it would let OPTIONS through to controllers).
+				.cors(Customizer.withDefaults())
 				// Safe to disable: the API is token/basic authenticated and stateless, so
 				// there is no ambient session cookie for a CSRF attack to ride on.
 				.csrf(csrf -> csrf.disable())
@@ -38,6 +52,18 @@ public class SecurityConfiguration {
 						session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
 				.authorizeHttpRequests(auth -> auth
 						.requestMatchers("/actuator/health/**").permitAll()
+						// Swagger UI and the spec it fetches. Both have to be open together:
+						// the page itself loads over a plain GET with no Authorization header,
+						// so leaving /v3/api-docs authenticated renders an empty UI and a 401
+						// in the console rather than a login prompt. Dev affordance only —
+						// see SPRINGDOC in application.properties for switching it off, and
+						// close these paths before this service is exposed outside localhost.
+						.requestMatchers(
+								"/swagger-ui.html",
+								"/swagger-ui/**",
+								"/v3/api-docs",
+								"/v3/api-docs/**",
+								"/v3/api-docs.yaml").permitAll()
 						// Placeholder for the step-up rule. Authentication alone is not
 						// enough to download evidence — this matcher must additionally
 						// require a verified OTP once 2FA is implemented.
@@ -45,5 +71,39 @@ public class SecurityConfiguration {
 						.anyRequest().authenticated())
 				.httpBasic(basic -> {})
 				.build();
+	}
+
+	/**
+	 * Browser access for the frontend, bound from {@code dfraas.security.cors.allowed-origins}.
+	 *
+	 * <p>Kept here rather than in a {@code @ConfigurationProperties} record because it is a
+	 * single list that only the filter chain above consumes.
+	 *
+	 * <p>Origins are an explicit allowlist — never a wildcard. CORS is what stops a page on
+	 * some other origin from reading this API's responses in a victim's browser, so this list
+	 * must be narrowed for each deployment, not widened. The defaults are the Vite dev server
+	 * and {@code vite preview}; see CORS_ALLOWED_ORIGINS in .env.example.
+	 */
+	@Bean
+	public CorsConfigurationSource corsConfigurationSource(
+			@Value("${dfraas.security.cors.allowed-origins}") List<String> allowedOrigins) {
+		CorsConfiguration configuration = new CorsConfiguration();
+		configuration.setAllowedOrigins(allowedOrigins);
+		configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+		// Authorization is what forces the preflight in the first place — HTTP Basic puts it on
+		// every call, and it is not a CORS-safelisted request header.
+		configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept"));
+		// Deliberately false. The frontend builds the Authorization header in JS rather than
+		// relying on a cookie or a browser-managed credential, so it does not need
+		// credentialed-mode CORS — and leaving this off keeps the response uncacheable as a
+		// credentialed one. Revisit only if session cookies replace HTTP Basic.
+		configuration.setAllowCredentials(false);
+		// Preflight results are cacheable for an hour, so the browser stops re-asking before
+		// every list/detail call.
+		configuration.setMaxAge(3600L);
+
+		UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+		source.registerCorsConfiguration("/api/**", configuration);
+		return source;
 	}
 }

@@ -1,5 +1,10 @@
 package za.co.dfraas.service;
 
+import java.util.Set;
+
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -8,32 +13,55 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.messaging.handler.annotation.Payload;
 import org.springframework.stereotype.Service;
 
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.ObjectMapper;
+import za.co.dfraas.dto.EvidenceEventMessage;
+import za.co.dfraas.dto.TriggerEventIngestRequest;
+import za.co.dfraas.dto.TriggerEventIngestResult;
+
 /**
  * Ingestion entry point: consumes SIEM/IDS trigger events from the {@code evidence-events}
  * topic and drives the preservation pipeline.
  *
- * <p><strong>Skeleton only.</strong> The two rules this class exists to enforce are both
- * still TODO, and both are load-bearing:
+ * <p><strong>The alert no longer drives preservation.</strong> Evidence streams in
+ * continuously from registered {@code EvidenceSource}s, so what an alert triggers is
+ * <em>correlation</em> — gathering the evidence already preserved whose coverage window
+ * overlaps it. This listener's job therefore ends at recording the alert; see TODO 3 for
+ * where the rest goes and why it is not inline.
  *
- * <ol>
- *   <li><em>Idempotency.</em> Kafka delivery is at-least-once, so the same trigger event
- *       will be redelivered on rebalance or retry. Ingesting twice would create duplicate
- *       EvidenceItems and pollute the custody ledger, so the first thing this method must
- *       do is check whether {@code triggerEventId} has already been persisted and return
- *       early if so. The dedupe check and the insert must share one transaction,
- *       otherwise two consumers can both pass the check.</li>
- *   <li><em>Hash before anything else.</em> Per SecureRS, the SHA-256 of the payload is
- *       computed before any other processing touches it — that hash is what every later
- *       IntegrityCheck compares against.</li>
- * </ol>
+ * <p>The two rules this class exists to enforce are in place. Idempotency lives in
+ * {@link TriggerEventService#recordIfAbsent}, which dedupes on the source's own event id
+ * inside a single transaction backed by a unique constraint; hashing happens in that same
+ * call, before the payload is written anywhere.
  *
- * <p>Payload is consumed as String until the schema decision (Avro/Protobuf + schema
- * registry) is made; swap the deserializer in application.properties at that point.
+ * <p><strong>The topic name is now wrong and should be split.</strong>
+ * {@code evidence-events} carries alerts, not evidence — a legacy of the reactive design,
+ * where the two were the same message. Streamed artifacts and SIEM alerts differ by orders
+ * of magnitude in volume, want different partition keys (source or asset, versus work
+ * group) and different retention, and a slow artifact stream must not be able to stall
+ * alert processing behind it. Two topics, and this listener keeps the alert one.
+ *
+ * <p>Payload is consumed as {@code String} until the schema decision (Avro/Protobuf +
+ * schema registry) is made; swap the deserializer in application.properties at that point,
+ * and replace {@link EvidenceEventMessage}.
  */
 @Service
 public class EvidenceEventConsumer {
 
 	private static final Logger log = LoggerFactory.getLogger(EvidenceEventConsumer.class);
+
+	private final TriggerEventService triggerEventService;
+	private final ObjectMapper objectMapper;
+	private final Validator validator;
+
+	public EvidenceEventConsumer(
+			TriggerEventService triggerEventService,
+			ObjectMapper objectMapper,
+			Validator validator) {
+		this.triggerEventService = triggerEventService;
+		this.objectMapper = objectMapper;
+		this.validator = validator;
+	}
 
 	@KafkaListener(topics = "${dfraas.kafka.evidence-events-topic}")
 	public void onEvidenceEvent(
@@ -45,9 +73,86 @@ public class EvidenceEventConsumer {
 		log.info("Received evidence event: key={} partition={} offset={} bytes={}",
 				key, partition, offset, payload.length());
 
-		// TODO 1: parse into a TriggerEvent, then return early if triggerEventId already exists.
-		// TODO 2: hash the payload (SHA-256) before any further processing.
-		// TODO 3: store the blob in MinIO, persist the EvidenceItem with its storageRef and
-		//         currentHash, and append the opening CustodyEvent — all in one transaction.
+		TriggerEventIngestRequest request = parse(payload, partition, offset);
+		if (request == null) {
+			return;
+		}
+
+		// Records the alert and computes its digest in one transaction. A duplicate
+		// delivery — normal under at-least-once — stops the pipeline here rather than
+		// producing a second EvidenceItem for one real-world event.
+		TriggerEventIngestResult result = triggerEventService.recordIfAbsent(request);
+		if (!result.created()) {
+			log.info("Duplicate delivery ignored: source={} externalEventId={} existingId={}",
+					request.sourceSystem(), request.externalEventId(), result.triggerEvent().id());
+			return;
+		}
+
+		log.info("Recorded trigger event: id={} source={} externalEventId={} sha256={}",
+				result.triggerEvent().id(), request.sourceSystem(), request.externalEventId(),
+				result.triggerEvent().payloadSha256());
+
+		// TODO 3: hand the recorded alert to correlation — resolve its window from firedAt
+		//         plus the lookback/lookahead frozen onto the row, find evidence whose
+		//         coverage window overlaps it (EvidenceItemRepository.findOverlappingCoverage),
+		//         write an EvidenceLink per match, and move correlationStatus to CORRELATED.
+		//
+		//         Deliberately not done inline here. Correlation is a query over evidence
+		//         that arrived independently of this message, so it does not belong in the
+		//         listener's transaction: a slow or over-broad scope would stall the alert
+		//         partition behind it, and evidence covering the window may not even have
+		//         been preserved yet. It is a separate pass over the work queue
+		//         (TriggerEventRepository.findByCorrelationStatusInOrderByReceivedAtAsc),
+		//         which is also what makes re-correlation for late arrivals the same code
+		//         path rather than a special case.
+	}
+
+	/**
+	 * Parses and validates a message, returning {@code null} for one that can never
+	 * succeed.
+	 *
+	 * <p><strong>Why this swallows rather than throws.</strong> With
+	 * {@code enable-auto-commit=false} and {@code ack-mode=record}, an exception out of the
+	 * listener leaves the offset uncommitted and the record is redelivered. That is exactly
+	 * what should happen for a transient fault, and exactly the wrong thing for a malformed
+	 * message: a payload that fails to parse will fail identically forever, and the retry
+	 * loop blocks every later message on that partition behind it. So a poison message is
+	 * logged and skipped, while genuine faults from {@code recordIfAbsent} are still
+	 * allowed to propagate and be retried.
+	 *
+	 * <p>Skipping is not free — a dropped alert is a gap in the readiness record, which is
+	 * precisely what this system exists to prevent. The log line is a stopgap.
+	 *
+	 * <p>TODO: route these to a dead-letter topic via {@code DefaultErrorHandler} +
+	 * {@code DeadLetterPublishingRecoverer} so a malformed alert is retained for review
+	 * rather than surviving only as a log entry.
+	 */
+	private TriggerEventIngestRequest parse(String payload, int partition, long offset) {
+		EvidenceEventMessage message;
+		try {
+			message = objectMapper.readValue(payload, EvidenceEventMessage.class);
+		} catch (JacksonException ex) {
+			log.error("Unparseable evidence event skipped: partition={} offset={} reason={}",
+					partition, offset, ex.getOriginalMessage());
+			return null;
+		}
+
+		// The raw payload, not the re-serialised message: the digest has to describe what
+		// actually arrived, and a round trip through the parser is free to change it.
+		TriggerEventIngestRequest request = new TriggerEventIngestRequest(
+				message.eventId(),
+				message.sourceSystem(),
+				message.triggerType(),
+				message.firedAt(),
+				payload);
+
+		Set<ConstraintViolation<TriggerEventIngestRequest>> violations = validator.validate(request);
+		if (!violations.isEmpty()) {
+			log.error("Invalid evidence event skipped: partition={} offset={} violations={}",
+					partition, offset,
+					violations.stream().map(v -> v.getPropertyPath() + " " + v.getMessage()).toList());
+			return null;
+		}
+		return request;
 	}
 }

@@ -18,6 +18,7 @@ FW_DIR="$SCRIPT_DIR/Firewall"
 FW_SCRIPT="$FW_DIR/simulate-firewall.sh"
 FW_GEN="$FW_DIR/generate_traffic.py"
 LAB_SH="$SCRIPT_DIR/lab.sh"
+SUBMIT_SCRIPT="$SCRIPT_DIR/submit-evidence.sh"
 CONFIG_FILE="${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}"
 
 # Topology, port lists, lab paths and lab_get all come from the one shared file — the
@@ -44,6 +45,14 @@ OUTDIR="$SCRIPT_DIR/output"
 # IDS produce independent evidence for the same packets.
 WITH_IDS=0
 IDS_DRAIN=45
+
+# ---- evidence repository -------------------------------------
+# Where a captured window goes once it is evidence. Overridable in pde.conf like
+# everything else, because the backend runs on the host in some setups and inside
+# WSL in others, and localhost does not always mean the same machine.
+DFRAAS_URL="${DFRAAS_URL:-http://localhost:8080}"
+DFRAAS_SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
+DFRAAS_AUTH="${DFRAAS_AUTH:-admin:admin}"
 
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
@@ -98,7 +107,7 @@ rsyslog_up()   { pgrep -x rsyslogd >/dev/null 2>&1; }
 # "0\n0" and shifts every later printf argument. Count into a variable.
 run_manifests() {
 	[ -d "$OUTDIR" ] || return 0
-	find "$OUTDIR" -mindepth 2 -maxdepth 2 -name 'firewall.manifest.json' 2>/dev/null | sort
+	find "$OUTDIR" -mindepth 2 -maxdepth 2 -name 'firewall_*.manifest.json' 2>/dev/null | sort
 }
 
 run_count() {
@@ -116,7 +125,7 @@ latest_run() {
 # `m`, the parsed manifest.
 manifest_field() {
 	python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' \
-		"$OUTDIR/$1/firewall.manifest.json" "$2" 2>/dev/null
+		"$OUTDIR/$1/firewall_$1.manifest.json" "$2" 2>/dev/null
 }
 
 # ---- status banner -------------------------------------------
@@ -552,11 +561,11 @@ kv("  UFW ALLOW", o["ufw_allow_lines"])
 # At logging full every packet also gets an AUDIT line, so lines will exceed the
 # event count. Shown rather than hidden, otherwise the totals look wrong.
 kv("  UFW AUDIT", o.get("ufw_audit_lines", "-"))
-kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/$run/firewall.manifest.json"
+kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/$run/firewall_${run}.manifest.json"
 
 	# When the window was captured with --with-ids there is a second, independent
 	# account of the same packets. Showing them together is the whole point.
-	local group="$OUTDIR/$run/group.json"
+	local group="$OUTDIR/$run/window_${run}.group.json"
 	if [ -f "$group" ]; then
 		head_ "IDS — same window, independent source"
 		python3 -c 'import json,sys
@@ -572,7 +581,7 @@ if ids:
         ("critical", "high", "medium", "low", "info")))
     kv("sha256", (ids["sha256"] or "-")[:40] + ("..." if ids["sha256"] else ""))' "$group"
 
-		local ids_log="$OUTDIR/$run/ids.alerts.log"
+		local ids_log="$OUTDIR/$run/ids_${run}.alerts.log"
 		if [ -s "$ids_log" ]; then
 			echo
 			python3 "$SCRIPT_DIR/../Anomaly Detection/Scripts/slips-format.py" --brief \
@@ -590,10 +599,10 @@ if ids:
 		-e "s/\[UFW AUDIT\]/${C_DIM}[UFW AUDIT]${R}/g" \
 		-e "s/\(SRC=[0-9.]*\)/${C_TITLE}\1${R}/g" \
 		-e "s/\(DPT=[0-9]*\)/${C_KEY}\1${R}/g" \
-		"$OUTDIR/$run/firewall.log" 2>/dev/null | head -12 | sed 's/^/    /'
+		"$OUTDIR/$run/firewall_${run}.log" 2>/dev/null | head -12 | sed 's/^/    /'
 	echo
 	dim "  window:  $OUTDIR/$run/"
-	dim "  files:   firewall.log, firewall.manifest.json, firewall.groundtruth.json"
+	dim "  files:   firewall_${run}.log, .manifest.json, .groundtruth.json"
 	pause
 }
 
@@ -608,7 +617,7 @@ verify_evidence() {
 	echo
 	local recorded actual
 	recorded="$(manifest_field "$run" 'm["output"]["sha256"]')"
-	actual="$(sha256sum "$OUTDIR/$run/firewall.log" 2>/dev/null | cut -d' ' -f1)"
+	actual="$(sha256sum "$OUTDIR/$run/firewall_${run}.log" 2>/dev/null | cut -d' ' -f1)"
 	kv "recorded"   "${recorded:-missing}"
 	kv "recomputed" "${actual:-missing}"
 	echo
@@ -617,6 +626,40 @@ verify_evidence() {
 	else
 		err "MISMATCH — the log has changed since it was captured"
 	fi
+	pause
+}
+
+submit_evidence() {
+	require_run || return
+	local run; run="$(pick_run)"
+	[ -n "$run" ] || return
+	banner
+	head_ "Submit window $run to the Evidence Repository"
+	dim "  One capture becomes one EvidenceItem. The manifest's window becomes the item's"
+	dim "  coverage window — the axis correlation runs along — and its sha256 goes as a"
+	dim "  claim, which the repository checks against a digest it recomputes itself."
+	dim "  groundtruth.json stays here: labels are research metadata, not evidence."
+	echo
+	kv "endpoint"    "$DFRAAS_URL/api/evidence-items"
+	kv "source key"  "$DFRAAS_SOURCE_KEY"
+	kv "artifact id" "firewall_${run}"
+	kv "window"      "$(manifest_field "$run" 'm["window"]["start_utc"] + "  ->  " + m["window"]["end_utc"]')"
+	kv "sha256"      "$(manifest_field "$run" 'm["output"]["sha256"]')"
+	echo
+	dim "  The source must be registered once before its first upload — that is where"
+	dim "  classification is decided, so it needs a work group id:"
+	dim "    ./submit-evidence.sh --register-with <workGroupId>"
+	echo
+	printf '  %ssubmit? [y/N]>%s ' "$C_TITLE" "$R"
+	# EOF is not consent, as everywhere else a prompt gates an outward-facing action.
+	local go; read -r go || { dim "  cancelled"; pause; return; }
+	case "$go" in
+		y|Y) ;;
+		*) dim "  cancelled"; pause; return ;;
+	esac
+	echo
+	DFRAAS_URL="$DFRAAS_URL" DFRAAS_SOURCE_KEY="$DFRAAS_SOURCE_KEY" DFRAAS_AUTH="$DFRAAS_AUTH" \
+		"$SUBMIT_SCRIPT" --run "$run" --outdir "$OUTDIR" 2>&1 | sed 's/^/  /'
 	pause
 }
 
@@ -686,6 +729,37 @@ doctor() {
 	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
 		local c; c=$(docker ps -q 2>/dev/null | wc -l)
 		[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while active"
+	fi
+
+	head_ "Can this machine reach the Evidence Repository?"
+	if command -v curl >/dev/null 2>&1; then ok "curl available"; else err "curl missing — submitting needs it"; fi
+
+	local health source_code
+	# `|| true` rather than `|| echo "000"`: curl already prints 000 from -w when the
+	# connection fails, so appending another makes the code "000000" and the branch that
+	# explains the failure never matches.
+	health=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$DFRAAS_URL/actuator/health" 2>/dev/null || true)
+	health="${health:-000}"
+	case "$health" in
+		200) ok "repository answering at $DFRAAS_URL" ;;
+		000) err "no answer from $DFRAAS_URL"
+		     dim "    if the backend runs on Windows and this is WSL, localhost may not"
+		     dim "    route there. Try the host address instead:"
+		     dim "    DFRAAS_URL=http://\$(ip route show default | awk '{print \$3}'):8080" ;;
+		*)   warn "$DFRAAS_URL answered HTTP $health on /actuator/health" ;;
+	esac
+
+	if [ "$health" = "200" ]; then
+		source_code=$(curl -sS -u "$DFRAAS_AUTH" -o /dev/null -w '%{http_code}' --max-time 3 \
+			"$DFRAAS_URL/api/evidence-sources?sourceKey=$DFRAAS_SOURCE_KEY" 2>/dev/null || true)
+		source_code="${source_code:-000}"
+		case "$source_code" in
+			200) ok "source '$DFRAAS_SOURCE_KEY' is registered" ;;
+			404) warn "source '$DFRAAS_SOURCE_KEY' is not registered yet"
+			     dim "    ./submit-evidence.sh --register-with <workGroupId>" ;;
+			401) err "credentials rejected — set DFRAAS_AUTH in pde.conf" ;;
+			*)   warn "source lookup answered HTTP $source_code" ;;
+		esac
 	fi
 	pause
 }
@@ -873,6 +947,7 @@ main_menu() {
 		echo
 		printf '  %s7%s  Read evidence back\n' "$C_NUM" "$R"
 		printf '  %s8%s  Verify integrity         %s(sha256 against the manifest)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		printf '  %ss%s  Submit to the repository %s(hands a window over for preservation)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		echo
 		printf '  %s9%s  Help and diagnostics\n' "$C_NUM" "$R"
 		echo
@@ -889,6 +964,7 @@ main_menu() {
 			6) preview_plan ;;
 			7) view_evidence ;;
 			8) verify_evidence ;;
+			s|S) submit_evidence ;;
 			9) help_menu ;;
 			0|q|Q) clear; return ;;
 			*) ;;

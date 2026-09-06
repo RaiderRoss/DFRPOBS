@@ -409,9 +409,12 @@ fi
 # thing the group manifest does. Names inside need no timestamp; the directory carries it.
 RUN_DIR="$OUTDIR/$STAMP"
 mkdir -p "$RUN_DIR"
-GT_JSON="$RUN_DIR/firewall.groundtruth.json"
-OUT_LOG="$RUN_DIR/firewall.log"
-MANIFEST="$RUN_DIR/firewall.manifest.json"
+# The names repeat the stamp the directory already carries, on purpose: a file that
+# leaves the directory — uploaded to the repository, attached to a case — has to keep its
+# identity, and "firewall.log" identifies nothing once it is somewhere else.
+GT_JSON="$RUN_DIR/firewall_${STAMP}.groundtruth.json"
+OUT_LOG="$RUN_DIR/firewall_${STAMP}.log"
+MANIFEST="$RUN_DIR/firewall_${STAMP}.manifest.json"
 
 log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PCT}% malicious, profile=${ATTACK_PROFILE}"
 # $LAB_NS, not $NS: under a lab the namespace is whichever one that session recorded,
@@ -548,8 +551,8 @@ manifest = {
         "malicious_ports": [int(p) for p in "${MALICIOUS_PORTS}".split(",")],
     },
     "output": {
-        "log_file": "firewall.log",
-        "ground_truth_file": "firewall.groundtruth.json",
+        "log_file": "firewall_${STAMP}.log",
+        "ground_truth_file": "firewall_${STAMP}.groundtruth.json",
         "lines": ${LOG_LINES},
         "bytes": ${BYTES},
         "ufw_block_lines": ${BLOCKED},
@@ -589,8 +592,8 @@ PY
 # ---------------------------------------------------------------------------
 # IDS evidence for the same window
 # ---------------------------------------------------------------------------
-IDS_LOG="$RUN_DIR/ids.alerts.log"
-GROUP_MANIFEST="$RUN_DIR/group.json"
+IDS_LOG="$RUN_DIR/ids_${STAMP}.alerts.log"
+GROUP_MANIFEST="$RUN_DIR/window_${STAMP}.group.json"
 IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"
 
 if [[ $WITH_IDS -eq 1 ]]; then
@@ -640,9 +643,9 @@ if [[ $WITH_IDS -eq 1 ]]; then
 		# the flow record behind the findings, and an investigator asking "on what
 		# basis" needs it. Moved only after the container has let go of the mount.
 		if [[ -d "$SLIPS_OUT" ]]; then
-			rm -rf "$RUN_DIR/ids"
-			mv "$SLIPS_OUT" "$RUN_DIR/ids"
-			SLIPS_OUT="$RUN_DIR/ids"
+			rm -rf "$RUN_DIR/ids_${STAMP}"
+			mv "$SLIPS_OUT" "$RUN_DIR/ids_${STAMP}"
+			SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
 		fi
 	fi
 
@@ -670,7 +673,7 @@ group = {
         {
             "pde_source": "firewall",
             "product": "ufw",
-            "file": "firewall.log",
+            "file": "firewall_${STAMP}.log",
             "sha256": "${SHA256}",
             "lines": ${LOG_LINES},
             "ufw_block_lines": ${BLOCKED},
@@ -680,7 +683,7 @@ group = {
         {
             "pde_source": "ids",
             "product": "slips",
-            "file": "ids.alerts.log",
+            "file": "ids_${STAMP}.alerts.log",
             "sha256": "${IDS_SHA}",
             "evidence_lines": ${IDS_KEPT},
             "evidence_lines_seen_total": ${IDS_TOTAL},
@@ -728,10 +731,10 @@ fi
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
 log "sha256 $SHA256"
 log "window directory: $RUN_DIR"
-log "  firewall.log              the evidence"
-log "  firewall.manifest.json    provenance and digest"
-log "  firewall.groundtruth.json labels, known before sending"
+log "  firewall_${STAMP}.log              the evidence"
+log "  firewall_${STAMP}.manifest.json    provenance and digest"
+log "  firewall_${STAMP}.groundtruth.json labels, known before sending"
 if [[ $WITH_IDS -eq 1 ]]; then
-	log "  ids.alerts.log            IDS evidence for the same window"
-	log "  group.json                both sources, one window"
+	log "  ids_${STAMP}.alerts.log            IDS evidence for the same window"
+	log "  window_${STAMP}.group.json         both sources, one window"
 fi

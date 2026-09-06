@@ -100,5 +100,27 @@ Verified without root: syntax, `--dry-run`, the traffic generator end to end (30
 in 3.0s against loopback, correct source-port binding and outcomes), and all six attack
 profiles producing distinct port distributions.
 
-Not yet verified: the privileged path — namespace creation, `ufw enable`, and the log
-capture itself. That needs a `sudo` run, which is the next step.
+Verified with root on WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`, ufw 0.36.1): the
+privileged path end to end — namespace creation, `ufw enable` at `logging full`, the
+capture, and the restore on exit.
+
+| run | lines | BLOCK | ALLOW | AUDIT |
+|---|---|---|---|---|
+| `20260906194400` port-scan, 10 users, 30s @ 20/s | 2595 | 60 | 540 | 1995 |
+| `20260906204848` port-scan, same scenario, IDS on | 1684 | 56 | 524 | 1104 |
+
+The verdicts reconcile exactly with the line count in both. The second run also carried
+Slips over the same window and produced 3 high-severity findings, and its 4 missing
+BLOCKs are explained: two attempts to 5432 reached a published Docker container through
+`nat/PREROUTING`, which runs before ufw's filter chain — so ufw never saw them. That is a
+real demonstration that firewall evidence alone can be incomplete.
+
+**The failure mode to check first is rsyslog.** Stopped, the capture still runs: it
+generates real traffic, restores the firewall, and extracts nothing, because there is no
+`/var/log/ufw.log` to read. The console's environment check reports it. This pre-flight
+costs nothing and touches no firewall state — it proves both that the daemon is up and
+that the stock `20-ufw.conf` rule is filing `[UFW ` lines to the right file:
+
+```bash
+logger -p kern.info "[UFW TEST] plumbing check" && sleep 2 && grep "UFW TEST" /var/log/ufw.log
+```

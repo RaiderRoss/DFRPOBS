@@ -11,4 +11,21 @@
     <!-- First domain table: WorkGroup -->
     <include file="changes/0001-create-work-group-table.xml" relativeToChangelogFile="true"/>
 
+    <!-- Ingestion input: the SIEM/IDS alert that triggers evidence preservation -->
+    <include file="changes/0002-create-trigger-event-table.xml" relativeToChangelogFile="true"/>
+
+    <!-- Ingestion output: the preserved artifact itself. Must follow 0001 and 0002 — it
+         carries foreign keys to both. -->
+    <include file="changes/0003-create-evidence-item-table.xml" relativeToChangelogFile="true"/>
+
+    <!-- The shift from reactive to continuous collection: registered producers that stream
+         evidence in on their own schedule, and the coverage window on each item that makes
+         retrospective correlation possible. Must follow 0001 (work_group) and 0003. -->
+    <include file="changes/0004-create-evidence-source-and-coverage-window.xml" relativeToChangelogFile="true"/>
+
+    <!-- Correlation: the many-to-many, reviewable link between an alert and the evidence
+         covering the time it fired, replacing evidence_item.trigger_event_id. Must follow
+         0004 — it migrates that column's contents into evidence_link and then drops it. -->
+    <include file="changes/0005-create-evidence-link-and-correlation-state.xml" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>

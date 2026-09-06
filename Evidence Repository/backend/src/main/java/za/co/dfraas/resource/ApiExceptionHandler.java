@@ -15,6 +15,8 @@ import org.springframework.web.context.request.WebRequest;
 import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExceptionHandler;
 
 import za.co.dfraas.exception.DuplicateResourceException;
+import za.co.dfraas.exception.EvidenceStorageException;
+import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.exception.ResourceNotFoundException;
 
 /**
@@ -43,6 +45,48 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 	public ProblemDetail handleDuplicate(DuplicateResourceException ex) {
 		ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
 		problem.setTitle("Resource already exists");
+		return problem;
+	}
+
+	/**
+	 * Integrity failures are 422, not 400.
+	 *
+	 * <p>A 400 tells a caller their request was malformed and they should fix it. This is the
+	 * opposite: the request was perfectly well formed, and the <em>content</em> did not survive
+	 * intact between the source hashing it and this system receiving or storing it. That is a
+	 * finding about the evidence rather than about the message carrying it, and a client that
+	 * cannot tell the two apart by status code has an audit trail made of prose.
+	 *
+	 * <p>The message names the artifact and no digests — see
+	 * {@link IntegrityVerificationException}. The values are logged where they belong, on the
+	 * server, by the service that compared them.
+	 */
+	@ExceptionHandler(IntegrityVerificationException.class)
+	public ProblemDetail handleIntegrityFailure(IntegrityVerificationException ex) {
+		ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+		problem.setTitle("Evidence integrity check failed");
+		return problem;
+	}
+
+	/**
+	 * Storage failures are 503 with a fixed message.
+	 *
+	 * <p>503 because the honest instruction to the caller is "this was not preserved, send it
+	 * again", and a retry is safe by construction: the storage key is derived from the
+	 * artifact's identity and ingestion dedupes on it, so a second attempt either completes the
+	 * interrupted preservation or is rejected as a duplicate.
+	 *
+	 * <p>The exception's own message carries the object key, which is exactly what this class
+	 * promises not to put in a response body, so the detail here is fixed text and the cause is
+	 * logged instead.
+	 */
+	@ExceptionHandler(EvidenceStorageException.class)
+	public ProblemDetail handleStorageFailure(EvidenceStorageException ex) {
+		logger.error("Evidence store unavailable", ex);
+		ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+				HttpStatus.SERVICE_UNAVAILABLE,
+				"The evidence store is unavailable, so nothing was preserved. Send the artifact again.");
+		problem.setTitle("Evidence store unavailable");
 		return problem;
 	}
 
