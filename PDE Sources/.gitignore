@@ -1,0 +1,8 @@
+# Captured evidence and its manifests. These are run artefacts, and the log files are
+# chmod 444 — they are reproducible from a seed, so they do not belong in the repo.
+output/
+
+# Local defaults set via `pde config set`.
+pde.conf
+
+__pycache__/
