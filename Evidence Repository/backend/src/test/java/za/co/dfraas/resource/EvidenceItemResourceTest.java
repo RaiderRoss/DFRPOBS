@@ -3,7 +3,9 @@ package za.co.dfraas.resource;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
@@ -64,7 +66,7 @@ class EvidenceItemResourceTest {
 	@Test
 	@DisplayName("POST preserves the artifact and returns 201 with a Location header")
 	void preserveReturnsCreatedWithLocation() throws Exception {
-		given(service.preserve(any(), any(), any())).willReturn(sampleDto());
+		given(service.preserve(any(), any(), any(), any())).willReturn(sampleDto());
 
 		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
 				.andExpect(status().isCreated())
@@ -80,18 +82,34 @@ class EvidenceItemResourceTest {
 	@Test
 	@DisplayName("The response carries the digest but never the storage reference")
 	void preserveResponseOmitsStorageRef() throws Exception {
-		given(service.preserve(any(), any(), any())).willReturn(sampleDto());
+		given(service.preserve(any(), any(), any(), any())).willReturn(sampleDto());
 
 		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
 				.andExpect(status().isCreated())
 				.andExpect(jsonPath("$.storageRef").doesNotExist());
 	}
 
+	/**
+	 * The attribution the custody chain records is taken from the authenticated request, not
+	 * from anything the caller can state in the metadata part. An upload that could name its
+	 * own preserver would make {@code custody_event.performed_by} worthless.
+	 */
+	@Test
+	@DisplayName("The authenticated principal is passed through as the custody attribution")
+	void preservePassesAuthenticatedPrincipalToTheService() throws Exception {
+		given(service.preserve(any(), any(), any(), any())).willReturn(sampleDto());
+
+		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
+				.andExpect(status().isCreated());
+
+		then(service).should().preserve(any(), any(), any(), eq("user"));
+	}
+
 	@Test
 	@DisplayName("An integrity failure is translated to 422, not 400")
 	void integrityFailureIsUnprocessableEntity() throws Exception {
 		willThrow(IntegrityVerificationException.digestMismatch(ARTIFACT_ID))
-				.given(service).preserve(any(), any(), any());
+				.given(service).preserve(any(), any(), any(), any());
 
 		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
 				.andExpect(status().isUnprocessableEntity())
@@ -107,7 +125,7 @@ class EvidenceItemResourceTest {
 	@DisplayName("An integrity failure names the artifact and no digests")
 	void integrityFailureDetailCarriesNoDigests() throws Exception {
 		willThrow(IntegrityVerificationException.digestMismatch(ARTIFACT_ID))
-				.given(service).preserve(any(), any(), any());
+				.given(service).preserve(any(), any(), any(), any());
 
 		String body = mockMvc
 				.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
@@ -123,7 +141,7 @@ class EvidenceItemResourceTest {
 	@DisplayName("A re-sent artifact is translated to 409")
 	void duplicateArtifactIsConflict() throws Exception {
 		willThrow(DuplicateResourceException.of("EvidenceItem", "sourceArtifactId", ARTIFACT_ID))
-				.given(service).preserve(any(), any(), any());
+				.given(service).preserve(any(), any(), any(), any());
 
 		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
 				.andExpect(status().isConflict())
@@ -134,7 +152,7 @@ class EvidenceItemResourceTest {
 	@DisplayName("An unregistered source key is translated to 404")
 	void unknownSourceIsNotFound() throws Exception {
 		willThrow(ResourceNotFoundException.of("EvidenceSource", "pde-sim-ufw-01"))
-				.given(service).preserve(any(), any(), any());
+				.given(service).preserve(any(), any(), any(), any());
 
 		mockMvc.perform(upload(metadataJson(CONTENT_SHA256, "2026-09-05T14:30:00Z", "2026-09-05T14:30:30Z")))
 				.andExpect(status().isNotFound())

@@ -9,6 +9,7 @@ import jakarta.validation.Valid;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -134,13 +135,33 @@ public class EvidenceItemResource {
 			@Parameter(description = "The artifact itself. Sent as bytes; never interpreted here.")
 			@RequestPart("file") MultipartFile file,
 
-			// Injected by Spring MVC to build the Location header; hidden so springdoc does not
-			// advertise it as something the caller supplies.
-			@Parameter(hidden = true) UriComponentsBuilder uriBuilder) throws IOException {
+			// Both injected by Spring MVC and hidden so springdoc does not advertise them as
+			// something the caller supplies: one builds the Location header, the other is who
+			// the request authenticated as.
+			@Parameter(hidden = true) UriComponentsBuilder uriBuilder,
+			@Parameter(hidden = true) Authentication authentication) throws IOException {
 
-		EvidenceItemDto preserved = service.preserve(metadata, file.getBytes(), contentTypeOf(file));
+		EvidenceItemDto preserved = service.preserve(
+				metadata, file.getBytes(), contentTypeOf(file), principalOf(authentication));
 		URI location = uriBuilder.path("/api/evidence-items/{id}").buildAndExpand(preserved.id()).toUri();
 		return ResponseEntity.created(location).body(preserved);
+	}
+
+	/**
+	 * Who this upload is attributed to in the custody chain.
+	 *
+	 * <p>Null-tolerant rather than asserted, matching a column that is nullable on purpose:
+	 * {@code custody_event.performed_by} is null when the honest answer is "the ingestion
+	 * pipeline". No route here can currently be reached unauthenticated —
+	 * {@code SecurityConfiguration} ends in {@code anyRequest().authenticated()} — so this
+	 * returns a principal in practice; what it refuses to do is invent one if that ever
+	 * changes.
+	 *
+	 * <p>A username rather than a user id, because {@code AppUser} does not exist yet. It
+	 * becomes a foreign key with that entity, alongside {@code EvidenceLink.linkedBy}.
+	 */
+	private static String principalOf(Authentication authentication) {
+		return authentication == null ? null : authentication.getName();
 	}
 
 	/**
