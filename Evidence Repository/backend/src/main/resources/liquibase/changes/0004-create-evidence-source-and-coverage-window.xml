@@ -1,0 +1,408 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        The schema half of the shift from reactive to continuous collection.
+
+        Before this changeset, an EvidenceItem existed because an alert fired. After it,
+        evidence streams in from registered sources on its own schedule and an alert is
+        something that happens *alongside* it. Two things have to exist in the schema
+        before that is possible:
+
+          1. A registered source (evidence_source). Under the reactive model the producer
+             was anonymous — anything could publish to the topic and the alert carried the
+             classification. Under continuous collection the producer is a long-lived,
+             named participant whose silence is itself a finding, and whose registration
+             is where classification is decided.
+
+          2. A coverage window on each item (event_start / event_end). Correlation asks
+             "what evidence covers the time this alert fired", and nothing in the schema
+             could answer that: evidence_item.created_at is when *we preserved* the
+             artifact, which for a streamed log bundle is minutes-to-hours after the
+             activity it records.
+
+        0005 adds the correlation itself.
+    -->
+
+    <changeSet id="0004-1" author="dfraas-team">
+        <preConditions onFail="MARK_RAN">
+            <not>
+                <tableExists tableName="evidence_source"/>
+            </not>
+        </preConditions>
+        <comment>Creates evidence_source — the registered producer that streams evidence in continuously</comment>
+        <createTable tableName="evidence_source">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+
+            <!--
+                The stable identifier a producer puts on the wire, and the same value
+                trigger_event.source_system carries. Deliberately the natural key rather
+                than the UUID: a collection agent's config file has to name its source, and
+                a human-readable key is what survives being copied into one.
+            -->
+            <column name="source_key" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+
+            <column name="display_name" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Registration is where classification is decided — this is the answer to
+                README open question 1.
+
+                Under the reactive model, classification had to be inferred per alert, from
+                a SIEM alert type, by a mapping table nobody had written. Under continuous
+                collection the question moves to a much better place: a source is registered
+                once, by a human, who knows which business unit the system it collects from
+                belongs to. Every item that source produces inherits that classification.
+
+                NOT NULL for the same reason evidence_item.work_group_id is: a source whose
+                evidence cannot be classified has no defensible retention or release policy,
+                and registering it would be recording a promise the system cannot keep.
+            -->
+            <column name="work_group_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                What kind of producer this is (SYSLOG, DB_AUDIT, NETFLOW, EDR, ...).
+                VARCHAR and not a CHECK list, for the same reason trigger_type is free-form:
+                the set is defined by whatever the institution actually runs, and adding a
+                collector must not require a migration.
+            -->
+            <column name="source_type" type="VARCHAR(64)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!-- VARCHAR + CHECK (0004-4), matching evidence_item.status. -->
+            <column name="status" type="VARCHAR(32)" defaultValue="ACTIVE">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                How often this source is expected to produce, in seconds. NULLABLE, and the
+                null means something specific: "this source is event-driven and silence
+                proves nothing". A syslog forwarder should have a cadence; a source that
+                only emits on a rare condition should not, because holding it to one would
+                generate a permanent false alarm.
+
+                This column is the whole reason evidence_source exists as an entity rather
+                than a lookup string. Continuous collection has a failure mode the reactive
+                model did not: a source that silently stops looks exactly like a source with
+                nothing to report. Under the old design a missing alert was noticeable —
+                someone was waiting for it. Here, nobody is. Cadence plus last_evidence_at
+                is what makes "which of our sources has gone quiet" a query rather than a
+                hope, and that question is the readiness audit.
+            -->
+            <column name="expected_interval_seconds" type="INTEGER">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                Last time this source successfully produced an item. The one mutable column
+                on the row, and stamped by the database clock on each ingest.
+
+                Note this is a liveness signal, not evidence: it is overwritten, so it keeps
+                no history. The history of what a source produced is evidence_item itself.
+            -->
+            <column name="last_evidence_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="true"/>
+            </column>
+
+            <column name="registered_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="evidence_source"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-2" author="dfraas-team">
+        <comment>A source key is the natural key producers put on the wire, so it must be unique</comment>
+        <!--
+            Global, not composite. Unlike trigger_event.external_event_id — which is only
+            unique within the system that issued it, because we do not control SIEM alert
+            numbering — source_key is assigned by *us* at registration, so we can and should
+            require it to be unique outright.
+        -->
+        <addUniqueConstraint
+            tableName="evidence_source"
+            columnNames="source_key"
+            constraintName="uq_evidence_source_key"/>
+        <rollback>
+            <dropUniqueConstraint
+                tableName="evidence_source"
+                constraintName="uq_evidence_source_key"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-3" author="dfraas-team">
+        <comment>Foreign key to work_group — RESTRICT, as everywhere else in this schema</comment>
+        <!--
+            RESTRICT rather than CASCADE: deleting a classification must not silently
+            deregister the collectors filing under it, which would stop evidence arriving
+            with no error anywhere. A source that should stop is set DECOMMISSIONED, not
+            deleted — the same soft-delete instinct evidence_item.status encodes.
+        -->
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_source_work_group"
+            baseTableName="evidence_source"
+            baseColumnNames="work_group_id"
+            referencedTableName="work_group"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <rollback>
+            <dropForeignKeyConstraint baseTableName="evidence_source" constraintName="fk_evidence_source_work_group"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-4" author="dfraas-team">
+        <comment>Constrain source status to the known states, and cadence to a real interval</comment>
+        <!-- addCheckConstraint is a Liquibase Pro tag, so these are raw SQL — same
+             trade-off as ck_evidence_item_status, and taken for the same reason. -->
+        <sql>
+            ALTER TABLE evidence_source
+                ADD CONSTRAINT ck_evidence_source_status
+                CHECK (status IN ('ACTIVE', 'SUSPENDED', 'DECOMMISSIONED'));
+        </sql>
+        <!--
+            A zero or negative cadence would make the silence check fire on every pass,
+            which is worse than having no check at all: an alarm that is always on is an
+            alarm nobody reads.
+        -->
+        <sql>
+            ALTER TABLE evidence_source
+                ADD CONSTRAINT ck_evidence_source_expected_interval
+                CHECK (expected_interval_seconds IS NULL OR expected_interval_seconds &gt; 0);
+        </sql>
+        <rollback>
+            <sql>ALTER TABLE evidence_source DROP CONSTRAINT ck_evidence_source_expected_interval;</sql>
+            <sql>ALTER TABLE evidence_source DROP CONSTRAINT ck_evidence_source_status;</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-5" author="dfraas-team">
+        <comment>Index the work_group foreign key and the liveness-monitoring predicate</comment>
+        <createIndex tableName="evidence_source" indexName="ix_evidence_source_work_group_id">
+            <column name="work_group_id"/>
+        </createIndex>
+        <!--
+            Raw SQL for the partial index (no WHERE support in createIndex outside
+            Liquibase Pro).
+
+            Partial on exactly the rows the liveness sweep looks at: sources that are
+            supposed to be producing. A source with no cadence expectation, or one that is
+            suspended or decommissioned, cannot be "late" and only dilutes the index.
+        -->
+        <sql>
+            CREATE INDEX ix_evidence_source_liveness
+                ON evidence_source (last_evidence_at)
+                WHERE status = 'ACTIVE' AND expected_interval_seconds IS NOT NULL;
+        </sql>
+        <rollback>
+            <sql>DROP INDEX ix_evidence_source_liveness;</sql>
+            <dropIndex tableName="evidence_source" indexName="ix_evidence_source_work_group_id"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-6" author="dfraas-team">
+        <comment>evidence_item gains its producing source, that source's own artifact id, and a coverage window</comment>
+        <!--
+            All four columns are nullable, and each null means something different:
+
+            - evidence_source_id NULL: preserved by a person, not streamed. Manual
+              preservation and compliance holds have no collector behind them, and
+              inventing a "manual" source row would assert that a collector exists.
+              Provenance is not lost — that is CustodyEvent.performed_by's job.
+
+            - source_artifact_id NULL: the producer had no identifier of its own to give.
+
+            - event_start / event_end NULL: the coverage window is unknown. Such an item is
+              still fully preserved evidence; it simply cannot be *automatically* correlated
+              and can only be linked to a trigger event by hand. Making these NOT NULL was
+              rejected: it would either reject legitimate evidence at ingest, or force a
+              backfill that invents a coverage window from created_at — asserting when an
+              artifact's contents were produced on the basis of when we happened to store
+              it, which is exactly the kind of fabricated timestamp this schema goes out of
+              its way to avoid elsewhere.
+        -->
+        <addColumn tableName="evidence_item">
+            <column name="evidence_source_id" type="UUID">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                The producer's own identifier for this artifact, and the dedupe key for
+                streamed ingestion — the evidence-side equivalent of
+                trigger_event.external_event_id.
+
+                This matters more under continuous collection than it did before. Kafka is
+                at-least-once, and the volume here is orders of magnitude above the alert
+                stream, so redelivery is not an edge case but a daily occurrence. Until now
+                the only thing standing against a duplicate item was
+                uq_evidence_item_storage_ref, which only helps if the storage key happens to
+                be derived deterministically from the artifact — a property nothing enforced
+                and no comment claimed.
+            -->
+            <column name="source_artifact_id" type="VARCHAR(255)">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                The interval of activity this artifact actually covers, as asserted by the
+                source. This is the axis correlation runs along, and it is emphatically not
+                created_at: an hourly log bundle rolled at 15:00 and preserved at 15:02
+                covers 14:00-15:00, and correlating an alert that fired at 14:30 against
+                created_at would miss it entirely while matching bundles that contain
+                nothing relevant.
+
+                Sender-asserted, and treated with the same suspicion as
+                trigger_event.fired_at — kept alongside created_at (our clock) rather than
+                replacing it. A source with a skewed clock can misplace its own evidence in
+                time; the gap between the window and created_at is what makes that visible.
+
+                A point-in-time artifact (a memory dump, a single transaction record) sets
+                both to the same instant. That is why the correlation range is built with
+                inclusive '[]' bounds in 0004-9 — a half-open range over a zero-length
+                interval is empty, and would silently overlap nothing at all.
+            -->
+            <column name="event_start" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="true"/>
+            </column>
+            <column name="event_end" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="true"/>
+            </column>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="evidence_item" columnName="event_end"/>
+            <dropColumn tableName="evidence_item" columnName="event_start"/>
+            <dropColumn tableName="evidence_item" columnName="source_artifact_id"/>
+            <dropColumn tableName="evidence_item" columnName="evidence_source_id"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-7" author="dfraas-team">
+        <comment>Foreign key and dedupe key for the producing source</comment>
+        <!--
+            RESTRICT: a source that produced evidence cannot be deleted out from under it.
+            The evidence would survive, but the record of what collected it would not, and
+            "where did this come from" is the first question asked of any exhibit.
+
+            Note what is NOT being done here: work_group_id stays on evidence_item and is
+            not replaced by a join through evidence_source. It looks redundant — a source
+            declares a work group, so the item's classification could be derived. It is not
+            redundant, it is a snapshot. Reclassifying a source next year must not silently
+            reclassify every artifact it ever produced, each of which was retained and
+            released under the classification in force at the time.
+        -->
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_item_evidence_source"
+            baseTableName="evidence_item"
+            baseColumnNames="evidence_source_id"
+            referencedTableName="evidence_source"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <!--
+            The streamed-ingestion idempotency guarantee. Composite for the same reason
+            uq_trigger_event_source_external is: an artifact id is only meaningful within
+            the source that issued it.
+
+            Postgres treats NULLs as distinct in a unique constraint by default, which is
+            precisely the behaviour wanted here: manually preserved items carry NULL in both
+            columns and never collide with each other, while a streamed source that
+            redelivers artifact "auth-2026-09-05-14" is rejected on the second attempt.
+        -->
+        <addUniqueConstraint
+            tableName="evidence_item"
+            columnNames="evidence_source_id, source_artifact_id"
+            constraintName="uq_evidence_item_source_artifact"/>
+        <rollback>
+            <dropUniqueConstraint tableName="evidence_item" constraintName="uq_evidence_item_source_artifact"/>
+            <dropForeignKeyConstraint baseTableName="evidence_item" constraintName="fk_evidence_item_evidence_source"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-8" author="dfraas-team">
+        <comment>Coverage window must be whole and ordered; an artifact id needs a source to be meaningful</comment>
+        <!--
+            Half a window is worse than none: it looks answerable to a correlation query
+            and answers wrongly. Either both ends are known or neither is.
+        -->
+        <sql>
+            ALTER TABLE evidence_item
+                ADD CONSTRAINT ck_evidence_item_coverage_window
+                CHECK (
+                    (event_start IS NULL AND event_end IS NULL)
+                    OR (event_start IS NOT NULL AND event_end IS NOT NULL AND event_end &gt;= event_start)
+                );
+        </sql>
+        <!--
+            An artifact id without a source cannot be resolved, and worse, it would sit
+            outside uq_evidence_item_source_artifact (NULLs being distinct) and so dedupe
+            against nothing at all.
+        -->
+        <sql>
+            ALTER TABLE evidence_item
+                ADD CONSTRAINT ck_evidence_item_artifact_needs_source
+                CHECK (source_artifact_id IS NULL OR evidence_source_id IS NOT NULL);
+        </sql>
+        <rollback>
+            <sql>ALTER TABLE evidence_item DROP CONSTRAINT ck_evidence_item_artifact_needs_source;</sql>
+            <sql>ALTER TABLE evidence_item DROP CONSTRAINT ck_evidence_item_coverage_window;</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0004-9" author="dfraas-team">
+        <comment>Index the source foreign key, and the coverage window as a GiST range index</comment>
+        <createIndex tableName="evidence_item" indexName="ix_evidence_item_evidence_source_id">
+            <column name="evidence_source_id"/>
+        </createIndex>
+        <!--
+            The index correlation actually runs on, and the reason the columns are stored as
+            two scalars rather than a native range type.
+
+            A btree on (event_start, event_end) cannot serve an overlap predicate well: the
+            "does this interval intersect that one" test is not a prefix range scan, and on
+            a table holding every artifact a bank's estate produces it degrades to something
+            close to a sequential scan. GiST over a range expression supports the &amp;&amp;
+            operator directly, which is the difference between correlation being a query and
+            being a batch job.
+
+            Two scalar columns rather than a tstzrange column, with the range built in the
+            index expression: Hibernate has no native mapping for tstzrange, and with
+            ddl-auto=validate a column it cannot map is a startup problem rather than a
+            convenience. The scalars stay the source of truth and are what the entity maps;
+            the range exists only where it is useful, which is here.
+
+            Inclusive '[]' bounds, matching 0004-6: a point-in-time artifact has
+            event_start = event_end, and tstzrange(t, t, '[)') is the empty range, which
+            overlaps nothing. With '[]' it is the single instant t, which is the truth.
+
+            Partial, because an item with no coverage window has no place in a correlation
+            index: tstzrange(NULL, NULL, '[]') is the *unbounded* range, so without the
+            WHERE clause every unwindowed item would overlap every alert ever fired.
+        -->
+        <sql>
+            CREATE INDEX ix_evidence_item_coverage
+                ON evidence_item
+                USING gist (tstzrange(event_start, event_end, '[]'))
+                WHERE event_start IS NOT NULL;
+        </sql>
+        <rollback>
+            <sql>DROP INDEX ix_evidence_item_coverage;</sql>
+            <dropIndex tableName="evidence_item" indexName="ix_evidence_item_evidence_source_id"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

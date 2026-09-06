@@ -1,32 +1,99 @@
+# DFRaaS local development environment
+# Spins up Postgres, MinIO, and Redpanda (Kafka-API-compatible, single-node, smaller memory footprint).
+# All credentials below are dev-only placeholders
+
 services:
-  minio:
-    image: quay.io/minio/minio
-    container_name: minio
-    command: server /data --console-address ":9001"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dfraas-postgres
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      POSTGRES_DB: dfraas
+      POSTGRES_USER: dfraas
+      POSTGRES_PASSWORD: dfraas_dev_only
+    ports:
+      # Host 5433, not 5432: a host-level Postgres already owns 5432 on this machine.
+      # Container-internal port is unchanged, so other services still reach it on 5432.
+      - "5433:5432"
     volumes:
-      - minio-data:/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "pg_isready -U dfraas"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
+  minio:
+    image: minio/minio:latest
+    container_name: dfraas-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: dfraas_admin
+      MINIO_ROOT_PASSWORD: dfraas_dev_only
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Creates the evidence bucket on startup so the app never has to.
   minio-init:
-    image: quay.io/minio/mc
+    image: minio/mc:latest
+    container_name: dfraas-minio-init
     depends_on:
-      - minio
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      sleep 3;
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb --ignore-existing local/my-bucket;
+      mc alias set local http://minio:9000 dfraas_admin dfraas_dev_only &&
+      mc mb --ignore-existing local/evidence-store
       "
 
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: dfraas-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      # Two listeners. A Kafka client bootstraps, then reconnects to whatever
+      # address the broker ADVERTISES — so a single listener advertised as
+      # "redpanda:9092" is reachable from other containers but not from the host,
+      # where that hostname does not resolve.
+      #   internal (9092)  -> for containers on this network, e.g. redpanda-console
+      #   external (19092) -> for the Spring app running on your host
+      # 9092 is deliberately NOT published to the host: bootstrapping there would
+      # succeed and then redirect you to the unresolvable internal name.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=PLAINTEXT://0.0.0.0:8082
+      - --advertise-pandaproxy-addr=PLAINTEXT://redpanda:8082
+    ports:
+      - "19092:19092" # Kafka API (external listener, for host-run apps)
+      - "9644:9644"   # Admin API
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+
+  # Web UI for browsing topics/messages
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: dfraas-redpanda-console
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      - redpanda
+
 volumes:
-  minio-data:
+  postgres_data:
+  minio_data:
+  redpanda_data:

@@ -18,8 +18,7 @@ services:
     volumes:
       - fineract-plugins:/app/plugins
     healthcheck:
-      # The Fineract image is Alpine/busybox based and ships no curl -- use the
-      # busybox wget applet instead (-O - so a failed fetch exits non-zero).
+      # The Fineract image is Alpine/busybox based and ships no curl so we use busybox wget applet 
       test: ["CMD", "busybox", "wget", "--no-check-certificate", "-q", "-O", "-", "https://localhost:8443/fineract-provider/actuator/health"]
       interval: 10s
       timeout: 5s
@@ -60,13 +59,23 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      # Schemas are baked into the image (see Kafka_Listener/Dockerfile), so no
-      # local Fineract checkout is needed. These are needed to interpret kafka events.
       - AVRO_SCHEMA_DIR=/schemas
       - AVRO_TEMPLATE_DIR=/schemas/avro-templates
+      - SECURERS_URL=${SECURERS_URL:-https://host.docker.internal:9443/pde/add/}
+      - SECURERS_API_KEY=${SECURERS_API_KEY:?set SECURERS_API_KEY in Fineract/.env — see .env.example}
+      - SECURERS_VERIFY_SSL=${SECURERS_VERIFY_SSL:-0}
+      - FINERACT_HOST=fineract-manager
+      - SECURERS_RANK=${SECURERS_RANK:-0.0}
+      - DEAD_LETTER_PATH=/dead-letter/events.jsonl
+      - LISTENER_VERBOSE=${LISTENER_VERBOSE:-0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - listener-dead-letter:/dead-letter
     depends_on:
       - kafka
     restart: unless-stopped
 
 volumes:
   fineract-plugins:
+  listener-dead-letter:

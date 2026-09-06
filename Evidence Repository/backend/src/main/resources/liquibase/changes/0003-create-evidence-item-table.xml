@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <changeSet id="0003-1" author="dfraas-team">
+        <preConditions onFail="MARK_RAN">
+            <not>
+                <tableExists tableName="evidence_item"/>
+            </not>
+        </preConditions>
+        <comment>Creates evidence_item — the preserved artifact, and the hub the custody and integrity tables hang off</comment>
+        <createTable tableName="evidence_item">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+
+            <!--
+                The K-FFRaaS classification this artifact was preserved under. NOT NULL:
+                unclassified evidence has no defensible retention or release policy, so an
+                item without one cannot be handled at all.
+
+                Where classification needs human review before storage (README open
+                question 1), the answer is a work_group row meaning "not yet classified",
+                not a null FK — "unclassified" is a truthful classification state. That is
+                not the placeholder-row move rejected for trigger_event, which would have
+                asserted that an alert fired when none did.
+            -->
+            <column name="work_group_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                The alert that caused this preservation. NULLABLE, and deliberately so
+                (README open question 2). NOT NULL would mean evidence can only exist
+                because an alert fired — the system becomes purely reactive and abandons
+                the readiness half of K-FFRaaS, since scheduled preservation, compliance
+                holds and manual preservation by an investigator have no trigger event.
+
+                Provenance survives the null: every item gets a mandatory opening
+                custody_event carrying performed_by and action. That is the universal
+                provenance record; trigger_event is the narrower automated *cause*.
+
+                Note what is NOT here: a unique constraint. The relationship is one-to-many
+                — one alert can reasonably preserve several artifacts (auth log, firewall
+                log, DB audit trail) — and a unique index would silently cap that at one.
+            -->
+            <column name="trigger_event_id" type="UUID">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                The MinIO object key, sized for the 1024-byte S3 key limit so a legitimate
+                key is never truncated. A key, not a URL: endpoint, bucket and credentials
+                are deployment configuration and change with the environment, while this
+                must stay valid for the lifetime of the evidence.
+            -->
+            <column name="storage_ref" type="VARCHAR(1024)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Lowercase hex SHA-256 of the stored object, computed on ingest before
+                anything else touches the bytes (SecureRS) and re-computed on every read or
+                export. "Current", not "original": key rotation, re-encryption or an
+                approved redaction legitimately change the bytes, and each such change
+                writes a custody_event carrying previous_hash and new_hash. The original
+                digest is the first link of that chain, not a second column here.
+            -->
+            <column name="current_hash" type="VARCHAR(64)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                VARCHAR + CHECK (see 0003-4), not a native Postgres enum. A native enum can
+                gain values but cannot lose or rename one without recreating the type and
+                rewriting every dependent column, and this set is business-facing — legal
+                hold, export embargo and redaction states will be argued over as the
+                readiness process matures. Contrast the processing state planned for
+                trigger_event, which is closed and internal and therefore a safe place for
+                a native enum.
+
+                No default: the status of a preserved artifact is a decision the ingestion
+                path makes explicitly, and a default would let a row that skipped that
+                decision look identical to one that made it.
+            -->
+            <column name="status" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!-- Stamped by the database clock, as with work_group.created_at and
+                 trigger_event.received_at: a skewed application host must not be able to
+                 influence a timestamp that may later be evidence. -->
+            <column name="created_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="evidence_item"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0003-2" author="dfraas-team">
+        <comment>Foreign keys — both RESTRICT, because nothing evidence references may be deleted out from under it</comment>
+        <!--
+            onDelete="RESTRICT" on both, not CASCADE. CASCADE is the wrong instinct in an
+            audited schema: deleting a work group must not silently take its evidence with
+            it, and deleting a trigger event must not erase the record of what it caused.
+            Evidence is soft-delete only (EvidenceStatus.DELETED); RESTRICT makes the
+            database enforce that from the other direction too.
+
+            onUpdate="RESTRICT" is nominal — these are surrogate UUID keys and are never
+            updated — but it is stated rather than left to the server default so the
+            intent is not inferred from silence.
+        -->
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_item_work_group"
+            baseTableName="evidence_item"
+            baseColumnNames="work_group_id"
+            referencedTableName="work_group"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_item_trigger_event"
+            baseTableName="evidence_item"
+            baseColumnNames="trigger_event_id"
+            referencedTableName="trigger_event"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <rollback>
+            <dropForeignKeyConstraint baseTableName="evidence_item" constraintName="fk_evidence_item_trigger_event"/>
+            <dropForeignKeyConstraint baseTableName="evidence_item" constraintName="fk_evidence_item_work_group"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0003-3" author="dfraas-team">
+        <comment>One storage object belongs to exactly one evidence item</comment>
+        <!--
+            Two items sharing a storage_ref would mean two custody chains and two retention
+            decisions governing one object, and a delete under one would silently gut the
+            other. The unique index is also what makes ingest retries safe once the MinIO
+            write is wired up: a redelivery that re-derives the same key is rejected here
+            rather than producing a second item for one artifact.
+        -->
+        <addUniqueConstraint
+            tableName="evidence_item"
+            columnNames="storage_ref"
+            constraintName="uq_evidence_item_storage_ref"/>
+        <rollback>
+            <dropUniqueConstraint
+                tableName="evidence_item"
+                constraintName="uq_evidence_item_storage_ref"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0003-4" author="dfraas-team">
+        <comment>Constrain current_hash to a real digest and status to the known lifecycle states</comment>
+        <!--
+            addCheckConstraint is a Liquibase Pro tag, so both are raw SQL — same trade-off
+            as ck_trigger_event_payload_sha256, and worth it for the same reason: the
+            integrity story rests on current_hash, and a constraint in the database holds
+            for writes that never pass through this application.
+
+            The status list must stay in step with the EvidenceStatus enum. Widening it is
+            one ALTER TABLE; that reversibility is exactly why this is not a native enum.
+        -->
+        <sql>
+            ALTER TABLE evidence_item
+                ADD CONSTRAINT ck_evidence_item_current_hash
+                CHECK (current_hash ~ '^[a-f0-9]{64}$');
+        </sql>
+        <sql>
+            ALTER TABLE evidence_item
+                ADD CONSTRAINT ck_evidence_item_status
+                CHECK (status IN ('PRESERVED', 'COMPROMISED', 'ARCHIVED', 'DELETED'));
+        </sql>
+        <rollback>
+            <sql>
+                ALTER TABLE evidence_item
+                    DROP CONSTRAINT ck_evidence_item_status;
+            </sql>
+            <sql>
+                ALTER TABLE evidence_item
+                    DROP CONSTRAINT ck_evidence_item_current_hash;
+            </sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0003-5" author="dfraas-team">
+        <comment>Index both foreign keys — Postgres creates neither automatically</comment>
+        <!--
+            Postgres indexes the referenced side of a foreign key (the primary key) but not
+            the referencing side, so without these every "evidence for this work group"
+            query and every RESTRICT check on a work_group or trigger_event delete is a
+            sequential scan of a table that grows with every preserved artifact.
+
+            ix_evidence_item_trigger_event_id also serves a query the schema will need
+            shortly: "does this trigger event already have evidence items", the guard that
+            makes ingestion resumable (README open question 3).
+        -->
+        <createIndex tableName="evidence_item" indexName="ix_evidence_item_work_group_id">
+            <column name="work_group_id"/>
+        </createIndex>
+        <createIndex tableName="evidence_item" indexName="ix_evidence_item_trigger_event_id">
+            <column name="trigger_event_id"/>
+        </createIndex>
+        <rollback>
+            <dropIndex tableName="evidence_item" indexName="ix_evidence_item_trigger_event_id"/>
+            <dropIndex tableName="evidence_item" indexName="ix_evidence_item_work_group_id"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0003-6" author="dfraas-team">
+        <comment>Partial index on the exceptional statuses — the readiness-audit query</comment>
+        <!--
+            Raw SQL because createIndex has no partial-index (WHERE) support outside
+            Liquibase Pro.
+
+            Partial rather than a plain btree on status. Almost every row is PRESERVED, so
+            a full index on a column with that distribution is large and the planner will
+            ignore it for the common value anyway. The question actually asked of this
+            column is the opposite one — "what is compromised, archived or deleted" — and a
+            partial index answers it while staying proportional to the number of items in
+            those states rather than to the whole table.
+        -->
+        <sql>
+            CREATE INDEX ix_evidence_item_status_exceptional
+                ON evidence_item (status)
+                WHERE status &lt;&gt; 'PRESERVED';
+        </sql>
+        <rollback>
+            <sql>
+                DROP INDEX ix_evidence_item_status_exceptional;
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
