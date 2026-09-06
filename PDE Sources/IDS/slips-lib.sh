@@ -67,23 +67,68 @@ slips_start() {
 		./slips.py -i "$iface" -o /output >/dev/null
 }
 
+# Typical time to readiness, used only to pace the progress bar. Measured at ~46s here;
+# the bar is an estimate against this, never a claim about state.
+SLIPS_EXPECTED_STARTUP="${SLIPS_EXPECTED_STARTUP:-50}"
+
+# Caps at 99% until readiness is actually observed, so a slow start looks slow instead
+# of looking finished. A bar sitting at 100% while nothing happens is worse than none.
+_slips_bar() {
+	local elapsed="$1" finished="${2:-0}" label="${3:-}" width=30 pct filled i bar=""
+	if [ "$finished" = "1" ]; then
+		pct=100
+	else
+		pct=$(( elapsed * 100 / SLIPS_EXPECTED_STARTUP ))
+		[ "$pct" -gt 99 ] && pct=99
+	fi
+	filled=$(( pct * width / 100 ))
+	for ((i = 0; i < width; i++)); do
+		if [ "$i" -lt "$filled" ]; then bar="${bar}█"; else bar="${bar}░"; fi
+	done
+	if [ "$finished" = "1" ]; then
+		printf '\r  Slips  [%s] %3ds  ready%-38s\n' "$bar" "$elapsed" ""
+	else
+		printf '\r  Slips  [%s] %3ds  %-38s' "$bar" "$elapsed" "$label"
+	fi
+}
+
 # Slips loads 15 modules and 45+ threat-intel feeds before it reads a single
 # packet. Nothing may be generated until this returns, or the window's traffic
 # is simply missed. $1 = timeout in seconds.
 slips_wait_ready() {
-	local timeout="${1:-240}" waited=0
+	local timeout="${1:-240}" waited=0 phase="starting container"
+	# Only draw for a human. Piped or logged, the carriage returns are noise, so that
+	# path keeps the old quiet 5-second poll.
+	local tty=0; [ -t 1 ] && tty=1
+
 	while [ "$waited" -lt "$timeout" ]; do
 		if docker logs "$SLIPS_CONTAINER" 2>&1 | grep -q "Started Input Process"; then
+			[ "$tty" = 1 ] && _slips_bar "$waited" 1
 			return 0
 		fi
 		if ! _slips_running "$SLIPS_CONTAINER"; then
+			[ "$tty" = 1 ] && printf '\n'
 			echo "slips exited during startup; last lines:" >&2
 			docker logs "$SLIPS_CONTAINER" 2>&1 | tail -5 >&2
 			return 1
 		fi
-		sleep 5
-		waited=$((waited + 5))
+
+		if [ "$tty" = 1 ]; then
+			# Phase comes from Slips' own log rather than being inferred from the
+			# clock, so the label says what is actually happening.
+			if docker logs "$SLIPS_CONTAINER" 2>&1 | grep -qi "loading"; then
+				phase="loading modules and threat-intel feeds"
+			fi
+			[ "$waited" -gt "$SLIPS_EXPECTED_STARTUP" ] && phase="still loading (longer than usual)"
+			_slips_bar "$waited" 0 "$phase"
+			sleep 1
+			waited=$((waited + 1))
+		else
+			sleep 5
+			waited=$((waited + 5))
+		fi
 	done
+	[ "$tty" = 1 ] && printf '\n'
 	echo "slips did not report readiness within ${timeout}s" >&2
 	return 1
 }

@@ -46,8 +46,16 @@ usage() {
 	EOF
 }
 
-lab_is_up()    { [[ -f "$LAB_STATE" ]]; }
-netns_exists() { ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$NS"; }
+lab_is_up() { [[ -f "$LAB_STATE" ]]; }
+
+# Takes the namespace to look for rather than assuming the compiled-in default: the
+# question is whether *this session's* namespace is alive, and a session may have
+# recorded a different one. Checking the default would report a live lab on the strength
+# of a namespace that has nothing to do with the recorded session.
+netns_exists() {
+	local ns="${1:-$NS}"
+	ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$ns"
+}
 
 # ---------------------------------------------------------------------------
 # up
@@ -83,20 +91,24 @@ lab_up() {
 	# did land — a state file written at the end would be missing precisely when a
 	# failure made it necessary.
 	local lab_stamp; lab_stamp=$(date -u +%Y%m%d%H%M%S)
+	# Every value is quoted. This file is sourced, and the repo path contains a space
+	# ("PDE Sources"), so an unquoted LAB_SLIPS_OUT parses as an assignment followed by
+	# a command — bash then reports "Sources/output/...: No such file or directory" from
+	# a file that merely looks like configuration.
 	cat > "$LAB_STATE" <<-EOF
 	# PDE lab session state. Written by lab.sh up; consumed by lab.sh down and by
 	# simulate-firewall.sh. Deleting this by hand orphans the firewall changes.
-	LAB_STAMP=$lab_stamp
-	LAB_STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-	LAB_WITH_IDS=$WITH_IDS
-	LAB_USERS=$USERS
-	LAB_ORIG_ENABLED=$orig_enabled
-	LAB_ORIG_LOGLEVEL=$orig_loglevel
-	LAB_NS=$NS
-	LAB_VETH_HOST=$VETH_HOST
-	LAB_SUBNET=$SUBNET
-	LAB_HOST_IP=$HOST_IP
-	LAB_SLIPS_OUT=$PDE_ROOT/output/ids-session-$lab_stamp
+	LAB_STAMP="$lab_stamp"
+	LAB_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	LAB_WITH_IDS="$WITH_IDS"
+	LAB_USERS="$USERS"
+	LAB_ORIG_ENABLED="$orig_enabled"
+	LAB_ORIG_LOGLEVEL="$orig_loglevel"
+	LAB_NS="$NS"
+	LAB_VETH_HOST="$VETH_HOST"
+	LAB_SUBNET="$SUBNET"
+	LAB_HOST_IP="$HOST_IP"
+	LAB_SLIPS_OUT="$PDE_ROOT/output/ids-session-$lab_stamp"
 	EOF
 	log "state recorded in $LAB_STATE (ufw was ENABLED=$orig_enabled LOGLEVEL=$orig_loglevel)"
 
@@ -169,8 +181,17 @@ lab_up() {
 lab_down() {
 	[[ $EUID -eq 0 ]] || die "must run as root"
 	lab_is_up || die "no lab session recorded ($LAB_STATE missing)"
-	# shellcheck source=/dev/null
-	source "$LAB_STATE"
+
+	# Parsed, not sourced — see lab_get. Everything below also tolerates a missing or
+	# damaged value and falls back to the compiled-in default, because a half-written
+	# state file must still be enough to put the firewall back.
+	local LAB_WITH_IDS LAB_NS LAB_VETH_HOST LAB_ORIG_ENABLED LAB_ORIG_LOGLEVEL LAB_SLIPS_OUT
+	LAB_WITH_IDS=$(lab_get LAB_WITH_IDS 0)
+	LAB_NS=$(lab_get LAB_NS "$NS")
+	LAB_VETH_HOST=$(lab_get LAB_VETH_HOST "$VETH_HOST")
+	LAB_ORIG_ENABLED=$(lab_get LAB_ORIG_ENABLED no)
+	LAB_ORIG_LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL low)
+	LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
 
 	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" ]]; then
 		# shellcheck source=IDS/slips-lib.sh
@@ -217,14 +238,15 @@ lab_status() {
 		return 0
 	fi
 
-	# shellcheck source=/dev/null
-	source "$LAB_STATE"
-	if netns_exists; then
-		echo "lab: UP since ${LAB_STARTED_UTC:-?}"
-		echo "  namespace   ${LAB_NS:-?} (${LAB_USERS:-?} users)"
+	local started ns
+	started=$(lab_get LAB_STARTED_UTC "?")
+	ns=$(lab_get LAB_NS "$NS")
+	if netns_exists "$ns"; then
+		echo "lab: UP since $started"
+		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
 		echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
-		echo "  ids         $([[ "${LAB_WITH_IDS:-0}" -eq 1 ]] && echo "slips on ${LAB_VETH_HOST:-?}" || echo "not running")"
-		echo "  restores to ENABLED=${LAB_ORIG_ENABLED:-?} LOGLEVEL=${LAB_ORIG_LOGLEVEL:-?}"
+		echo "  ids         $([[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && echo "slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")" || echo "not running")"
+		echo "  restores to ENABLED=$(lab_get LAB_ORIG_ENABLED "?") LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL "?")"
 		return 0
 	fi
 
@@ -233,7 +255,7 @@ lab_status() {
 	# comes back up on boot still carrying the test rules, with nothing running that
 	# would put it back.
 	echo "lab: STALE"
-	echo "  A session was recorded at ${LAB_STARTED_UTC:-?} but its namespace is gone,"
+	echo "  A session was recorded at $started but its namespace is gone,"
 	echo "  most likely a reboot or 'wsl --shutdown'."
 	echo
 	echo "  Your firewall may still be enabled with the test rules on it."

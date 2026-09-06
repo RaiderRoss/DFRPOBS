@@ -50,11 +50,22 @@ source "$PDE_ROOT/lab-config.sh"
 # a firewall it did not configure. With no lab up it does the whole thing itself, which
 # keeps the one-shot path — and its exit trap — exactly as it was.
 LAB_MODE=0
+LAB_WITH_IDS=0
+LAB_SLIPS_OUT=""
+LAB_USERS=0
+LAB_STARTED_UTC=""
+LAB_NS="$NS"
+LAB_VETH_HOST="$VETH_HOST"
 if [[ -f "$LAB_STATE" ]]; then
-	# shellcheck source=/dev/null
-	source "$LAB_STATE"
-	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${LAB_NS:-$NS}"; then
+	# Parsed rather than sourced — see lab_get in lab-config.sh.
+	LAB_NS=$(lab_get LAB_NS "$NS")
+	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$LAB_NS"; then
 		LAB_MODE=1
+		LAB_WITH_IDS=$(lab_get LAB_WITH_IDS 0)
+		LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
+		LAB_USERS=$(lab_get LAB_USERS 0)
+		LAB_STARTED_UTC=$(lab_get LAB_STARTED_UTC "?")
+		LAB_VETH_HOST=$(lab_get LAB_VETH_HOST "$VETH_HOST")
 	fi
 fi
 

@@ -19,6 +19,20 @@
 LAB_DIR="${LAB_DIR:-$PDE_ROOT/.lab}"
 LAB_STATE="$LAB_DIR/state.env"
 
+# Reads one field out of the state file by parsing it, never by sourcing it.
+#
+# Sourcing puts the recovery path at the mercy of the file it is trying to recover from:
+# one malformed line makes `source` return non-zero, `set -e` aborts, and the firewall
+# stays modified — the failure takes out the only thing that could undo it. Parsing
+# cannot fail that way, and cannot execute anything either.
+#
+#   lab_get <KEY> [default]
+lab_get() {
+	local v
+	v=$(grep -E "^$1=" "$LAB_STATE" 2>/dev/null | head -1 | cut -d= -f2- | sed 's/^"//; s/"$//')
+	printf '%s' "${v:-${2:-}}"
+}
+
 # Test subnet. Deliberately not a range anything else on this host uses, so extraction
 # can separate simulated traffic from whatever else the firewall happens to log.
 SUBNET="10.99.0.0/24"

@@ -18,7 +18,10 @@ FW_DIR="$SCRIPT_DIR/Firewall"
 FW_SCRIPT="$FW_DIR/simulate-firewall.sh"
 FW_GEN="$FW_DIR/generate_traffic.py"
 LAB_SH="$SCRIPT_DIR/lab.sh"
-LAB_STATE_FILE="$SCRIPT_DIR/.lab/state.env"
+# Honours a LAB_DIR override the same way lab-config.sh does, so tests can point the
+# whole lifecycle at a scratch directory instead of the real session state — which holds
+# a live backup of the machine's firewall rules and must never be a test fixture.
+LAB_STATE_FILE="${LAB_DIR:-$SCRIPT_DIR/.lab}/state.env"
 CONFIG_FILE="${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}"
 
 # ---- scenario defaults ---------------------------------------
@@ -67,15 +70,20 @@ kv()   { printf '    %s%-28s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
 #         still be carrying the test rules, and nothing is running that would undo it.
 lab_state() {
 	[ -f "$LAB_STATE_FILE" ] || { echo down; return; }
-	local ns
-	ns=$(grep -E '^LAB_NS=' "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2)
+	# Via lab_field, not a private grep: values are quoted, and reading LAB_NS as
+	# `"pde-fw"` fails to match the namespace and reports a live lab as stale.
+	local ns; ns="$(lab_field LAB_NS)"
 	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${ns:-pde-fw}"; then
 		echo up
 	else
 		echo stale
 	fi
 }
-lab_field() { grep -E "^$1=" "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2-; }
+# Values in the state file are quoted, so strip the surrounding quotes rather than
+# printing them back to the user.
+lab_field() {
+	grep -E "^$1=" "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//'
+}
 
 ufw_enabled()  { grep -E '^ENABLED='  /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
 ufw_loglevel() { grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
@@ -775,11 +783,19 @@ case "$(lab_state)" in
 		dim "  Its namespace is gone, but ufw.service is enabled — your firewall has most"
 		dim "  likely come back up still carrying the test rules from that session."
 		echo
-		printf '  %srestore the firewall now? [Y/n]>%s ' "$C_TITLE" "$R"; read -r _r
-		case "$_r" in
-			n|N) dim "  left as is — option 1 can recover it later" ;;
-			*)   sudo_run "$LAB_SH" down || err "recovery failed; run: sudo $LAB_SH down" ;;
-		esac
+		printf '  %srestore the firewall now? [Y/n]>%s ' "$C_TITLE" "$R"
+		# `read` failing means EOF, not consent. Letting an empty variable fall through
+		# to the default would run a privileged command on nobody's say-so — which,
+		# piped, hangs forever on a sudo password prompt that has no terminal to
+		# answer it.
+		if read -r _r; then
+			case "$_r" in
+				n|N) dim "  left as is — option 1 can recover it later" ;;
+				*)   sudo_run "$LAB_SH" down || err "recovery failed; run: sudo $LAB_SH down" ;;
+			esac
+		else
+			dim "  no input — left as is. Recover with: sudo $LAB_SH down"
+		fi
 		echo
 		;;
 	up)
