@@ -149,6 +149,14 @@ if [[ $LAB_MODE -eq 1 ]]; then
 	WITH_IDS="${LAB_WITH_IDS:-0}"
 	SLIPS_OUT="${LAB_SLIPS_OUT:-}"
 
+	# An empty path here would not fail: slips_alerts_offset would report 0 and
+	# slips_collect would read a file that does not exist, producing an empty evidence
+	# file and a group manifest claiming the IDS found nothing. Silence that looks like
+	# a result is the worst outcome available, so refuse instead.
+	if [[ $WITH_IDS -eq 1 && -z "$SLIPS_OUT" ]]; then
+		die "the lab records an IDS but no output directory; './lab.sh down' and start it again"
+	fi
+
 	# The lab created a fixed set of addresses in the namespace. Asking for more users
 	# than exist would bind to addresses that are not there, and the failure would look
 	# like a traffic problem rather than a configuration one.
@@ -400,7 +408,10 @@ OUT_LOG="$OUTDIR/firewall_${STAMP}.log"
 MANIFEST="$OUTDIR/firewall_${STAMP}.manifest.json"
 
 log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PCT}% malicious, profile=${ATTACK_PROFILE}"
-ip netns exec "$NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
+# $LAB_NS, not $NS: under a lab the namespace is whichever one that session recorded,
+# and defaulting to the compiled-in name would run the traffic somewhere else entirely.
+# They coincide today, which is exactly why this would go unnoticed until they did not.
+ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--users "$USERS_CSV" \
 	--malicious-users "$MALICIOUS_CSV" \
 	--target "$HOST_IP" \
@@ -560,7 +571,14 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	read -r IDS_TOTAL IDS_KEPT <<< "$IDS_COUNTS" || true
 	IDS_TOTAL=${IDS_TOTAL:-0}
 	IDS_KEPT=${IDS_KEPT:-0}
+	# Must be exactly five numbers: the group manifest unpacks them positionally, and a
+	# short read there is a ValueError that would lose the whole manifest after the
+	# evidence has already been collected.
 	IDS_SEVERITIES=$(slips_severity_counts "$IDS_LOG")
+	if [[ $(printf '%s\n' $IDS_SEVERITIES | grep -c .) -ne 5 ]]; then
+		echo "warning: severity counts unreadable ('$IDS_SEVERITIES'); recording zeros" >&2
+		IDS_SEVERITIES="0 0 0 0 0"
+	fi
 	IDS_SHA=$(sha256sum "$IDS_LOG" | cut -d' ' -f1)
 	chmod 444 "$IDS_LOG"
 	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} findings fall inside the window"

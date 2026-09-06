@@ -18,11 +18,17 @@ FW_DIR="$SCRIPT_DIR/Firewall"
 FW_SCRIPT="$FW_DIR/simulate-firewall.sh"
 FW_GEN="$FW_DIR/generate_traffic.py"
 LAB_SH="$SCRIPT_DIR/lab.sh"
-# Honours a LAB_DIR override the same way lab-config.sh does, so tests can point the
-# whole lifecycle at a scratch directory instead of the real session state — which holds
-# a live backup of the machine's firewall rules and must never be a test fixture.
-LAB_STATE_FILE="${LAB_DIR:-$SCRIPT_DIR/.lab}/state.env"
 CONFIG_FILE="${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}"
+
+# Topology, port lists, lab paths and lab_get all come from the one shared file — the
+# same one lab.sh and simulate-firewall.sh read. The console previously restated the
+# subnet and the port lists locally, and they drifted: the event-plan preview was still
+# describing a 14-port sweep after the real list grew to 35, so it showed the operator a
+# histogram for a run that would not happen. A preview that disagrees with the capture is
+# worse than no preview.
+PDE_ROOT="$SCRIPT_DIR"
+# shellcheck source=lab-config.sh
+source "$SCRIPT_DIR/lab-config.sh"
 
 # ---- scenario defaults ---------------------------------------
 USERS=10
@@ -69,20 +75,16 @@ kv()   { printf '    %s%-28s%s %s\n' "$C_DIM" "$1" "$R" "$2"; }
 # stale — a session was recorded but its namespace is gone (reboot). The firewall may
 #         still be carrying the test rules, and nothing is running that would undo it.
 lab_state() {
-	[ -f "$LAB_STATE_FILE" ] || { echo down; return; }
-	# Via lab_field, not a private grep: values are quoted, and reading LAB_NS as
-	# `"pde-fw"` fails to match the namespace and reports a live lab as stale.
-	local ns; ns="$(lab_field LAB_NS)"
-	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "${ns:-pde-fw}"; then
+	[ -f "$LAB_STATE" ] || { echo down; return; }
+	# Via lab_get from lab-config.sh, not a private grep: values are quoted, and reading
+	# LAB_NS as `"pde-fw"` fails to match the namespace and reports a live lab as stale.
+	# One reader for the state file, shared with lab.sh, so that cannot diverge either.
+	local ns; ns="$(lab_get LAB_NS "$NS")"
+	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$ns"; then
 		echo up
 	else
 		echo stale
 	fi
-}
-# Values in the state file are quoted, so strip the surrounding quotes rather than
-# printing them back to the user.
-lab_field() {
-	grep -E "^$1=" "$LAB_STATE_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^"//; s/"$//'
 }
 
 ufw_enabled()  { grep -E '^ENABLED='  /etc/ufw/ufw.conf 2>/dev/null | cut -d= -f2; }
@@ -121,7 +123,7 @@ banner() {
 
 	local lab; lab="$(lab_state)"
 	case "$lab" in
-		up)    printf '  %s\n' "${C_OK}● LAB UP${R}  ${C_DIM}since $(lab_field LAB_STARTED_UTC)   ufw carrying test rules   $([ "$(lab_field LAB_WITH_IDS)" = "1" ] && echo "slips running" || echo "no ids")${R}" ;;
+		up)    printf '  %s\n' "${C_OK}● LAB UP${R}  ${C_DIM}since $(lab_get LAB_STARTED_UTC)   ufw carrying test rules   $([ "$(lab_get LAB_WITH_IDS)" = "1" ] && echo "slips running" || echo "no ids")${R}" ;;
 		stale) printf '  %s\n' "${C_ERR}● LAB STALE${R}  ${C_DIM}session did not survive; your firewall may still be modified — option 1 to recover${R}" ;;
 		*)     printf '  %s\n' "${C_DIM}○ lab down   the host is untouched${R}" ;;
 	esac
@@ -246,7 +248,27 @@ configure_menu() {
 		printf '  %s4%s  Malicious share  %s%-7s%s %spercentage of EVENTS that are malicious%s\n'               "$C_NUM" "$R" "$C_KEY" "${MALICIOUS_PCT}%" "$R" "$C_DIM" "$R"
 		printf '  %s5%s  Attackers        %s%-7s%s %show many USERS attack — a separate knob from 4%s\n'        "$C_NUM" "$R" "$C_KEY" "$MALICIOUS_USERS" "$R" "$C_DIM" "$R"
 		printf '  %s6%s  Seed             %s%-7s%s %ssame seed, same run — keep it for reproducibility%s\n'     "$C_NUM" "$R" "$C_KEY" "$SEED" "$R" "$C_DIM" "$R"
-		echo
+
+		# Every user cannot be an attacker: the run needs a benign baseline to contrast
+		# against, and the simulator refuses. Said here, at the point of setting it,
+		# rather than at the point of capture.
+		if [ "$MALICIOUS_USERS" -ge "$USERS" ] 2>/dev/null; then
+			echo
+			warn "Attackers (${MALICIOUS_USERS}) must be fewer than users (${USERS})."
+			dim "    A capture needs benign traffic to contrast the attack against, so"
+			dim "    the simulator will refuse this. Lower 5, or raise 1."
+		fi
+
+		# Users is the one knob here that a running session has already committed to.
+		if [ "$(lab_state)" = "up" ]; then
+			local lab_users; lab_users="$(lab_get LAB_USERS 0)"
+			if [ "$USERS" -gt "${lab_users:-0}" ]; then
+				echo
+				warn "The running sources have only ${lab_users} user addresses."
+				dim "    They are created at start-up, so a capture cannot use more than that."
+				dim "    Restart the sources (option 1 → 2) to apply ${USERS}."
+			fi
+		fi
 		echo
 		# Whether the IDS runs at all is a question about sources, and lives on the
 		# sources screen. It used to be togglable here too, which left one setting with
@@ -291,16 +313,22 @@ preview_plan() {
 	head_ "Event plan for '$ATTACK_PROFILE'"
 	dim "  Built from seed $SEED. No packets are sent and nothing is changed."
 	echo
+	# Addresses and ports come from lab-config.sh, the same values the capture uses.
+	# Restating them here is what made this preview describe a different run.
 	local ips="" mal="" i
-	for i in $(seq 1 "$USERS"); do ips="${ips}${ips:+,}10.99.0.$((10 + i))"; done
-	for i in $(seq 0 $((MALICIOUS_USERS - 1))); do mal="${mal}${mal:+,}10.99.0.$((10 + USERS - i))"; done
+	for i in $(seq 1 "$USERS"); do
+		ips="${ips}${ips:+,}${USER_IP_BASE}$((USER_IP_OFFSET + i))"
+	done
+	for i in $(seq 0 $((MALICIOUS_USERS - 1))); do
+		mal="${mal}${mal:+,}${USER_IP_BASE}$((USER_IP_OFFSET + USERS - i))"
+	done
 
 	python3 "$FW_GEN" --plan-only \
-		--users "$ips" --malicious-users "$mal" --target 10.99.0.1 \
+		--users "$ips" --malicious-users "$mal" --target "$HOST_IP" \
 		--duration "$DURATION" --rate "$RATE" --malicious-pct "$MALICIOUS_PCT" \
 		--attack-profile "$ATTACK_PROFILE" \
-		--benign-ports 80,443,8080 \
-		--malicious-ports 21,22,23,135,139,445,1433,3306,3389,5432,5900,6379,9200,27017 \
+		--benign-ports "$BENIGN_PORTS" \
+		--malicious-ports "$MALICIOUS_PORTS" \
 		--seed "$SEED" --out /dev/null 2>&1 \
 	| python3 -c 'import json,sys
 d = json.load(sys.stdin)
@@ -349,19 +377,53 @@ run_capture() {
 	kv ""          "$(profile_signature "$ATTACK_PROFILE")"
 	kv "malicious" "${MALICIOUS_PCT}% of events"
 	echo
-	if [ "$WITH_IDS" = "1" ]; then
-		dim "    Slips attaches to the veth before the window opens and keeps running"
-		dim "    ${IDS_DRAIN}s past it, so both sources describe the same packets. Expect roughly"
-		dim "    $(( 60 + DURATION + IDS_DRAIN ))s in total — most of it Slips loading its modules."
+	# What this costs and what it touches both depend on whether the sources are already
+	# standing. Saying "this enables ufw" while a lab has it enabled already is simply
+	# untrue, and quoting Slips' start-up time when Slips is running overstates the wait
+	# by about a minute.
+	local state; state="$(lab_state)"
+	if [ "$state" = "up" ]; then
+		if [ "$(lab_get LAB_WITH_IDS 0)" = "1" ]; then
+			dim "    Slips is already reading the veth, so both sources see this window."
+			dim "    Expect about $(( DURATION + IDS_DRAIN ))s: the window, then ${IDS_DRAIN}s for Slips to"
+			dim "    raise evidence for it."
+		else
+			dim "    Expect about ${DURATION}s."
+		fi
 		echo
+		dim "    The sources are already running and stay running. This reads a window"
+		dim "    against them — it does not change your firewall, which the lab already"
+		dim "    configured and will restore when you stop it."
+	else
+		if [ "$WITH_IDS" = "1" ]; then
+			dim "    Slips attaches to the veth before the window opens and keeps running"
+			dim "    ${IDS_DRAIN}s past it, so both sources describe the same packets. Expect roughly"
+			dim "    $(( 60 + DURATION + IDS_DRAIN ))s in total — most of it Slips loading its modules."
+			echo
+		fi
+		warn "This enables ufw and modifies the host firewall for ${DURATION}s."
+		dim "    Your ruleset, ENABLED and LOGLEVEL are snapshotted and restored on exit,"
+		dim "    including on Ctrl-C. Option 5 shows the exact changes first."
+		if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+			local c; c=$(docker ps -q 2>/dev/null | wc -l)
+			[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while it is active."
+		fi
 	fi
-	warn "This enables ufw and modifies the host firewall for ${DURATION}s."
-	dim "    Your ruleset, ENABLED and LOGLEVEL are snapshotted and restored on exit,"
-	dim "    including on Ctrl-C. Option 4 shows the exact changes first."
-	if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-		local c; c=$(docker ps -q 2>/dev/null | wc -l)
-		[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while it is active."
+	# The namespace addresses are created when the sources start, so Users is fixed for
+	# the life of a session. Caught here, where it can be explained, rather than letting
+	# the simulator die part-way through with an error that reads like a traffic fault.
+	if [ "$state" = "up" ]; then
+		local lab_users; lab_users="$(lab_get LAB_USERS 0)"
+		if [ "$USERS" -gt "${lab_users:-0}" ]; then
+			echo
+			err "The running sources have ${lab_users} user addresses; the scenario asks for ${USERS}."
+			dim "    Addresses are created when the sources start, so this needs a restart:"
+			dim "    option 1 → 2. Or set Users back to ${lab_users} under option 4."
+			pause
+			return
+		fi
 	fi
+
 	echo
 	printf '  %sproceed? [y/N]>%s ' "$C_TITLE" "$R"; read -r go
 	case "$go" in
@@ -384,7 +446,7 @@ run_capture() {
 		"$FW_SCRIPT" "${args[@]}" || rc=$?
 	fi
 	echo
-	if [ "$rc" -eq 0 ]; then ok "capture complete — option 6 reads it back"
+	if [ "$rc" -eq 0 ]; then ok "capture complete — option 7 reads it back"
 	else err "the simulator exited with status $rc"; fi
 	pause
 }
@@ -394,7 +456,7 @@ require_run() {
 	if ! latest_run >/dev/null 2>&1; then
 		banner
 		head_ "Nothing captured yet"
-		dim "  Option 1 runs a capture."
+		dim "  Option 2 runs a capture."
 		pause
 		return 1
 	fi
@@ -617,7 +679,14 @@ on_exit() {
 	if [ "$LAB_OWNED" = "1" ] && [ "$(lab_state)" = "up" ]; then
 		printf '\n'
 		dim "stopping sources and restoring the firewall..."
-		sudo_run "$LAB_SH" down >/dev/null 2>&1 || \
+		# stderr is NOT redirected. sudo writes its password prompt there, and hiding it
+		# turns "type your password" into a console that appears to hang with no
+		# explanation — the sudo timestamp can easily have expired during a long session.
+		# Warn first if a password is going to be needed, so the prompt is expected.
+		if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+			dim "sudo needs your password to restore the firewall:"
+		fi
+		sudo_run "$LAB_SH" down >/dev/null || \
 			err "could not stop the sources — run: sudo $LAB_SH down"
 	fi
 }
@@ -631,7 +700,7 @@ sources_menu() {
 		dim "  a capture is a window read against them."
 		echo
 		local state; state="$(lab_state)"
-		local running_ids; running_ids="$(lab_field LAB_WITH_IDS)"
+		local running_ids; running_ids="$(lab_get LAB_WITH_IDS)"
 
 		printf '  %s%-12s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
 		if [ "$state" = "up" ]; then
@@ -679,7 +748,7 @@ sources_menu() {
 				# Naming the values it returns to, rather than saying "restores your
 				# firewall" and leaving the reader to wonder what that means.
 				printf '  %s3%s  Stop sources             %s(ufw back to ENABLED=%s LOGLEVEL=%s)%s\n' \
-					"$C_NUM" "$R" "$C_DIM" "$(lab_field LAB_ORIG_ENABLED)" "$(lab_field LAB_ORIG_LOGLEVEL)" "$R"
+					"$C_NUM" "$R" "$C_DIM" "$(lab_get LAB_ORIG_ENABLED)" "$(lab_get LAB_ORIG_LOGLEVEL)" "$R"
 				;;
 			stale) printf '  %s2%s  %sRecover stale session%s %s(put the firewall back)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
 			*)     printf '  %s2%s  Start sources\n' "$C_NUM" "$R" ;;
@@ -825,18 +894,26 @@ case "$(lab_state)" in
 		dim "  Its namespace is gone, but ufw.service is enabled — your firewall has most"
 		dim "  likely come back up still carrying the test rules from that session."
 		echo
-		printf '  %srestore the firewall now? [Y/n]>%s ' "$C_TITLE" "$R"
-		# `read` failing means EOF, not consent. Letting an empty variable fall through
-		# to the default would run a privileged command on nobody's say-so — which,
-		# piped, hangs forever on a sudo password prompt that has no terminal to
-		# answer it.
-		if read -r _r; then
-			case "$_r" in
-				n|N) dim "  left as is — option 1 can recover it later" ;;
-				*)   sudo_run "$LAB_SH" down || err "recovery failed; run: sudo $LAB_SH down" ;;
-			esac
+		if [ "$AUTO_LAB" = "0" ]; then
+			# --no-lab is a promise not to touch the firewall or ask for sudo. Reporting
+			# the stale session is useful; reaching for root behind that flag is not.
+			dim "  --no-lab, so nothing has been changed. Recover when you are ready with:"
+			dim "    sudo $LAB_SH down"
+			sleep 2
 		else
-			dim "  no input — left as is. Recover with: sudo $LAB_SH down"
+			printf '  %srestore the firewall now? [Y/n]>%s ' "$C_TITLE" "$R"
+			# `read` failing means EOF, not consent. Letting an empty variable fall
+			# through to the default would run a privileged command on nobody's say-so
+			# — which, piped, hangs forever on a sudo password prompt that has no
+			# terminal to answer it.
+			if read -r _r; then
+				case "$_r" in
+					n|N) dim "  left as is — option 1 can recover it later" ;;
+					*)   sudo_run "$LAB_SH" down || err "recovery failed; run: sudo $LAB_SH down" ;;
+				esac
+			else
+				dim "  no input — left as is. Recover with: sudo $LAB_SH down"
+			fi
 		fi
 		echo
 		;;
