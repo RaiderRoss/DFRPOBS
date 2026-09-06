@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { hasCredentials, repositoryApi, setCredentials, clearCredentials, type TriggerEvent, type WorkGroup } from '../api/api'
 
 function formatDate(value: string) {
@@ -64,7 +65,7 @@ function TriggerEvents() {
         </article>
         <aside className="panel detail-panel">
             <p className="panel-label">GET /by-external-id</p><h2>Resolve a source event</h2><p className="panel-copy">External identifiers are unique only within their source system.</p>
-            <form className="lookup-form" onSubmit={resolve}><input required placeholder="Source system" value={lookup.sourceSystem} onChange={(event) => setLookup({ ...lookup, sourceSystem: event.target.value })} /><input required placeholder="External event ID" value={lookup.externalEventId} onChange={(event) => setLookup({ ...lookup, externalEventId: event.target.value })} /><button className="action primary" type="submit">Resolve event</button></form>
+            <form className="lookup-form source-lookup-form" onSubmit={resolve}><input required placeholder="Source system" value={lookup.sourceSystem} onChange={(event) => setLookup({ ...lookup, sourceSystem: event.target.value })} /><input required placeholder="External event ID" value={lookup.externalEventId} onChange={(event) => setLookup({ ...lookup, externalEventId: event.target.value })} /><button className="action primary" type="submit">Resolve event</button></form>
             {selected && <div className="detail-block"><span className="detail-kicker">Selected record</span><strong>{selected.triggerType}</strong><dl><dt>Repository ID</dt><dd>{selected.id}</dd><dt>Fired</dt><dd>{formatDate(selected.firedAt)}</dd><dt>Received</dt><dd>{formatDate(selected.receivedAt)}</dd><dt>SHA-256</dt><dd><code>{selected.payloadSha256}</code></dd></dl></div>}
         </aside>
     </section>
@@ -85,15 +86,15 @@ function WorkGroups() {
         catch (exception) { setMessage(exception instanceof Error ? exception.message : 'Work group could not be created.') }
     }
 
-    return <section className="workspace-grid">
+    return <section className="workspace-grid work-groups-grid">
         <article className="panel wide-panel"><div className="panel-header"><div><p className="panel-label">GET /api/work-groups</p><h2>Classification catalogue</h2></div><span className="chip">{groups.length} loaded</span></div><div className="toolbar"><input aria-label="Filter by classification code" placeholder="Filter classification code" value={filter} onChange={(event) => setFilter(event.target.value)} /><button className="action" type="button" onClick={() => void load()}>Refresh</button></div><div className="group-list">{groups.map((group) => <article className="group-row" key={group.id}><div><strong>{group.name}</strong><span>{group.classificationCode}</span></div><small>Created {formatDate(group.createdAt)}</small><button className="text-button" type="button" onClick={() => void repositoryApi.getWorkGroup(group.id).then((item) => setMessage(`${item.name} / ${item.classificationCode}`))}>Inspect</button></article>)}</div></article>
-        <aside className="panel detail-panel"><p className="panel-label">POST /api/work-groups</p><h2>Create a classification</h2><p className="panel-copy">The server assigns the ID and creation timestamp. Codes use SCREAMING_SNAKE_CASE.</p><form className="lookup-form" onSubmit={create}><input required placeholder="Human-readable name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /><input required pattern="[A-Z0-9]+(_[A-Z0-9]+)*" placeholder="CLASSIFICATION_CODE" value={form.classificationCode} onChange={(event) => setForm({ ...form, classificationCode: event.target.value })} /><button className="action primary" type="submit">Create work group</button></form>{message && <p className="form-message">{message}</p>}</aside>
+        <aside className="panel detail-panel"><p className="panel-label">POST /api/work-groups</p><h2>Create a classification</h2><p className="panel-copy">The server assigns the ID and creation timestamp. Codes use SCREAMING_SNAKE_CASE.</p><form className="lookup-form classification-form" onSubmit={create}><input required placeholder="Human-readable name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /><input required pattern="[A-Z0-9]+(_[A-Z0-9]+)*" placeholder="CLASSIFICATION_CODE" value={form.classificationCode} onChange={(event) => setForm({ ...form, classificationCode: event.target.value })} /><button className="action primary" type="submit">Create work group</button></form>{message && <p className="form-message">{message}</p>}</aside>
     </section>
 }
 
 export default function RepositoryPage() {
     const [connected, setConnected] = useState(hasCredentials())
-    const path = window.location.pathname
+    const { pathname: path } = useLocation()
     if (!connected) return <AuthPanel onAuthenticated={() => setConnected(true)} />
     return <>{path === '/work-groups' ? <WorkGroups /> : path === '/trigger-events' ? <TriggerEvents /> : <Overview connected onDisconnect={() => { clearCredentials(); setConnected(false) }} />}</>
 }

@@ -91,7 +91,7 @@ p {
 h1 {
   max-width: 720px;
   margin-bottom: 16px;
-  font-size: clamp(2.4rem, 5vw, 4.8rem);
+  font-size: clamp(0.5rem, 2vw, 4rem);
   line-height: 0.98;
   letter-spacing: -0.045em;
 }
@@ -186,6 +186,10 @@ h2 {
 
 .workspace-grid {
   grid-template-columns: minmax(0, 1.65fr) minmax(300px, 0.8fr);
+}
+
+.work-groups-grid {
+  grid-template-columns: minmax(0, 1.45fr) minmax(340px, 0.9fr);
 }
 
 .panel {
@@ -387,6 +391,30 @@ code {
   align-self: start;
 }
 
+.source-lookup-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 26px;
+}
+
+.source-lookup-form .action {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
+.classification-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 26px;
+}
+
+.classification-form .action {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+
 .detail-block {
   margin-top: 24px;
   padding-top: 18px;
@@ -464,6 +492,7 @@ dd {
 }
 
 @media (max-width: 900px) {
+
   .topbar,
   .overview-grid,
   .workspace-grid {
@@ -491,7 +520,7 @@ dd {
   }
 
   h1 {
-    font-size: clamp(2.2rem, 12vw, 3.5rem);
+    font-size: clamp(2rem, 4vw, 4rem);
   }
 
   .tab-bar {
@@ -509,6 +538,24 @@ dd {
   .toolbar,
   .lookup-form {
     flex-direction: column;
+  }
+
+  .source-lookup-form {
+    grid-template-columns: 1fr;
+  }
+
+  .source-lookup-form .action {
+    grid-column: auto;
+    justify-self: stretch;
+  }
+
+  .classification-form {
+    grid-template-columns: 1fr;
+  }
+
+  .classification-form .action {
+    grid-column: auto;
+    justify-self: stretch;
   }
 
   .group-row {
