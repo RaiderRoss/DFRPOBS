@@ -162,7 +162,7 @@ banner() {
 # the menu has to stay instant, and this is what the log actually shows.
 profile_signature() {
 	case "$1" in
-		port-scan)   printf 'one SRC, many different DPTs — a wide BLOCK fan-out' ;;
+		port-scan)   printf 'VERTICAL: one target, many ports — down the port list' ;;
 		brute-force) printf 'one SRC, one DPT, many SPTs — repeated BLOCKs on 22' ;;
 		db-probe)    printf 'database ports only — narrow and deliberate' ;;
 		stealth)     printf 'evenly spaced, maximal gaps — slips rate thresholds' ;;

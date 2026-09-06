@@ -67,12 +67,18 @@ attacker reaches for and how attempts are spread in time:
 
 | Profile | Shape in the log |
 |---|---|
-| `port-scan` | one SRC, many different DPTs — a wide BLOCK fan-out |
+| `port-scan` | **vertical scan** — one target, many ports, down the port list |
 | `brute-force` | one SRC, one DPT, many SPTs — repeated BLOCKs on 22 |
-| `db-probe` | database ports only — narrow and deliberate |
-| `stealth` | evenly spaced, maximal gaps — slips rate thresholds |
+| `db-probe` | a narrow vertical scan: database ports only, deliberate |
+| `stealth` | evenly spaced, maximal gaps — under rate thresholds |
 | `syn-burst` | every attempt in one short spike against one port |
 | `mixed` | sweep first, then sustained pressure on a single port |
+
+All six are **vertical** in shape, because every simulated user targets the single host
+`10.99.0.1`. A **horizontal** scan is the other axis — one port swept across many hosts —
+and needs several addresses on the host side of the veth, which the current topology does
+not have. Slips detects both, and horizontal is one of its more reliable signatures, so
+it is worth adding when the correlation needs to be richer.
 
 Option **6** prints the port histogram for the selected profile without sending
 anything, so you can compare shapes before committing one to the dataset.

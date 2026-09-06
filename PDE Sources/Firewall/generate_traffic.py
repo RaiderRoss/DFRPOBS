@@ -28,8 +28,10 @@ from datetime import datetime, timezone
 # distinguishable shape in the resulting log — which is the point, since a firewall log
 # has no "malicious" column and detection has only the pattern to work with.
 ATTACK_PROFILES = {
-    "port-scan": "Wide sweep across many denied ports. The classic reconnaissance "
-                 "signature: one SRC, many different DPTs, spread evenly over the window.",
+    "port-scan": "A VERTICAL scan: one target host, many denied ports, spread over the "
+                 "window. Vertical means down the port list of a single machine; a "
+                 "horizontal scan is the other axis — one port across many hosts — and "
+                 "is not reachable here, because every simulated user targets one host.",
     "brute-force": "Repeated attempts against a single authentication port. One SRC, one "
                    "DPT, many distinct SPTs — credential stuffing as seen from the network.",
     "db-probe": "Database ports only (1433/3306/5432/6379/27017). Narrow and deliberate: "
