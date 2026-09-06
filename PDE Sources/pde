@@ -337,11 +337,24 @@ print("    %-20s %s" % ("malicious", d["malicious_events"]))
 print("    %-20s %s" % ("benign", d["benign_events"]))
 h = d["malicious_port_histogram"]
 if h:
+    top, low = max(h.values()), min(h.values())
     print()
-    print("    malicious attempts by destination port:")
-    top = max(h.values())
-    for p, n in sorted(h.items(), key=lambda kv: -kv[1]):
-        print("      %-7s %-4s %s" % (p, n, "#" * max(1, int(n * 34 / top))))'
+    print("    %-20s %s" % ("distinct ports hit", len(h)))
+    print("    %-20s %s" % ("attempts per port", low if low == top else "%s-%s" % (low, top)))
+    # A vertical scan spread evenly gives every port the same count, and a bar chart of
+    # 35 identical full-width bars says nothing at all. The flatness IS the signature,
+    # so name it; draw bars only when there is a shape to see.
+    if top == low:
+        print()
+        print("    Every port hit the same number of times — an even sweep, which is")
+        print("    what makes this a vertical scan rather than pressure on one service.")
+    else:
+        print()
+        print("    attempts by destination port:")
+        for p, n in sorted(h.items(), key=lambda kv: (-kv[1], int(kv[0])))[:12]:
+            print("      %-7s %-4s %s" % (p, n, "#" * max(1, int(n * 30 / top))))
+        if len(h) > 12:
+            print("      ... and %d more ports at %d or fewer" % (len(h) - 12, low))'
 	echo
 	dim "  This shape is all detection has to work with. Worth comparing profiles"
 	dim "  before committing to one for the dataset."
@@ -465,30 +478,52 @@ require_run() {
 
 # Lists runs and returns the chosen id. With only one run it returns that one
 # without asking, so the common case stays a single keypress.
+#
+# Everything it DRAWS goes to stderr; only the chosen id goes to stdout. The caller
+# reads it with $( ), which captures stdout — so a menu drawn on stdout is not shown
+# at all, and is instead returned as the "run id". That produced a filename made of a
+# whole screenful of escape codes and an "OSError: File name too long", for every user
+# with more than one capture.
 pick_run() {
 	local runs count
 	runs=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort)
 	count=$(printf '%s\n' "$runs" | grep -c . 2>/dev/null)
 	if [ "${count:-0}" -le 1 ]; then latest_run; return; fi
 
-	banner
-	head_ "Captured runs"
-	echo
-	local i=1 f id detail
-	while IFS= read -r f; do
-		[ -n "$f" ] || continue
-		id=$(basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//')
-		detail=$(manifest_field "$id" 'm["configuration"]["attack_profile"]+"   "+str(m["output"]["lines"])+" lines, "+str(m["output"]["ufw_block_lines"])+" BLOCK"')
-		printf '  %s%s%s  %-16s %s%s%s\n' "$C_NUM" "$i" "$R" "$id" "$C_DIM" "$detail" "$R"
-		i=$((i + 1))
-	done <<< "$runs"
-	echo
-	printf '  %sselect (enter for latest)>%s ' "$C_TITLE" "$R"; read -r sel
-	if [ -z "$sel" ]; then latest_run; return; fi
-	local chosen
-	chosen=$(printf '%s\n' "$runs" | sed -n "${sel}p")
-	if [ -z "$chosen" ]; then latest_run; return; fi
-	basename "$chosen" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
+	{
+		banner
+		head_ "Captured runs"
+		echo
+		local i=1 f id detail
+		while IFS= read -r f; do
+			[ -n "$f" ] || continue
+			id=$(basename "$f" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//')
+			detail=$(manifest_field "$id" 'm["configuration"]["attack_profile"]+"   "+str(m["output"]["lines"])+" lines, "+str(m["output"]["ufw_block_lines"])+" BLOCK"')
+			printf '  %s%s%s  %-16s %s%s%s\n' "$C_NUM" "$i" "$R" "$id" "$C_DIM" "$detail" "$R"
+			i=$((i + 1))
+		done <<< "$runs"
+		echo
+		printf '  %sselect 1-%s (enter for latest)>%s ' "$C_TITLE" "$count" "$R"
+	} >&2
+
+	local sel
+	read -r sel || { latest_run; return; }
+	[ -z "$sel" ] && { latest_run; return; }
+
+	# Anything that is not a row number falls back to the latest and says so. It used to
+	# be fed straight to `sed -n "${sel}p"`, so a typo became a sed syntax error and the
+	# console quietly showed a different run than the one asked for.
+	case "$sel" in
+		*[!0-9]*) printf '  not a row number — showing the latest instead\n' >&2
+		          latest_run; return ;;
+	esac
+	if [ "$sel" -lt 1 ] || [ "$sel" -gt "$count" ]; then
+		printf '  there is no run %s — showing the latest instead\n' "$sel" >&2
+		latest_run; return
+	fi
+
+	basename "$(printf '%s\n' "$runs" | sed -n "${sel}p")" \
+		| sed -e 's/^firewall_//' -e 's/\.manifest\.json$//'
 }
 
 view_evidence() {
