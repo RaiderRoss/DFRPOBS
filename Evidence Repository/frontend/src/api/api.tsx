@@ -33,9 +33,6 @@ export type EvidenceItem = {
   id: string
   workGroupId: string
   evidenceSourceId: string | null
-  // Null together, and only for manually preserved items: the backend allows an artifact
-  // with no coverage window rather than inventing one from createdAt. The listing has to
-  // render those rows, so the nulls are in the type.
   eventStart: string | null
   eventEnd: string | null
   sourceArtifactId: string
@@ -44,7 +41,6 @@ export type EvidenceItem = {
   createdAt: string
 }
 
-/** Spring's PagedModel wire shape — `content` plus a page descriptor. */
 export type Page<T> = {
   content: T[]
   page?: { size: number; number: number; totalElements: number; totalPages: number }
@@ -113,9 +109,7 @@ export const repositoryApi = {
       method: 'POST',
       body: JSON.stringify(source),
     }),
-  // Paged, not a bare array: evidence_item grows at the rate the whole estate produces, so
-  // the API has no unpaged listing to call. Sorted newest-first on createdAt — the timestamp
-  // the repository stamps — rather than the source-asserted eventStart.
+
   listEvidenceItems: (workGroupId = '', includeDeleted = false, page = 0, size = 50) => {
     const params = new URLSearchParams({ page: String(page), size: String(size), sort: 'createdAt,desc' })
     if (workGroupId) params.set('workGroupId', workGroupId)

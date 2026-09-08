@@ -5,11 +5,6 @@ function formatDate(value: string) {
     return new Intl.DateTimeFormat('en-ZA', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value))
 }
 
-/**
- * Manually preserved items have no coverage window at all — the repository stores null
- * rather than inventing one from createdAt, so the column has to say so instead of
- * rendering "Invalid Date".
- */
 function formatWindow(start: string | null, end: string | null) {
     if (!start || !end) return 'Not asserted'
     return `${formatDate(start)} — ${formatDate(end)}`
@@ -41,13 +36,10 @@ export default function EvidenceItemsPage() {
         } catch (exception) { setError(exception instanceof Error ? exception.message : 'Unable to load evidence items.') }
     }
 
-    // The filter select needs names, not the UUIDs the API filters on.
     useEffect(() => { void repositoryApi.listWorkGroups().then(setWorkGroups).catch(() => setWorkGroups([])) }, [])
 
     useEffect(() => { void load() }, [workGroupId, includeDeleted, page])
 
-    // Page 3 of a filter usually does not exist under the next one, so changing a filter
-    // returns to the first page rather than leaving the table empty with no explanation.
     function applyFilter(next: () => void) { setPage(0); next() }
 
     async function lookup(event: FormEvent) {

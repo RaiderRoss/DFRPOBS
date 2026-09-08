@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { clearCredentials, repositoryApi, type EvidenceItem, type EvidenceSource, type TriggerEvent, type WorkGroup } from '../api/api'
 
-/** Trigger events and evidence items are paged, so the breakdowns describe this newest slice. */
 const SAMPLE_SIZE = 50
 
 type GroupCoverage = { group: WorkGroup; sources: number; items: number }
@@ -26,11 +25,6 @@ function tally<T>(rows: T[], key: (row: T) => string) {
     return [...counts].sort((a, b) => b[1] - a[1])
 }
 
-/**
- * A source is overdue when it declared a collection interval and the newest artifact it
- * produced is older than that interval. Sources without an interval make no promise about
- * cadence, so silence from them is not a finding.
- */
 function isOverdue(source: EvidenceSource, now: number) {
     if (!source.expectedIntervalSeconds) return false
     if (!source.lastEvidenceAt) return true
@@ -49,9 +43,6 @@ export default function OverviewPage() {
                 repositoryApi.listEvidenceSources(),
                 repositoryApi.listEvidenceItems('', false, 0, SAMPLE_SIZE),
             ])
-            // Per-classification item counts come from the pager, one size=1 request per group,
-            // rather than from the sampled page: the catalogue is small and this reports the
-            // true total instead of whatever share of the newest 50 items that group holds.
             const totals = await Promise.all(groups.map((group) => repositoryApi
                 .listEvidenceItems(group.id, false, 0, 1)
                 .then((page) => page.page?.totalElements ?? page.content.length)
