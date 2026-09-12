@@ -1,27 +1,47 @@
 # Normalise line endings on checkout regardless of each developer's
 # core.autocrlf setting (Git for Windows defaults it to "true").
 #
-# This matters beyond cosmetics for shell scripts run inside containers:
-# the Postgres entrypoint executes config/docker/postgresql/
-# docker-entrypoint-initdb.d/01-init.sh, and a CR at the end of the shebang
-# (or of the "EOSQL" heredoc terminator) stops it running -- which silently
-# leaves the fineract_tenants database uncreated.
+# This repo is worked on from both WSL (core.autocrlf unset) and Windows. Without
+# this file, Windows git reports every LF-terminated file as modified because it
+# intends to rewrite it as CRLF — phantom diffs with zero line changes.
+#
+# It matters beyond cosmetics for shell scripts run inside containers. A CR at the
+# end of a shebang fails in Linux with:
+#     /usr/bin/env: 'bash\r': No such file or directory
+# and the Postgres entrypoint executes config/docker/postgresql/
+# docker-entrypoint-initdb.d/01-init.sh, where a CR on the shebang (or on the
+# "EOSQL" heredoc terminator) stops it running -- which silently leaves the
+# fineract_tenants database uncreated.
 #
 # Compose v2 does strip CR from env_file values, so *.env is normalised for
 # consistency rather than to fix a live bug.
 
 * text=auto eol=lf
 
-*.sh    text eol=lf
-*.env   text eol=lf
-*.yml   text eol=lf
-*.yaml  text eol=lf
-*.avsc  text eol=lf
-*.py    text eol=lf
-*.md    text eol=lf
+# Explicit for the executable content, so intent is obvious on review.
+*.sh     text eol=lf
+*.py     text eol=lf
+*.env    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.avsc   text eol=lf
+*.md     text eol=lf
+*.gradle text eol=lf
 
 Dockerfile text eol=lf
 
-# Windows-only helpers, if any are added later, must keep CRLF.
+# Never touch binaries.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.pdf  binary
+*.pcap binary
+*.rdb  binary
+*.tar  binary
+*.gz   binary
+*.zip  binary
+
+# Windows-only helpers must keep CRLF.
 *.bat   text eol=crlf
 *.ps1   text eol=crlf

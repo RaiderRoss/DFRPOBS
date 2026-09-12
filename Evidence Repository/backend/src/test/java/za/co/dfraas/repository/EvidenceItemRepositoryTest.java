@@ -265,6 +265,75 @@ class EvidenceItemRepositoryTest {
 	}
 
 	@Test
+	@DisplayName("findByStatusNot is the browse listing, and it withholds soft-deleted evidence")
+	void listingExcludesSoftDeletedItems() {
+		repository.saveAndFlush(newItem("evidence/browse/live.log"));
+
+		EvidenceItem deleted = newItem("evidence/browse/destroyed.log");
+		deleted.setStatus(EvidenceStatus.DELETED);
+		repository.saveAndFlush(deleted);
+
+		assertThat(repository.findByStatusNot(EvidenceStatus.DELETED, PageRequest.of(0, 10)))
+				.extracting(EvidenceItem::getStorageRef)
+				.containsExactly("evidence/browse/live.log");
+	}
+
+	@Test
+	@DisplayName("findByStatusNot excludes one status rather than allow-listing several")
+	void listingIncludesEveryStateThatIsNotDeleted() {
+		// The reason the query is phrased as an exclusion. A COMPROMISED artifact is still
+		// preserved evidence and is arguably the one an investigator most needs to see, and an
+		// ARCHIVED one is intact and merely slower to retrieve. Neither may be filtered out of
+		// a browse listing, and a status added later must show up by default rather than
+		// vanish until someone remembers to widen an IN clause.
+		EvidenceItem compromised = newItem("evidence/browse/altered.log");
+		compromised.setStatus(EvidenceStatus.COMPROMISED);
+		repository.saveAndFlush(compromised);
+
+		EvidenceItem archived = newItem("evidence/browse/cold.log");
+		archived.setStatus(EvidenceStatus.ARCHIVED);
+		repository.saveAndFlush(archived);
+
+		assertThat(repository.findByStatusNot(EvidenceStatus.DELETED, PageRequest.of(0, 10)))
+				.extracting(EvidenceItem::getStorageRef)
+				.containsExactlyInAnyOrder("evidence/browse/altered.log", "evidence/browse/cold.log");
+	}
+
+	@Test
+	@DisplayName("findByWorkGroupIdAndStatusNot narrows the listing without losing the soft delete")
+	void listingByWorkGroupAlsoExcludesSoftDeletedItems() {
+		repository.saveAndFlush(newItem("evidence/browse/wg-live.log"));
+
+		EvidenceItem deleted = newItem("evidence/browse/wg-destroyed.log");
+		deleted.setStatus(EvidenceStatus.DELETED);
+		repository.saveAndFlush(deleted);
+
+		// The unfiltered findByWorkGroupId still sees both — the soft delete is applied by
+		// this finder, not by the classification.
+		assertThat(repository.findByWorkGroupId(workGroup.getId(), PageRequest.of(0, 10))).hasSize(2);
+
+		assertThat(repository.findByWorkGroupIdAndStatusNot(
+				workGroup.getId(), EvidenceStatus.DELETED, PageRequest.of(0, 10)))
+				.extracting(EvidenceItem::getStorageRef)
+				.containsExactly("evidence/browse/wg-live.log");
+	}
+
+	@Test
+	@DisplayName("The browse listing is paged, so an unbounded table cannot be materialised in one read")
+	void listingIsPaged() {
+		for (int i = 0; i < 5; i++) {
+			repository.saveAndFlush(newItem("evidence/browse/page-" + i + ".log"));
+		}
+
+		assertThat(repository.findByStatusNot(EvidenceStatus.DELETED, PageRequest.of(0, 2)))
+				.hasSize(2)
+				.extracting(EvidenceItem::getStorageRef)
+				.allSatisfy(ref -> assertThat(ref).startsWith("evidence/browse/page-"));
+		assertThat(repository.findByStatusNot(EvidenceStatus.DELETED, PageRequest.of(0, 2)).getTotalElements())
+				.isEqualTo(5);
+	}
+
+	@Test
 	@DisplayName("countByStatus answers the readiness-audit question")
 	void countsItemsInAnExceptionalState() {
 		repository.saveAndFlush(newItem("evidence/audit/intact.log"));

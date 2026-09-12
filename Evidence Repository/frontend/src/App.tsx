@@ -7,6 +7,8 @@ export const pageRoutes: Record<PageName, string> = {
     Overview: '/',
     'Trigger events': '/trigger-events',
     'Work groups': '/work-groups',
+    'Evidence sources': '/evidence-sources',
+    'Evidence items': '/evidence-items',
 }
 
 function Dashboard() {
@@ -16,11 +18,9 @@ function Dashboard() {
             <section className="hero-panel">
                 <header className="topbar">
                     <div>
-                        <p className="eyebrow">DFRaaS / evidence repository</p>
-                        <h1>Investigate what the repository actually recorded.</h1>
-                        <p className="lede">A focused operator console for immutable trigger events and the work groups that classify evidence.</p>
+                        <h1>DFRaaS / evidence repository</h1>
+                        <p className="lede">Online platform for ease of management of the evidence repository.</p>
                     </div>
-                    <div className="status-card"><span className="status-pill">Repository console</span><strong>LIVE</strong><span>Basic-authenticated access to the Spring API</span></div>
                 </header>
                 <nav className="tab-bar" aria-label="Dashboard sections">
                     {navTabs.map((tab) => <NavLink key={tab} to={pageRoutes[tab]} className={({ isActive }) => isActive ? 'tab active' : 'tab'}>{tab}</NavLink>)}

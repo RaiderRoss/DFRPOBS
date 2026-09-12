@@ -3,24 +3,32 @@ package za.co.dfraas.resource;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willThrow;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import java.time.OffsetDateTime;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.data.domain.PageImpl;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.security.test.context.support.WithMockUser;
@@ -62,6 +70,80 @@ class EvidenceItemResourceTest {
 
 	@MockitoBean
 	private EvidenceItemService service;
+
+	@Test
+	@DisplayName("GET lists preserved artifacts as a page, not a bare array")
+	void listReturnsAPageOfItems() throws Exception {
+		given(service.findAll(any(), anyBoolean(), any()))
+				.willReturn(new PageImpl<>(List.of(sampleDto()), PageRequest.of(0, 50), 1));
+
+		mockMvc.perform(get("/api/evidence-items"))
+				.andExpect(status().isOk())
+				// PagedModel's shape, not Spring Data's Page — content plus a page descriptor.
+				.andExpect(jsonPath("$.content[0].id").value(ITEM_ID.toString()))
+				.andExpect(jsonPath("$.content[0].currentHash").value(CONTENT_SHA256))
+				.andExpect(jsonPath("$.page.totalElements").value(1));
+	}
+
+	@Test
+	@DisplayName("The listing carries the digest but never the storage reference")
+	void listResponseOmitsTheStorageReference() throws Exception {
+		given(service.findAll(any(), anyBoolean(), any()))
+				.willReturn(new PageImpl<>(List.of(sampleDto()), PageRequest.of(0, 50), 1));
+
+		String body = mockMvc.perform(get("/api/evidence-items"))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString();
+
+		// The same guarantee the single-item response makes. A listing is the easier place to
+		// leak the object key, because it leaks one per row.
+		assertThat(body.toLowerCase(Locale.ROOT)).doesNotContain("storageref");
+	}
+
+	@Test
+	@DisplayName("Soft-deleted items are omitted unless the caller asks for them")
+	void includeDeletedDefaultsToFalse() throws Exception {
+		given(service.findAll(any(), anyBoolean(), any()))
+				.willReturn(new PageImpl<>(List.of(), PageRequest.of(0, 50), 0));
+
+		mockMvc.perform(get("/api/evidence-items")).andExpect(status().isOk());
+		then(service).should().findAll(eq(null), eq(false), any());
+
+		mockMvc.perform(get("/api/evidence-items").param("includeDeleted", "true"))
+				.andExpect(status().isOk());
+		then(service).should().findAll(eq(null), eq(true), any());
+	}
+
+	@Test
+	@DisplayName("workGroupId narrows the listing to one classification")
+	void listPassesTheWorkGroupFilterThrough() throws Exception {
+		given(service.findAll(any(), anyBoolean(), any()))
+				.willReturn(new PageImpl<>(List.of(), PageRequest.of(0, 50), 0));
+
+		mockMvc.perform(get("/api/evidence-items").param("workGroupId", WORK_GROUP_ID.toString()))
+				.andExpect(status().isOk());
+
+		then(service).should().findAll(eq(WORK_GROUP_ID), eq(false), any());
+	}
+
+	@Test
+	@DisplayName("The default ordering is newest-first on createdAt, not the source-asserted eventStart")
+	void listDefaultsToNewestFirstByCreatedAt() throws Exception {
+		given(service.findAll(any(), anyBoolean(), any()))
+				.willReturn(new PageImpl<>(List.of(), PageRequest.of(0, 50), 0));
+
+		mockMvc.perform(get("/api/evidence-items")).andExpect(status().isOk());
+
+		ArgumentCaptor<Pageable> pageable = ArgumentCaptor.forClass(Pageable.class);
+		then(service).should().findAll(any(), anyBoolean(), pageable.capture());
+
+		// eventStart is asserted by the collector. Ordering on it would let a source with a
+		// wrong clock decide where its artifacts sit in an investigator's list.
+		assertThat(pageable.getValue().getSort().getOrderFor("createdAt"))
+				.isNotNull()
+				.satisfies(order -> assertThat(order.getDirection()).isEqualTo(Sort.Direction.DESC));
+		assertThat(pageable.getValue().getPageSize()).isEqualTo(50);
+	}
 
 	@Test
 	@DisplayName("POST preserves the artifact and returns 201 with a Location header")

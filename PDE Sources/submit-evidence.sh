@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 #
-# Submits a captured window to the DFRaaS Evidence Repository.
+# Submits one source's evidence from a captured window to the DFRaaS Evidence Repository.
 #
-# One run becomes one EvidenceItem: the log file is the artifact, and the manifest
-# supplies everything the repository needs to describe it — the coverage window the
-# capture asserts, and the sha256 taken before anything else touched the file.
+# One EvidenceItem references one artifact, so a window that captured both the firewall
+# and the IDS is two items from two registered sources — not one upload carrying two
+# files. --source picks which one goes; the window supplies the rest.
+#
+# The coverage window is the same for both, because both observed the same packets over
+# the same period. Only the artifact, the digest and the registered source differ.
 #
 # The digest is sent as a *claim*. The repository recomputes it from the bytes that
 # arrive, compares the two, and stores only its own value; a mismatch is a 422 and
@@ -17,9 +20,11 @@
 # are research metadata, not evidence, and the repository has nowhere truthful to put
 # them.
 #
-#   ./submit-evidence.sh --dry-run          # show exactly what would be sent
-#   ./submit-evidence.sh                    # submit the most recent capture
-#   ./submit-evidence.sh --run 20260905143000
+#   ./submit-evidence.sh --dry-run                    # show exactly what would be sent
+#   ./submit-evidence.sh                              # firewall log of the latest window
+#   ./submit-evidence.sh --source ids                 # the IDS evidence for that window
+#   ./submit-evidence.sh --run 20260906204848 --source ids
+#   ./submit-evidence.sh --list                       # what is available to send
 #
 set -euo pipefail
 
@@ -31,13 +36,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 OUTDIR="${OUTDIR:-$SCRIPT_DIR/output}"
 URL="${DFRAAS_URL:-http://localhost:8080}"
-SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
 AUTH="${DFRAAS_AUTH:-admin:admin}"
-DISPLAY_NAME="${DFRAAS_DISPLAY_NAME:-PDE testbed firewall (ufw)}"
-SOURCE_TYPE="${DFRAAS_SOURCE_TYPE:-FIREWALL}"
+
+# Each PDE source registers separately. They are different collectors observing
+# different things, so they get different keys and types at the repository — and a
+# reader asking "where did this come from" gets an answer more useful than "the testbed".
+FW_SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
+FW_DISPLAY_NAME="${DFRAAS_DISPLAY_NAME:-PDE testbed firewall (ufw)}"
+FW_SOURCE_TYPE="${DFRAAS_SOURCE_TYPE:-FIREWALL}"
+
+IDS_SOURCE_KEY="${DFRAAS_IDS_SOURCE_KEY:-pde-sim-slips-01}"
+IDS_DISPLAY_NAME="${DFRAAS_IDS_DISPLAY_NAME:-PDE testbed IDS (Slips)}"
+IDS_SOURCE_TYPE="${DFRAAS_IDS_SOURCE_TYPE:-IDS}"
 
 RUN=""
+SOURCE="firewall"
 DRY_RUN=0
+LIST=0
 WORK_GROUP=""
 
 log()  { printf '  %s\n' "$*" >&2; }
@@ -48,10 +63,13 @@ usage() {
 	cat <<-EOF
 
 	Options:
-	  --run ID               capture to submit, e.g. 20260905143000  (default: latest)
+	  --source NAME          which source's evidence to send: firewall | ids
+	                                                          (default $SOURCE)
+	  --list                 show the windows and what each holds, then exit
+	  --run ID               window to submit from, e.g. 20260906204848 (default: latest)
 	  --outdir DIR           where captures live                     (default $OUTDIR)
 	  --url URL              repository base URL                     (default $URL)
-	  --source-key KEY       registered source to file under         (default $SOURCE_KEY)
+	  --source-key KEY       override the registered source key for --source
 	  --auth USER:PASS       HTTP Basic credentials                  (default admin:admin)
 	  --register-with UUID   register the source first, under this work group
 	  --dry-run              print the request and exit; sends nothing
@@ -61,16 +79,18 @@ usage() {
 	--register-with is the convenience form of it, not an automatic one:
 
 	  curl -u $AUTH $URL/api/work-groups           # find the work group id
-	  ./submit-evidence.sh --register-with <uuid>  # register it, then submit
+	  ./submit-evidence.sh --source $SOURCE --register-with <uuid>   # then submit
 	EOF
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--run) RUN="$2"; shift 2 ;;
+		--source) SOURCE="$2"; shift 2 ;;
+		--list) LIST=1; shift ;;
 		--outdir) OUTDIR="$2"; shift 2 ;;
 		--url) URL="${2%/}"; shift 2 ;;
-		--source-key) SOURCE_KEY="$2"; shift 2 ;;
+		--source-key) SOURCE_KEY_OVERRIDE="$2"; shift 2 ;;
 		--auth) AUTH="$2"; shift 2 ;;
 		--register-with) WORK_GROUP="$2"; shift 2 ;;
 		--dry-run) DRY_RUN=1; shift ;;
@@ -82,6 +102,38 @@ done
 command -v curl    >/dev/null 2>&1 || fail "curl not found on PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
 
+case "$SOURCE" in
+	firewall|ids) ;;
+	*) fail "unknown --source '$SOURCE' (firewall | ids)" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# --list: what is on disk and therefore sendable, per window per source
+# ---------------------------------------------------------------------------
+if [[ "$LIST" -eq 1 ]]; then
+	found=0
+	for dir in "$OUTDIR"/*/; do
+		[[ -d "$dir" ]] || continue
+		stamp=$(basename "$dir")
+		[[ "$stamp" == "sessions" ]] && continue
+		[[ -f "$dir/firewall_${stamp}.manifest.json" ]] || continue
+		found=1
+		printf '  %s\n' "$stamp" >&2
+		if [[ -f "$dir/firewall_${stamp}.log" ]]; then
+			printf '    %-10s %-34s %s bytes\n' firewall "firewall_${stamp}.log" \
+				"$(stat -c %s "$dir/firewall_${stamp}.log")" >&2
+		fi
+		if [[ -f "$dir/ids_${stamp}.alerts.log" ]]; then
+			printf '    %-10s %-34s %s bytes\n' ids "ids_${stamp}.alerts.log" \
+				"$(stat -c %s "$dir/ids_${stamp}.alerts.log")" >&2
+		else
+			printf '    %-10s %s\n' ids "not captured for this window" >&2
+		fi
+	done
+	[[ "$found" -eq 1 ]] || log "no captures found in $OUTDIR"
+	exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve the run
 # ---------------------------------------------------------------------------
@@ -89,28 +141,53 @@ if [[ -z "$RUN" ]]; then
 	# `|| true` is load-bearing: with `set -o pipefail`, find's non-zero exit on a
 	# missing directory fails the whole assignment, and `set -e` then kills the script
 	# before the explanatory message below can be printed. Silent exit 1, no reason given.
-	latest=$(find "$OUTDIR" -maxdepth 1 -name 'firewall_*.manifest.json' 2>/dev/null | sort | tail -1 || true)
+	# Each capture is a directory named for its window, holding that window's files.
+	latest=$(find "$OUTDIR" -mindepth 2 -maxdepth 2 -name 'firewall_*.manifest.json' 2>/dev/null | sort | tail -1 || true)
 	[[ -n "$latest" ]] || fail "no captures found in $OUTDIR — run a capture first"
-	RUN=$(basename "$latest" | sed -e 's/^firewall_//' -e 's/\.manifest\.json$//')
+	RUN=$(basename "$(dirname "$latest")")
 fi
 
-MANIFEST="$OUTDIR/firewall_${RUN}.manifest.json"
-LOG_FILE="$OUTDIR/firewall_${RUN}.log"
-[[ -f "$MANIFEST" ]] || fail "no manifest for run $RUN ($MANIFEST)"
-[[ -f "$LOG_FILE" ]] || fail "no log file for run $RUN ($LOG_FILE)"
+RUN_DIR="$OUTDIR/$RUN"
+MANIFEST="$RUN_DIR/firewall_${RUN}.manifest.json"
+GROUP="$RUN_DIR/window_${RUN}.group.json"
+[[ -f "$MANIFEST" ]] || fail "no manifest for window $RUN ($MANIFEST)"
 
-# The artifact id the repository dedupes on. Derived from the capture rather than
-# generated here, so re-running this script for the same window is idempotent: the
-# second attempt is rejected as a duplicate instead of preserving the log twice.
-ARTIFACT_ID="firewall_${RUN}"
-
-read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
+# The coverage window is a property of the capture, not of the source: both sources
+# observed the same packets over the same period, so both items carry the same window
+# and correlation can line them up along it. Only the artifact and its digest differ.
+#
+# The firewall's digest lives in its own manifest; the IDS's lives in the group
+# manifest, which is the record that says the two describe one window.
+if [[ "$SOURCE" == "firewall" ]]; then
+	LOG_FILE="$RUN_DIR/firewall_${RUN}.log"
+	ARTIFACT_ID="firewall_${RUN}"
+	SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$FW_SOURCE_KEY}"
+	DISPLAY_NAME="$FW_DISPLAY_NAME"
+	SOURCE_TYPE="$FW_SOURCE_TYPE"
+	read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
 import json, sys
 m = json.load(open(sys.argv[1]))
 print(m["window"]["start_utc"], m["window"]["end_utc"], m["output"]["sha256"])
 ' "$MANIFEST") || true
+else
+	LOG_FILE="$RUN_DIR/ids_${RUN}.alerts.log"
+	ARTIFACT_ID="ids_${RUN}"
+	SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$IDS_SOURCE_KEY}"
+	DISPLAY_NAME="$IDS_DISPLAY_NAME"
+	SOURCE_TYPE="$IDS_SOURCE_TYPE"
+	[[ -f "$GROUP" ]] || fail "window $RUN has no IDS evidence (no $GROUP) — it was captured without --with-ids"
+	read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
+import json, sys
+g = json.load(open(sys.argv[1]))
+ids = next((i for i in g["items"] if i["pde_source"] == "ids"), None)
+if ids is None:
+    raise SystemExit("group manifest lists no ids item")
+print(g["window"]["start_utc"], g["window"]["end_utc"], ids["sha256"])
+' "$GROUP") || true
+fi
 
-[[ -n "$MANIFEST_SHA256" ]] || fail "manifest has no sha256 — treat run $RUN as suspect"
+[[ -f "$LOG_FILE" ]] || fail "window $RUN has no $SOURCE evidence ($LOG_FILE)"
+[[ -n "$MANIFEST_SHA256" ]] || fail "no recorded sha256 for the $SOURCE artifact — treat window $RUN as suspect"
 
 # ---------------------------------------------------------------------------
 # Local integrity check, before anything is sent
@@ -120,7 +197,7 @@ if [[ "$ACTUAL_SHA256" != "$MANIFEST_SHA256" ]]; then
 	log "the log file no longer matches the digest recorded at capture:"
 	log "  manifest    $MANIFEST_SHA256"
 	log "  recomputed  $ACTUAL_SHA256"
-	fail "refusing to submit run $RUN — it changed after it was captured"
+	fail "refusing to submit the $SOURCE artifact from window $RUN — it changed after it was captured"
 fi
 
 BYTES=$(stat -c %s "$LOG_FILE")
@@ -195,7 +272,7 @@ fi
 # ---------------------------------------------------------------------------
 # Submit
 # ---------------------------------------------------------------------------
-log "submitting run $RUN as $ARTIFACT_ID (${BYTES} bytes) to $URL"
+log "submitting the $SOURCE artifact from window $RUN as $ARTIFACT_ID (${BYTES} bytes) to $URL"
 
 CODE=$(curl -sS -u "$AUTH" -o "$TMP_DIR/response.json" -w '%{http_code}' \
 	-X POST "$URL/api/evidence-items" \
@@ -229,12 +306,13 @@ case "$CODE" in
 		fi
 		;;
 	409)
-		log "already preserved — this capture was submitted before, and the repository"
+		log "already preserved — this artifact was submitted before, and the repository"
 		log "dedupes on (source, artifact id) so it was not stored twice"
 		;;
 	404)
 		log "no source is registered under the key '$SOURCE_KEY'"
-		log "register it first:  $0 --register-with <workGroupId>"
+		log "each PDE source registers separately — register this one first:"
+		log "  $0 --source $SOURCE --register-with <workGroupId>"
 		exit 1
 		;;
 	422)

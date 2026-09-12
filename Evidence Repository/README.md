@@ -36,7 +36,7 @@ Backend (Java, Spring Boot) is layered as:
 - **CustodyEvent** — `id, evidenceItemId, sequence, action, performedBy, occurredAt, recordedAt, artifactHashBefore, artifactHashAfter, prevEntryHash, entryHash, canonicalVersion, detail` — the append-only chain-of-custody ledger, one hash-chained sequence per `EvidenceItem` (changeset `0006`). Every state-changing action appends one, and the opening `CREATED` entry is written in the same transaction as the item itself — which is what makes provenance survive `evidenceSourceId` being nullable, and why an item whose chain has no entry at position 0 does not verify at all. **Append-only is enforced here rather than documented** (open question 8): every column is `updatable = false`, `entryHash` covers the entry's own contents, and `prevEntryHash` binds it to the entry before it, so an edit made outside Hibernate no longer agrees with the digest stored beside it. What the chain detects is stated precisely, because it is easy to overclaim: editing an entry, moving one between items, reordering one within a chain, and deleting one from the middle (that last only because `sequence` must be contiguous from 0 — the digests alone cannot see a hole, since every surviving row is individually valid). What it does **not** detect is truncation of its own *end*; closing that needs the head hash witnessed outside this database, and it is left as a stated gap. `prevEntryHash` is `NOT NULL` with a genesis value of 64 zeros rather than a null, so verification is one uniform loop and there is no origin special case for a forged origin to hide in. **Two clocks, deliberately**: `occurredAt` is the application's claim and is inside the digest — it has to be, because the digest must be computed before the INSERT that carries it, and a database-generated value could only be hashed by reading it back and issuing an UPDATE, the one operation this table forbids — while `recordedAt` is the database's `now()` and is outside it; the gap between them is how a backfill or a fabrication becomes visible. `canonicalVersion` selects, per row, which frozen canonical form `entryHash` was computed under, so improving the hashing rules never means recomputing stored digests. The hash pair is named `artifactHash*` rather than the `previousHash`/`newHash` sketched here originally: the table carries two unrelated pairs of hashes, and a `previousHash` sitting beside `prevEntryHash` would be read as part of the chain. `action` is `VARCHAR` + CHECK for `EvidenceStatus`'s reasons, and the list holds **only `CREATED`**, because only the ingest path exists to emit anything — an action list is read as exhaustive, so a value nothing writes turns "never recorded" into a false claim of "never happened". `performedBy` is a `VARCHAR` username for now, the third placeholder for an `AppUser` foreign key.
 - **IntegrityCheck** — `id, evidenceItemId, computedHash, matchesStored, checkedAt` — periodic/on-demand re-verification, separate from custody events, matching SecureRS's verify-on-read pattern.
 - **AppUser** — `id, username, role, mfaEnabled`.
-- **AccessLog** — `id, evidenceItemId, userId, action, occurredAt` — every read/view, logged separately from custody-changing actions (compliance requirement).
+- **AccessLog** — `id, evidenceItemId, userId, action, occurredAt` — every read/view, logged separately from custody-changing actions (compliance requirement). **Unresolved:** this overlaps the custody chain now that reads are treated as custody events — see open question 10.
 
 ## Storage & infrastructure
 - **MinIO** — evidence blob storage (object storage), referenced by `EvidenceItem.storageRef`. Should use envelope encryption via a real KMS/HSM (not a static key in config, which is what the SecureRS prototype does).
@@ -103,6 +103,48 @@ host while its dependencies run in Docker:
 
 All credentials above are dev-only placeholders
 
+## Chain of custody
+
+Every EvidenceItem owns one chain, answering **what**, **when** and **by whom** for
+everything that happens to that item — creation, hashing, reading, export, relocation,
+status change. One ordered ledger per item, not a log per action type.
+
+**The chaining rule.** Each entry's hash covers the previous entry's hash:
+
+```
+newHash = H( previousHash ‖ canonical(event) )
+```
+
+- The **first** entry is the item's own `CREATED` event, not an empty chain. An item that
+  exists with an empty chain has an unexplained origin.
+- Genesis uses a **fixed constant** for `previousHash` rather than null, so verification
+  is one uniform loop instead of a special case that has to be right twice.
+- `canonical(event)` must be **frozen and versioned** — field order, encoding, timestamp
+  precision. The day serialisation changes, every historical chain stops verifying and
+  tampering becomes indistinguishable from a format change. Build the string explicitly
+  rather than letting a JSON library decide it, and stamp each row with the version used.
+
+**Transactionality.** A custody entry is written in the *same transaction* as the action
+it records. A crash between "moved the object" and "logged the move" leaves evidence with
+an unexplained gap, which is the one thing custody must never have. This is why the
+ledger is a table and not a file: a file write cannot enlist in the Postgres transaction.
+A custody *file* is derived on demand for export or handover; the table stays
+authoritative, so there is never a question of which one wins.
+
+**What the chain proves, and what it does not.** Linked hashes make *modification of an
+interior entry* detectable. On their own they do not detect:
+
+- **Truncation** — remove the last N entries and what remains still verifies cleanly.
+  Nothing inside the chain states how long it ought to be.
+- **Wholesale re-chaining** — anyone who can write the ledger can recompute every hash
+  from genesis and produce a valid chain saying whatever they like.
+
+So the chain alone is defeated by precisely the actor forensic readiness exists to catch:
+the insider with write access. It needs at least one of an append-only guarantee enforced
+below the application, a head hash anchored where the writer cannot reach it, or
+per-entry signatures. Until then the honest claim is "a consistent chain", not "the
+chain" — see open questions 8 and 9.
+
 ## Open questions
 1. ~~**Whether WorkGroup classification on ingest is automated or needs human review.**~~ **Resolved** by changeset `0004`, and dissolved rather than answered. The question only existed because classification had to be inferred *per alert*, from a SIEM alert type, by a mapping table nobody had written. Under continuous collection it moves somewhere much better: a source is registered once, by a human who knows which business unit the system it collects from belongs to, and `EvidenceSource.workGroupId` is `NOT NULL`. Every item that source produces inherits that classification, snapshotted onto the item so a later reclassification of the source does not rewrite the past.
 2. ~~**`EvidenceItem` → `TriggerEvent` cardinality and nullability.**~~ **Resolved twice.** `0003` made it one-to-many with a nullable, non-unique FK on `EvidenceItem`. `0005` replaced that FK entirely with `EvidenceLink` — the `0003` answer was right about cardinality and right that nullability was load-bearing, but it was answering the wrong question. A foreign key can only express *causation* ("this exists because that fired"), and once collection is continuous the artifact already existed. The relationship became many-to-many (a bundle covering an hour bears on every alert in that hour), and more importantly it became an inference that has to be labelled as one. The `0003` reasoning survives in two places: nullability's argument now applies to `evidenceSourceId`, and the rejection of a synthetic placeholder `TriggerEvent` still stands — `LinkMethod.CAUSAL` records genuine alert-driven collection without inventing an alert that never fired.
@@ -112,3 +154,22 @@ All credentials above are dev-only placeholders
 6. **Per-trigger-type correlation policy.** The lookback/lookahead defaults (30 min / 15 min) are one global pair, frozen onto each row so past correlations stay reproducible. A data-exfiltration alert wants hours of lookback and a failed-login alert wants minutes, so the policy belongs with the detection catalogue rather than on `trigger_event`. Related: `CorrelationStatus.CLOSED` implies a rule for *when* the collection lag has elapsed, which nothing currently decides.
 7. `IntegrityCheck`, `AppUser` and `AccessLog` remain unwritten, and each needs its own Liquibase changeset first. Done: `EvidenceItem` (`0003`), `EvidenceSource` (`0004`), `EvidenceLink` + correlation state (`0005`), `CustodyEvent` (`0006`). **One deliberate reordering to note.** The order stated here put `AppUser` before `CustodyEvent`, on the grounds that `performedBy` should be a foreign key rather than a third `VARCHAR` placeholder. Custody went first anyway, and the reason is that the two are not symmetrically urgent: a username in `performedBy` is a value that can be converted to an FK later by a migration, whereas every artifact preserved before the ledger existed has a hole in its chain that cannot be filled honestly afterwards — an opening entry the application never computed is a fabricated one, and `CustodyChainService.verify` reports those items as missing their origin rather than backfilling them. Waiting on `AppUser` would have meant another few weeks of items that can never verify. So `AppUser` is next, and it converts all three placeholders (`CustodyEvent.performedBy`, `EvidenceLink.linkedBy`, `reviewedBy`) at once; then `IntegrityCheck`, which is also what makes `CustodyAction` worth widening, since nothing today can emit a `HASH_MISMATCH` entry; then `AccessLog`.
 8. **Append-only is now a constraint in one table and still a convention in three.** `custody_event` (`0006`) is the exception and shows what the answer looks like: every column `updatable = false`, so an edit through Hibernate is ignored rather than written; a stored digest over each entry's contents; and each entry bound to the one before it, so an edit or deletion made outside the application leaves a mark that `CustodyChainService.verify` will find. `TriggerEvent`, `EvidenceItem` and `EvidenceLink` still inherit `delete` from `JpaRepository` with nothing stopping a caller, `EvidenceLink` still needs a dismissed link to survive, and `TriggerEvent.correlationScope` is still meant to be written exactly once while being unknown at insert. The remaining work is now in two clearly separate halves. **In the database**, for all four tables: a revoked `UPDATE`/`DELETE` grant, or rules that reject them, since none of the above helps against a writer that never goes through this application — and the CHECK constraints in `0006` exist for exactly that writer. **Outside it**, for `custody_event` specifically: the chain cannot detect truncation of its own end, because "three entries, intact" and "five entries, the last two removed" are indistinguishable from inside. That needs the head `entryHash` witnessed somewhere this database cannot reach — an anchor row per item elsewhere, periodic external notarisation, or write-once storage — and it is a deployment decision as much as a schema one, which is why it is named here rather than quietly assumed.
+9. **How the custody chain is anchored.** Question 8 covers stopping deletes through the
+   application; this is the harder half. Even with append-only enforced, hash chaining is
+   tamper-*evident* against edits to an interior entry and nothing more: truncating the
+   tail still verifies, and anyone able to write the ledger can recompute it from genesis.
+   Closing that needs a head hash anchored somewhere the writer does not control — a WORM
+   bucket, a signed timestamp, a second system — or per-entry signatures, so forging costs
+   a key rather than database access. This is what turns "hash chained" into a defensible
+   admissibility claim, which makes it a prerequisite for the custody work rather than a
+   follow-up to it.
+10. **Whether reads live in the custody chain or in `AccessLog`.** The two now overlap:
+    the data model logs reads separately, while the custody design treats reading as a
+    custody event. Two records of who-read-what will drift, and a court asking "who
+    accessed this" should not get two answers. Leaning towards one chain per item with
+    `AccessLog` as a projection over it — a read genuinely is custody-relevant, and one
+    ordered ledger is easier to defend than two that must be reconciled. It also closes a
+    gap: an `access_log` row is not hash-chained, so deleting "X read this at 03:00" is
+    undetectable, and read history is often the most incriminating part of the record. The
+    cost is volume, since reads dominate, so verification would need to be incremental
+    from a checkpointed head rather than re-hashing from genesis every time.

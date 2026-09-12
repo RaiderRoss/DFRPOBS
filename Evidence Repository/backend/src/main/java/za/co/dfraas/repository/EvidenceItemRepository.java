@@ -159,6 +159,38 @@ public interface EvidenceItemRepository extends JpaRepository<EvidenceItem, UUID
 			Pageable pageable);
 
 	/**
+	 * The general browse listing, and the read behind {@code GET /api/evidence-items}.
+	 *
+	 * <p><strong>Excludes one status rather than selecting several</strong>, so a status added
+	 * to {@link EvidenceStatus} later — legal hold, export embargo — appears in the listing by
+	 * default instead of being silently invisible until someone remembers to widen an
+	 * {@code IN} clause. The caller passes {@link EvidenceStatus#DELETED}; soft-deleted
+	 * evidence is withheld from the default browse for the same reason
+	 * {@link #findOverlappingCoverage} withholds it, but the resource exposes a flag to ask
+	 * for it, because "this evidence was destroyed" is itself a finding and must remain
+	 * reachable.
+	 *
+	 * <p><strong>No index serves the ordering.</strong> {@code created_at} is unindexed, so a
+	 * newest-first page over this table is a scan and a sort. That is survivable at testbed
+	 * volume and is not survivable at the volume continuous collection implies; the fix is an
+	 * index on {@code (created_at DESC)} in a new changeset, which is a schema change and so
+	 * deliberately not made here. Paged regardless — the page bounds what is returned, not
+	 * what is read.
+	 */
+	Page<EvidenceItem> findByStatusNot(EvidenceStatus status, Pageable pageable);
+
+	/**
+	 * The same listing narrowed to one classification — the filtered form of
+	 * {@link #findByStatusNot}, and the counterpart of {@link #findByWorkGroupId} that honours
+	 * the soft delete.
+	 *
+	 * <p>Served by {@code ix_evidence_item_work_group_id} for the selection, though the
+	 * newest-first ordering still sorts; see the note on {@link #findByStatusNot}.
+	 */
+	Page<EvidenceItem> findByWorkGroupIdAndStatusNot(
+			UUID workGroupId, EvidenceStatus status, Pageable pageable);
+
+	/**
 	 * The readiness-audit query: everything not in the normal state. Served by the partial
 	 * index {@code ix_evidence_item_status_exceptional} when {@code status} is anything
 	 * other than {@link EvidenceStatus#PRESERVED}.

@@ -102,24 +102,22 @@ profiles producing distinct port distributions.
 
 Verified with root on WSL2 (kernel `6.18.33.2-microsoft-standard-WSL2`, ufw 0.36.1): the
 privileged path end to end — namespace creation, `ufw enable` at `logging full`, the
-capture, and the restore on exit. Run `20260906194400`, `port-scan`, 10 users, 30s at
-20/s, seed 1337:
+capture, and the restore on exit.
 
-| | |
-|---|---|
-| log lines | 2595 (645,556 bytes) |
-| `[UFW BLOCK]` | 60 |
-| `[UFW ALLOW]` | 540 |
-| `[UFW AUDIT]` | 1995 |
+| run | lines | BLOCK | ALLOW | AUDIT |
+|---|---|---|---|---|
+| `20260906194400` port-scan, 10 users, 30s @ 20/s | 2595 | 60 | 540 | 1995 |
+| `20260906204848` port-scan, same scenario, IDS on | 1684 | 56 | 524 | 1104 |
 
-The verdicts reconcile exactly with the line count, and 60 BLOCK against 60 planned
-malicious events means no blocked SYN was retransmitted into extra log lines on this run.
-That is a property of the run rather than a guarantee — the caveat about counting distinct
-`SPT` values still holds in general.
+The verdicts reconcile exactly with the line count in both. The second run also carried
+Slips over the same window and produced 3 high-severity findings, and its 4 missing
+BLOCKs are explained: two attempts to 5432 reached a published Docker container through
+`nat/PREROUTING`, which runs before ufw's filter chain — so ufw never saw them. That is a
+real demonstration that firewall evidence alone can be incomplete.
 
 **The failure mode to check first is rsyslog.** Stopped, the capture still runs: it
 generates real traffic, restores the firewall, and extracts nothing, because there is no
-`/var/log/ufw.log` to read. Option **9** in the console reports it. The pre-flight below
+`/var/log/ufw.log` to read. The console's environment check reports it. This pre-flight
 costs nothing and touches no firewall state — it proves both that the daemon is up and
 that the stock `20-ufw.conf` rule is filing `[UFW ` lines to the right file:
 
