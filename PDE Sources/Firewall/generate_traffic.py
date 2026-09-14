@@ -14,6 +14,7 @@ inferred afterwards from the logs.
 
 import argparse
 import json
+import math
 import random
 import socket
 import sys
@@ -42,11 +43,35 @@ ATTACK_PROFILES = {
                  "shaped — a spike rather than a spread.",
     "mixed": "Two phases: a sweep first, then sustained pressure on a single port. "
              "Approximates reconnaissance followed by exploitation.",
+    "guaranteed-alert": "Built to make the IDS raise a real alert, not just evidence. "
+                        "Completed connections to a few ports Slips has no service "
+                        "record for, which the firewall permits and a listener on the "
+                        "host answers, at twice what Slips' threshold needs per "
+                        "attacker. The firewall logs them ALLOW: it let the attack "
+                        "through, and only the IDS can say it was hostile.",
 }
 DEFAULT_PROFILE = "port-scan"
 
 DB_PORTS = [1433, 3306, 5432, 6379, 27017]
 AUTH_PORTS = [22, 3389, 23]
+
+# guaranteed-alert, derived from Slips' source rather than tuned by trial:
+#   - an alert fires when one source's weighted evidence inside one timewindow reaches
+#     detection_threshold * width / 60, which is 0.25 * 3600 / 60 = 15 by default
+#   - an ESTABLISHED connection to a port Slips has no record of is "unknown destination
+#     port" evidence at HIGH (0.8) with confidence 1.0, raised once per connection
+# so 19 completed connections from one source are the fewest that can cross it.
+SLIPS_THRESHOLD_IN_WIDTH = 0.25 * 3600 / 60
+UNKNOWN_PORT_ESTABLISHED_WEIGHT = 0.8 * 1.0
+ALERT_MIN_ESTABLISHED = math.ceil(SLIPS_THRESHOLD_IN_WIDTH / UNKNOWN_PORT_ESTABLISHED_WEIGHT)
+# Planned at twice the minimum, as margin for connections that do not complete. Slips
+# accumulates per source IP, so this is per attacker.
+ALERT_ATTEMPTS_PER_ATTACKER = 2 * ALERT_MIN_ESTABLISHED
+# Slips' vertical-scan detector counts only connections that FAILED, and only above five
+# distinct ports. Keeping to five makes marking the attacker a port scanner impossible
+# even if every connection failed, and a marked scanner has its unknown-port evidence
+# suppressed.
+ALERT_MAX_DISTINCT_PORTS = 5
 
 
 def utc_now():
@@ -72,7 +97,7 @@ def _pick(preferred, available):
     return next((p for p in preferred if p in available), available[0])
 
 
-def plan_malicious(profile, count, duration, malicious_ports, rng):
+def plan_malicious(profile, count, duration, malicious_ports, rng, alert_ports=None):
     """Returns [(dport, t_offset), ...] for the attacker's attempts."""
     if count == 0:
         return []
@@ -115,6 +140,17 @@ def plan_malicious(profile, count, duration, malicious_ports, rng):
         times = ([rng.uniform(0, half) for _ in range(n_scan)]
                  + [rng.uniform(half, duration) for _ in range(n_focus)])
 
+    elif profile == "guaranteed-alert":
+        if not alert_ports:
+            raise SystemExit("guaranteed-alert needs --alert-ports")
+        if len(set(alert_ports)) > ALERT_MAX_DISTINCT_PORTS:
+            raise SystemExit("guaranteed-alert takes at most %d distinct ports; more "
+                             "lets Slips mark the attacker a port scanner and suppress "
+                             "the evidence the alert is built from"
+                             % ALERT_MAX_DISTINCT_PORTS)
+        ports = _sweep(count, alert_ports, rng)
+        times = [rng.uniform(0, duration) for _ in range(count)]
+
     else:
         raise SystemExit("unknown attack profile: %s (see --list-profiles)" % profile)
 
@@ -122,7 +158,7 @@ def plan_malicious(profile, count, duration, malicious_ports, rng):
 
 
 def build_plan(users, malicious_ips, duration, rate, malicious_pct,
-               benign_ports, malicious_ports, profile, rng):
+               benign_ports, malicious_ports, profile, rng, alert_ports=None):
     total = max(1, int(round(duration * rate)))
 
     benign_ips = [u for u in users if u not in malicious_ips]
@@ -141,6 +177,23 @@ def build_plan(users, malicious_ips, duration, rate, malicious_pct,
             print("warning: malicious_pct=%s but no malicious users; generating an "
                   "all-benign run" % malicious_pct, file=sys.stderr)
         n_malicious = 0
+
+    if profile == "guaranteed-alert":
+        if not malicious_ips:
+            raise SystemExit("guaranteed-alert needs at least one malicious user")
+        # Raised to the floor rather than left to the percentage: this profile exists so
+        # the alert is not left to chance, and a small share of a short window would
+        # plan too few connections to cross the threshold.
+        floor = ALERT_ATTEMPTS_PER_ATTACKER * len(malicious_ips)
+        if n_malicious < floor:
+            print("note: guaranteed-alert raises malicious events from %d to %d "
+                  "(%d per attacker; Slips needs %d completed per attacker)"
+                  % (n_malicious, floor, ALERT_ATTEMPTS_PER_ATTACKER,
+                     ALERT_MIN_ESTABLISHED), file=sys.stderr)
+            n_malicious = floor
+        if n_malicious >= total:
+            raise SystemExit("guaranteed-alert needs %d malicious events but the window "
+                             "has only %d; raise --rate or --duration" % (floor, total))
     n_benign = total - n_malicious
 
     events = []
@@ -152,10 +205,14 @@ def build_plan(users, malicious_ips, duration, rate, malicious_pct,
             "t_offset": rng.uniform(0.0, duration),
         })
 
-    for dport, t_offset in plan_malicious(profile, n_malicious, duration,
-                                          malicious_ports, rng):
+    for i, (dport, t_offset) in enumerate(plan_malicious(
+            profile, n_malicious, duration, malicious_ports, rng, alert_ports)):
         events.append({
-            "src": rng.choice(malicious_ips),
+            # Slips accumulates per source IP, so guaranteed-alert shares its attempts
+            # out evenly: a random draw could leave one attacker under the threshold.
+            # Every other profile keeps the random draw, so its seeded runs are unchanged.
+            "src": (malicious_ips[i % len(malicious_ips)]
+                    if profile == "guaranteed-alert" else rng.choice(malicious_ips)),
             "dport": dport,
             "label": "malicious",
             "t_offset": t_offset,
@@ -197,6 +254,38 @@ def attempt(src_ip, dst_ip, dport, timeout):
         s.close()
 
 
+def per_attacker(events, outcome=None):
+    """Malicious attempts per source IP, optionally only those with a given outcome."""
+    counts = {}
+    for e in events:
+        if e["label"] == "malicious" and (outcome is None or e.get("outcome") == outcome):
+            counts[e["src"]] = counts.get(e["src"], 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def alert_guarantee(profile, events, completed=False):
+    """What guaranteed-alert needs from Slips and, once sent, whether the traffic gave it.
+
+    traffic_sufficient is a claim about the TRAFFIC only: every attacker completed enough
+    connections to cross the threshold. Whether Slips then alerted is the IDS's own
+    output, read from its log and never inferred here.
+    """
+    if profile != "guaranteed-alert":
+        return None
+    out = {
+        "slips_threshold": SLIPS_THRESHOLD_IN_WIDTH,
+        "weight_per_completed_connection": UNKNOWN_PORT_ESTABLISHED_WEIGHT,
+        "min_completed_per_attacker": ALERT_MIN_ESTABLISHED,
+        "planned_per_attacker": per_attacker(events),
+    }
+    if completed:
+        done = per_attacker(events, outcome="connected")
+        out["completed_per_attacker"] = {ip: done.get(ip, 0) for ip in out["planned_per_attacker"]}
+        out["traffic_sufficient"] = all(n >= ALERT_MIN_ESTABLISHED
+                                        for n in out["completed_per_attacker"].values())
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--list-profiles", action="store_true",
@@ -214,6 +303,9 @@ def main():
                     choices=sorted(ATTACK_PROFILES), help="attacker behaviour")
     ap.add_argument("--benign-ports", help="comma-separated, firewall-permitted")
     ap.add_argument("--malicious-ports", help="comma-separated, firewall-denied")
+    ap.add_argument("--alert-ports",
+                    help="comma-separated, firewall-permitted and answered by a listener; "
+                         "the guaranteed-alert profile's targets")
     ap.add_argument("--connect-timeout", type=float, default=0.25)
     ap.add_argument("--max-inflight", type=int, default=64,
                     help="concurrent connection attempts; must exceed rate * "
@@ -239,6 +331,7 @@ def main():
     malicious = [u.strip() for u in args.malicious_users.split(",") if u.strip()]
     benign_ports = [int(p) for p in args.benign_ports.split(",") if p.strip()]
     malicious_ports = [int(p) for p in args.malicious_ports.split(",") if p.strip()]
+    alert_ports = [int(p) for p in (args.alert_ports or "").split(",") if p.strip()]
 
     unknown = set(malicious) - set(users)
     if unknown:
@@ -246,7 +339,7 @@ def main():
 
     rng = random.Random(args.seed)
     plan = build_plan(users, malicious, args.duration, args.rate, args.malicious_pct,
-                      benign_ports, malicious_ports, args.attack_profile, rng)
+                      benign_ports, malicious_ports, args.attack_profile, rng, alert_ports)
 
     if args.plan_only:
         summary = {}
@@ -259,6 +352,8 @@ def main():
             "malicious_events": sum(1 for e in plan if e["label"] == "malicious"),
             "benign_events": sum(1 for e in plan if e["label"] == "benign"),
             "malicious_port_histogram": dict(sorted(summary.items())),
+            "malicious_per_attacker": per_attacker(plan),
+            "alert_guarantee": alert_guarantee(args.attack_profile, plan),
             "first_10": [{k: e[k] for k in ("seq", "src", "dport", "label")}
                          for e in plan[:10]],
         }, sys.stdout, indent=2)
@@ -330,6 +425,7 @@ def main():
         # the temporal shape the profile specified and the run should be rated down.
         "dispatch_drift_mean_s": round(drift_total / max(1, len(executed)), 4),
         "dispatch_drift_max_s": round(drift_max, 4),
+        "alert_guarantee": alert_guarantee(args.attack_profile, executed, completed=True),
         "users": [{"ip": u, "role": "malicious" if u in malicious else "benign"} for u in users],
         "events": executed,
     }
@@ -343,6 +439,15 @@ def main():
              ground_truth["benign_events"], ground_truth["elapsed_seconds"],
              ground_truth["dispatch_drift_mean_s"],
              ground_truth["dispatch_drift_max_s"]))
+
+    guarantee = ground_truth["alert_guarantee"]
+    if guarantee:
+        print("guaranteed-alert: completed connections per attacker %s; Slips needs %d each"
+              % (guarantee["completed_per_attacker"], ALERT_MIN_ESTABLISHED))
+        if not guarantee["traffic_sufficient"]:
+            print("warning: an attacker completed fewer connections than the threshold "
+                  "needs, so no alert is guaranteed for it. Check that the alert "
+                  "listener is up and the alert ports are permitted.", file=sys.stderr)
 
 
 if __name__ == "__main__":

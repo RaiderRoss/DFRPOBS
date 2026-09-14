@@ -80,7 +80,7 @@ usage() {
 	  --malicious-pct P      share of *events* that are malicious  (default $MALICIOUS_PCT)
 	  --malicious-users N    how many *users* are attackers        (default $MALICIOUS_USERS)
 	  --attack-profile P     attacker behaviour                    (default $ATTACK_PROFILE)
-	                         port-scan|brute-force|db-probe|stealth|syn-burst|mixed
+	                         port-scan|brute-force|db-probe|stealth|syn-burst|mixed|guaranteed-alert
 	  --seed N               makes a run reproducible              (default $SEED)
 	  --outdir DIR           where the log and manifest land       (default $OUTDIR)
 	  --dry-run              print the firewall changes and exit
@@ -176,6 +176,26 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	fi
 fi
 
+# guaranteed-alert depends on a listener and permit rules. A lab started before they
+# existed has neither: every attempt would be denied, Slips would rate it MEDIUM at best,
+# and the run would look like the IDS failing to alert. One-shot captures build their own.
+if [[ "$ATTACK_PROFILE" == "guaranteed-alert" && $DRY_RUN -eq 0 ]]; then
+	if [[ $LAB_MODE -eq 1 ]]; then
+		if [[ -z "$(lab_get LAB_ALERT_PORTS "")" ]]; then
+			die "the running lab predates the guaranteed-alert profile; restart it ('./lab.sh down', then up)"
+		fi
+		LAB_LISTENER_PID=$(lab_get LAB_LISTENER_PID "")
+		if [[ -z "$LAB_LISTENER_PID" || ! -d "/proc/$LAB_LISTENER_PID" ]]; then
+			die "the lab's alert listener is not running; restart the lab ('./lab.sh down', then up)"
+		fi
+	fi
+	# An alert is the IDS's to raise. Without it the traffic is still sent — permitted
+	# connections to unusual ports, logged ALLOW — but nothing is watching to call it hostile.
+	if [[ $WITH_IDS -ne 1 ]]; then
+		echo "warning: guaranteed-alert without the IDS: the traffic is sent, but no alert can be raised" >&2
+	fi
+fi
+
 # The LOG target is a module on the WSL kernel and is loaded on demand, but failing here
 # with a clear message beats discovering an empty log file after the run.
 modprobe xt_LOG 2>/dev/null || true
@@ -203,6 +223,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
 
 	  # Order matters, and these are applied in this order:
 	  ufw allow from $SUBNET to any port <${BENIGN_PORTS}> proto tcp
+	  ufw allow from $SUBNET to any port <${ALERT_PORTS}> proto tcp    # guaranteed-alert target
 	  ufw deny  from $SUBNET                                 # everything else = the attacker
 	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp    # keep dev stack reachable
 
@@ -211,9 +232,9 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	  and is logged as allowed, mislabelling part of the dataset.
 
 	  Then, into ufw's own chain, two unrate-limited LOG rules:
-	  iptables -I ufw-user-input 1 -s $SUBNET -p tcp -m multiport --dports <${BENIGN_PORTS}> \\
+	  iptables -I ufw-user-input 1 -s $SUBNET -p tcp -m multiport --dports <${ALLOWED_PORTS}> \\
 	           -j LOG --log-prefix "[UFW ALLOW] "
-	  iptables -I ufw-user-input 2 -s $SUBNET -p tcp -m multiport ! --dports <${BENIGN_PORTS}> \\
+	  iptables -I ufw-user-input 2 -s $SUBNET -p tcp -m multiport ! --dports <${ALLOWED_PORTS}> \\
 	           -j LOG --log-prefix "[UFW BLOCK] "
 
 	  ufw's own 'log' keyword hardcodes -m limit --limit 3/min --limit-burst 10 with no
@@ -224,6 +245,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	  veth $VETH_HOST <-> $VETH_NS, host $HOST_IP/24
 	  namespace addresses: ${USER_IPS[*]}
 	  attackers: ${MALICIOUS_IPS[*]:-none}
+	  listener on $HOST_IP ports <${ALERT_PORTS}>, accept-and-close (guaranteed-alert)
 
 	ufw rate-limits logging in two independent places, and both would gut a ${DURATION}s window:
 
@@ -268,6 +290,7 @@ else
 		if [[ $WITH_IDS -eq 1 ]] && declare -F slips_stop >/dev/null; then
 			slips_stop
 		fi
+		alert_listener_stop "${LISTENER_PID:-}"
 		ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
 		ip netns del "$NS" 2>/dev/null || true
 		ip link del "$VETH_HOST" 2>/dev/null || true
@@ -283,6 +306,7 @@ else
 		echo "firewall restored to ENABLED=$ORIG_ENABLED LOGLEVEL=$ORIG_LOGLEVEL"
 		return $rc
 	}
+	LISTENER_PID=""
 	trap restore EXIT INT TERM
 
 	# ---------------------------------------------------------------------------
@@ -302,6 +326,12 @@ else
 		ip netns exec "$NS" ip addr add "$ip_addr/24" dev "$VETH_NS"
 	done
 	ip netns exec "$NS" ip link set "$VETH_NS" up
+
+	# Answers the guaranteed-alert profile's connections. Host side and bound to the veth's
+	# host address, so it can only start once that exists. Stopped by the trap.
+	log "starting the alert listener on $HOST_IP ports $ALERT_PORTS"
+	LISTENER_PID=$(alert_listener_start "$HOST_IP" "$STATE_DIR/alert-listener.pid" "$STATE_DIR/alert-listener.log") \
+		|| die "could not start the alert listener"
 
 	# ---------------------------------------------------------------------------
 	# IDS
@@ -346,6 +376,13 @@ else
 		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 	done
 
+	# Permitted as well: the guaranteed-alert profile needs its connections to complete,
+	# and a denied SYN never does.
+	IFS=',' read -ra _alert <<< "$ALERT_PORTS"
+	for p in "${_alert[@]}"; do
+		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
+	done
+
 	# Everything else from the test subnet is the attacker. An explicit deny is clearer
 	# than relying on the default policy and, unlike the default, it is unambiguously
 	# attributable to this run.
@@ -376,9 +413,11 @@ else
 	# ufw reloads its chains from user.rules on enable/disable, so these do not survive the
 	# restore in the exit trap.
 	# ---------------------------------------------------------------------------
-	iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$BENIGN_PORTS" \
+	# ALLOWED_PORTS, not BENIGN_PORTS: the alert ports are permitted too, and the BLOCK rule
+	# below is "everything else", so leaving them out would label permitted traffic BLOCK.
+	iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$ALLOWED_PORTS" \
 		-j LOG --log-prefix "[UFW ALLOW] " --log-level 4
-	iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$BENIGN_PORTS" \
+	iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$ALLOWED_PORTS" \
 		-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
 	log "ufw active (verdict logging installed without ufw's 3/min cap)"
 fi
@@ -430,6 +469,7 @@ ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--attack-profile "$ATTACK_PROFILE" \
 	--benign-ports "$BENIGN_PORTS" \
 	--malicious-ports "$MALICIOUS_PORTS" \
+	--alert-ports "$ALERT_PORTS" \
 	--seed "$SEED" \
 	--out "$GT_JSON"
 
@@ -549,6 +589,7 @@ manifest = {
         "subnet": "${SUBNET}",
         "benign_ports": [int(p) for p in "${BENIGN_PORTS}".split(",")],
         "malicious_ports": [int(p) for p in "${MALICIOUS_PORTS}".split(",")],
+        "alert_ports": [int(p) for p in "${ALERT_PORTS}".split(",")],
     },
     "output": {
         "log_file": "firewall_${STAMP}.log",
@@ -584,6 +625,10 @@ manifest = {
         "a blocked SYN is retransmitted by the client kernel, so one blocked attempt can "
         "produce several BLOCK lines; count distinct SPT values, not lines, to recover "
         "the attempt count",
+        "ALERT_PORTS (${ALERT_PORTS}) are permitted from the subnet and answered by a "
+        "listener, so guaranteed-alert attempts are logged [UFW ALLOW] although the ground "
+        "truth labels them malicious. That is the scenario: the firewall let the attack "
+        "through, and only the IDS can say it was hostile",
     ],
 }
 json.dump(manifest, open(sys.argv[1], "w"), indent=2)
@@ -594,7 +639,7 @@ PY
 # ---------------------------------------------------------------------------
 IDS_LOG="$RUN_DIR/ids_${STAMP}.alerts.log"
 GROUP_MANIFEST="$RUN_DIR/window_${STAMP}.group.json"
-IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"
+IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"; IDS_ALERTS=0
 
 if [[ $WITH_IDS -eq 1 ]]; then
 	# Slips raises evidence in batches once it has seen the flows, so the window's
@@ -625,9 +670,11 @@ if [[ $WITH_IDS -eq 1 ]]; then
 		echo "warning: severity counts unreadable ('$IDS_SEVERITIES'); recording zeros" >&2
 		IDS_SEVERITIES="0 0 0 0 0"
 	fi
+	# Alert lines carry no threat level, so the counts above cannot include them.
+	IDS_ALERTS=$(slips_alert_count "$IDS_LOG")
 	IDS_SHA=$(sha256sum "$IDS_LOG" | cut -d' ' -f1)
 	chmod 444 "$IDS_LOG"
-	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} findings fall inside the window"
+	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} lines fall inside the window, ${IDS_ALERTS} of them alerts"
 
 	# Under a lab, Slips outlives this capture and keeps writing into its session
 	# directory: stopping it or moving that directory would end the lab's IDS on the
@@ -687,6 +734,7 @@ group = {
             "sha256": "${IDS_SHA}",
             "evidence_lines": ${IDS_KEPT},
             "evidence_lines_seen_total": ${IDS_TOTAL},
+            "alerts": ${IDS_ALERTS},
             "threat_levels": {
                 "critical": int(crit), "high": int(high),
                 "medium": int(med), "low": int(low), "info": int(info),
@@ -709,6 +757,9 @@ group = {
         "Slips keeps its own 1-hour timewindows internally and its alert threshold "
         "accumulates per profile across that hour, not across this ${DURATION}s window",
         "a line whose timestamp cannot be parsed is kept rather than dropped",
+        "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on "
+        "timewindow N'). They are sliced by their own leading timestamp, which is the flow that "
+        "completed the alert, and carry no threat level, so threat_levels does not include them",
     ],
 }
 json.dump(group, open(sys.argv[1], "w"), indent=2)
@@ -729,6 +780,9 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
+if [[ $WITH_IDS -eq 1 ]]; then
+	log "IDS: ${IDS_KEPT} lines in the window, ${IDS_ALERTS} of them alerts"
+fi
 log "sha256 $SHA256"
 log "window directory: $RUN_DIR"
 log "  firewall_${STAMP}.log              the evidence"

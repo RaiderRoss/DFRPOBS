@@ -83,9 +83,11 @@ the script keeps the dev stack's ports reachable; extend it if you add services.
 `--attack-profile`, `--seed`, `--outdir`.
 
 `--attack-profile` is one of `port-scan`, `brute-force`, `db-probe`, `stealth`,
-`syn-burst`, `mixed`. Each changes both the ports the attacker reaches for and how the
+`syn-burst`, `mixed`, `guaranteed-alert`. Each changes both the ports the attacker reaches for and how the
 attempts are spread in time; `generate_traffic.py --list-profiles` describes them, and
 `--plan-only` prints the resulting port histogram without sending anything.
+`guaranteed-alert` is the exception: its ports are *permitted*, and answered by a
+listener the script starts on the host, so its attempts complete and log as ALLOW.
 
 `--malicious-pct` (share of *events*) and `--malicious-users` (how many *users* attack)
 are independent knobs. The brief's "10%, 10:1" conflates them — 10:1 users is 9.09% of

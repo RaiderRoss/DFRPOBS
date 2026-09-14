@@ -187,12 +187,13 @@ profile_signature() {
 		stealth)     printf 'evenly spaced, maximal gaps — slips rate thresholds' ;;
 		syn-burst)   printf 'every attempt in one short spike against one port' ;;
 		mixed)       printf 'sweep first, then pressure on a single port' ;;
+		guaranteed-alert) printf 'ALLOWED conns to ports Slips cannot name — built to alert' ;;
 		*)           printf 'unknown profile' ;;
 	esac
 }
 
 profile_menu() {
-	local names="port-scan brute-force db-probe stealth syn-burst mixed"
+	local names="port-scan brute-force db-probe stealth syn-burst mixed guaranteed-alert"
 	while true; do
 		banner
 		head_ "Choose how the attacker behaves"
@@ -202,12 +203,23 @@ profile_menu() {
 		local i=1 p mark
 		for p in $names; do
 			if [ "$p" = "$ATTACK_PROFILE" ]; then mark="${C_OK}◂ selected${R}"; else mark=""; fi
-			printf '  %s%s%s  %-13s %s%-46s%s %b\n' "$C_NUM" "$i" "$R" "$p" \
+			printf '  %s%s%s  %-17s %s%-46s%s %b\n' "$C_NUM" "$i" "$R" "$p" \
 				"$C_DIM" "$(profile_signature "$p")" "$R" "$mark"
 			i=$((i + 1))
 		done
 		echo
-		printf '  %s7%s  Preview this profile %s(port histogram, no packets sent)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		if [ "$ATTACK_PROFILE" = "guaranteed-alert" ]; then
+			dim "  guaranteed-alert completes connections to ports ${ALERT_PORTS}, which the"
+			dim "  firewall permits, so Slips raises one HIGH finding per connection and crosses"
+			dim "  its alert threshold. The alert is the IDS's to raise:"
+			if [ "$WITH_IDS" = "1" ]; then
+				dim "  the IDS source is on."
+			else
+				warn "  the IDS source is OFF — turn it on under option 1, or nothing can alert."
+			fi
+			echo
+		fi
+		printf '  %s8%s  Preview this profile %s(port histogram, no packets sent)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		echo
 		printf '  %s0%s  back\n' "$C_NUM" "$R"
 		echo
@@ -220,7 +232,8 @@ profile_menu() {
 			4) ATTACK_PROFILE=stealth;     persist ATTACK_PROFILE ;;
 			5) ATTACK_PROFILE=syn-burst;   persist ATTACK_PROFILE ;;
 			6) ATTACK_PROFILE=mixed;       persist ATTACK_PROFILE ;;
-			7) preview_plan ;;
+			7) ATTACK_PROFILE=guaranteed-alert; persist ATTACK_PROFILE ;;
+			8) preview_plan ;;
 			0|q) return ;;
 			*) ;;
 		esac
@@ -346,12 +359,19 @@ preview_plan() {
 		--attack-profile "$ATTACK_PROFILE" \
 		--benign-ports "$BENIGN_PORTS" \
 		--malicious-ports "$MALICIOUS_PORTS" \
+		--alert-ports "$ALERT_PORTS" \
 		--seed "$SEED" --out /dev/null 2>&1 \
 	| python3 -c 'import json,sys
 d = json.load(sys.stdin)
 print("    %-20s %s" % ("planned events", d["planned_events"]))
 print("    %-20s %s" % ("malicious", d["malicious_events"]))
 print("    %-20s %s" % ("benign", d["benign_events"]))
+g = d.get("alert_guarantee")
+if g:
+    print()
+    print("    %-20s %s" % ("per attacker", ", ".join("%s: %s" % kv for kv in g["planned_per_attacker"].items())))
+    print("    %-20s %s completed each (%.1f per connection, threshold %.0f)"
+          % ("Slips needs", g["min_completed_per_attacker"], g["weight_per_completed_connection"], g["slips_threshold"]))
 h = d["malicious_port_histogram"]
 if h:
     top, low = max(h.values()), min(h.values())
@@ -361,7 +381,12 @@ if h:
     # A vertical scan spread evenly gives every port the same count, and a bar chart of
     # 35 identical full-width bars says nothing at all. The flatness IS the signature,
     # so name it; draw bars only when there is a shape to see.
-    if top == low:
+    if g:
+        print()
+        print("    Deliberately not a scan: %d ports, each connection meant to complete." % len(h))
+        print("    Slips marks a source a port scanner only for FAILED connections above five")
+        print("    ports, so none of the HIGH findings this profile relies on can be suppressed.")
+    elif top == low:
         print()
         print("    Every port hit the same number of times — an even sweep, which is")
         print("    what makes this a vertical scan rather than pressure on one service.")
@@ -406,6 +431,11 @@ run_capture() {
 	kv "profile"   "$ATTACK_PROFILE"
 	kv ""          "$(profile_signature "$ATTACK_PROFILE")"
 	kv "malicious" "${MALICIOUS_PCT}% of events"
+	if [ "$ATTACK_PROFILE" = "guaranteed-alert" ] && [ "$WITH_IDS" != "1" ]; then
+		echo
+		warn "guaranteed-alert with the IDS off: the traffic is sent, but nothing can raise the alert."
+		dim "    Turn the IDS on under option 1 first."
+	fi
 	echo
 	# What this costs and what it touches both depend on whether the sources are already
 	# standing. Saying "this enables ufw" while a lab has it enabled already is simply
@@ -582,6 +612,7 @@ if ids:
     t = ids["threat_levels"]
     kv("threat levels", "  ".join("%s %s" % (n, t[n]) for n in
         ("critical", "high", "medium", "low", "info")))
+    kv("alerts", ids.get("alerts", "-"))
     kv("sha256", (ids["sha256"] or "-")[:40] + ("..." if ids["sha256"] else ""))' "$group"
 
 		local ids_log="$OUTDIR/$run/ids_${run}.alerts.log"

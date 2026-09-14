@@ -76,12 +76,23 @@ attacker reaches for and how attempts are spread in time:
 | `stealth` | evenly spaced, maximal gaps — under rate thresholds |
 | `syn-burst` | every attempt in one short spike against one port |
 | `mixed` | sweep first, then sustained pressure on a single port |
+| `guaranteed-alert` | **permitted** connections to ports Slips has no record of — built so the IDS raises a real alert |
 
-All six are **vertical** in shape, because every simulated user targets the single host
+The first six are **vertical** in shape, because every simulated user targets the single host
 `10.99.0.1`. A **horizontal** scan is the other axis — one port swept across many hosts —
 and needs several addresses on the host side of the veth, which the current topology does
 not have. Slips detects both, and horizontal is one of its more reliable signatures, so
 it is worth adding when the correlation needs to be richer.
+
+`guaranteed-alert` exists to get an *alert* out of Slips, not just evidence. Slips alerts
+only when one source's weighted evidence in a one-hour timewindow reaches 15, and a port
+scan tops out around 5 — so the other profiles produce findings and never an alert. This
+one completes connections to a handful of ports Slips has no service record for
+(`ALERT_PORTS` in `lab-config.sh`), each worth 0.8, planning 38 per attacker against the
+19 needed. The firewall permits them and a listener on the host answers, so the firewall
+log shows `[UFW ALLOW]`: the firewall let the attack through, and only the IDS can say it
+was hostile. It needs the IDS source on. The arithmetic is in
+[IDS/README.md](IDS/README.md#getting-a-real-alert).
 
 Option **6** prints the port histogram for the selected profile without sending
 anything, so you can compare shapes before committing one to the dataset.

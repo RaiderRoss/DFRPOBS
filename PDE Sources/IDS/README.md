@@ -91,6 +91,42 @@ Under a lab, Slips spans many windows, so its working tree lives once per sessio
 `conn.log` is kept deliberately: it is the flow record the findings were derived from,
 and "on what basis" is a question an investigation will ask.
 
+## Getting a real alert
+
+Evidence is not an alert. Slips raises an alert only when one source's weighted evidence
+inside one timewindow reaches `detection_threshold × width / 60` — `0.25 × 3600 / 60 = 15`
+with its defaults — where each finding weighs its threat level (`info 0`, `low 0.2`,
+`medium 0.5`, `high 0.8`, `critical 1`) times its confidence. The port scan above peaks at
+about 5.4 for the attacker, so it yields findings and can never yield an alert.
+
+The `guaranteed-alert` profile is built from that arithmetic, read out of Slips' source:
+
+| | |
+|---|---|
+| finding | `Connection to unknown destination port` — HIGH if the connection was **established**, MEDIUM if not, confidence 1.0, once per connection |
+| weight | 0.8 per completed connection |
+| needed | ⌈15 / 0.8⌉ = **19** completed connections per attacker |
+| planned | **38** per attacker, shared out evenly across attackers |
+| ports | `ALERT_PORTS` in `lab-config.sh` — none in Slips' `services.csv` or its organisation port list |
+
+Two conditions make it hold, and the lab provides both. The connections must
+**complete**, so the ports are permitted from the subnet and a listener on the host
+accepts and closes each one. And there must be **five or fewer** distinct ports: the
+vertical-scan detector marks a source a port scanner above five, and a marked scanner has
+its unknown-port evidence suppressed — the very findings the alert is built from.
+
+The ground truth's `alert_guarantee` records `completed_per_attacker` and
+`traffic_sufficient`, which say whether the *traffic* delivered. Whether Slips *alerted*
+is its own output: `alerts` in the group manifest counts its verdict lines —
+
+```
+<iso>: Src IP 10.99.0.20                . Generated an alert given enough evidence on timewindow 1. (real time <iso>)
+```
+
+An alert resets that source's total to zero, and evidence already inside an alert is not
+counted again, so each capture has to cross the threshold on its own. This profile does
+so per window.
+
 ## Two things to know
 
 **Slips' timewindows are its own.** It profiles per source IP in 1-hour timewindows and

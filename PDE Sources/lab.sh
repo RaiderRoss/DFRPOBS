@@ -128,6 +128,19 @@ lab_up() {
 	done
 	ip netns exec "$NS" ip link set "$VETH_NS" up
 
+	# --- listener behind the alert ports --------------------------------------
+	# Bound to the host address, so it can only start once the veth carries it. Recorded in
+	# the state file immediately: it runs in the root namespace, so deleting the namespace
+	# would not stop it, and `down` must be able to find it even if setup fails after this.
+	log "starting the alert listener on $HOST_IP ports $ALERT_PORTS"
+	local listener_pid
+	listener_pid=$(alert_listener_start "$HOST_IP" "$LAB_DIR/alert-listener.pid" "$LAB_DIR/alert-listener.log") \
+		|| die "could not start the alert listener"
+	cat >> "$LAB_STATE" <<-EOF
+	LAB_LISTENER_PID="$listener_pid"
+	LAB_ALERT_PORTS="$ALERT_PORTS"
+	EOF
+
 	# --- IDS, before the firewall so `logging full` is not on during its startup ---
 	if [[ $WITH_IDS -eq 1 ]]; then
 		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
@@ -150,6 +163,12 @@ lab_up() {
 	for p in "${_benign[@]}"; do
 		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 	done
+	# Permitted as well: the guaranteed-alert profile needs its connections to complete,
+	# and a denied SYN never does.
+	IFS=',' read -ra _alert <<< "$ALERT_PORTS"
+	for p in "${_alert[@]}"; do
+		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
+	done
 	ufw deny from "$SUBNET" >/dev/null
 	IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
 	for p in "${_preserve[@]}"; do
@@ -163,9 +182,11 @@ lab_up() {
 	# loglevel check, which caps a window at ~11 verdict lines per rule however much
 	# traffic crosses. Same kernel target, same prefixes, no rate limit. Removed when
 	# ufw reloads on `down`.
-	iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$BENIGN_PORTS" \
+	# ALLOWED_PORTS, not BENIGN_PORTS: the alert ports are permitted too, and the BLOCK rule
+	# below is "everything else", so leaving them out would label permitted traffic BLOCK.
+	iptables -I ufw-user-input 1 -s "$SUBNET" -p tcp -m multiport --dports "$ALLOWED_PORTS" \
 		-j LOG --log-prefix "[UFW ALLOW] " --log-level 4
-	iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$BENIGN_PORTS" \
+	iptables -I ufw-user-input 2 -s "$SUBNET" -p tcp -m multiport ! --dports "$ALLOWED_PORTS" \
 		-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
 
 	log "lab up"
@@ -192,6 +213,11 @@ lab_down() {
 	LAB_ORIG_ENABLED=$(lab_get LAB_ORIG_ENABLED no)
 	LAB_ORIG_LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL low)
 	LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
+
+	# In the root namespace, so tearing the namespace down below would not stop it.
+	log "stopping the alert listener"
+	alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
+	rm -f "$LAB_DIR/alert-listener.pid"
 
 	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" ]]; then
 		# shellcheck source=IDS/slips-lib.sh
@@ -246,6 +272,12 @@ lab_status() {
 		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
 		echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
 		echo "  ids         $([[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && echo "slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")" || echo "not running")"
+		local lpid; lpid=$(lab_get LAB_LISTENER_PID "")
+		if [[ -n "$lpid" && -d "/proc/$lpid" ]]; then
+			echo "  listener    ports $(lab_get LAB_ALERT_PORTS "?") on $HOST_IP (pid $lpid)"
+		else
+			echo "  listener    not running — guaranteed-alert connections will not complete"
+		fi
 		echo "  restores to ENABLED=$(lab_get LAB_ORIG_ENABLED "?") LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL "?")"
 		return 0
 	fi

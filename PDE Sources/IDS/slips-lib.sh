@@ -189,7 +189,10 @@ if os.path.exists(src):
         if not line.strip():
             continue
         total += 1
-        ts = parse(line.split(" ", 1)[0])
+        # Alert lines put a colon straight after the timestamp ("<iso>: Src IP ...
+        # Generated an alert"), where evidence lines put a space. Stripped so an alert is
+        # sliced by its own time rather than kept only because it failed to parse.
+        ts = parse(line.split(" ", 1)[0].rstrip(":"))
         # A line whose timestamp cannot be parsed is kept: an unreadable
         # timestamp is a reason to look at the evidence, not to discard it.
         if ts is None or (start <= ts <= end):
@@ -215,4 +218,14 @@ if os.path.exists(path):
             counts[m.group(1).lower()] += 1
 print(" ".join(str(counts[l]) for l in levels))
 PY
+}
+
+# Slips' own alert verdicts in the sliced evidence, for the manifest. Evidence is what
+# Slips saw; an alert is Slips deciding one source crossed its threshold.
+# $1 = the sliced evidence file. Echoes one number.
+slips_alert_count() {
+	local n
+	# grep -c prints 0 AND exits 1 on no match; `|| true` keeps the one 0.
+	n=$(grep -cE "(Generated an alert|Is blocked) given enough evidence on timewindow" "$1" 2>/dev/null || true)
+	printf '%s' "${n:-0}"
 }

@@ -9,7 +9,8 @@
 #  keeps that from mislabelling the dataset. Two copies of these
 #  drifting apart would reintroduce that bug silently.
 #
-#  Defines variables only — no side effects.
+#  Defines variables and helper functions only — sourcing it
+#  has no side effects.
 # ==============================================================
 
 # Where a running lab records what it changed, so it can be undone later. Inside the
@@ -56,6 +57,24 @@ BENIGN_PORTS="80,443,8080"
 # opposite of the correlation this exists to demonstrate. None may overlap BENIGN_PORTS.
 MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,873,993,995,1080,1433,1521,2049,2375,3306,3389,5060,5432,5900,6379,8443,9200,11211,27017"
 
+# Ports the guaranteed-alert profile connects to. Permitted from the subnet and answered
+# by a listener on the host, so every attempt completes its handshake.
+#
+# Chosen against Slips' own tables, not by feel: none is in its services.csv or its
+# ports_used_by_specific_orgs.csv, so an ESTABLISHED connection to one is "unknown
+# destination port" evidence at HIGH (0.8), confidence 1.0, once per connection. Five at
+# most: above five distinct ports Slips' vertical-scan detector can mark the source a
+# port scanner, and a marked scanner has exactly this evidence suppressed. None may
+# overlap BENIGN_PORTS, MALICIOUS_PORTS or PRESERVE_PORTS.
+ALERT_PORTS="13337,17171,24242,28282"
+
+# Everything the subnet is permitted to reach, for the verdict LOG rules. The BLOCK rule
+# is "everything else", so a permitted port missing from here is logged as BLOCK.
+# iptables multiport accepts at most 15 ports.
+ALLOWED_PORTS="$BENIGN_PORTS,$ALERT_PORTS"
+
+ALERT_LISTENER="$PDE_ROOT/Firewall/alert_listener.py"
+
 # Host services kept reachable while ufw is up, so a default-deny firewall does not cut
 # off the dev stack or the Windows host's access to it. Overlaps MALICIOUS_PORTS on 22
 # and 5432 — see the rule ordering in lab.sh, which is what stops that overlap
@@ -64,3 +83,41 @@ PRESERVE_PORTS="22,5432,5433,8080,9000,9001,19092,8081"
 
 UFW_LOG="/var/log/ufw.log"
 KERN_LOG="/var/log/kern.log"
+
+# Starts the accept-and-close listener behind ALERT_PORTS, detached, so it outlives the
+# script that started it — lab.sh exits as soon as the lab is up.
+#   alert_listener_start <host> <pidfile> <logfile>    echoes the PID
+#
+# The listener writes its own PID once every port is bound. That file is the readiness
+# signal and the only trustworthy PID: setsid forks when it has to, and then $! names a
+# process that has already exited.
+alert_listener_start() {
+	local host="$1" pidfile="$2" logfile="$3" i
+	rm -f "$pidfile"
+	setsid python3 "$ALERT_LISTENER" --host "$host" --ports "$ALERT_PORTS" \
+		--pidfile "$pidfile" </dev/null >"$logfile" 2>&1 &
+	for ((i = 0; i < 50; i++)); do
+		if [[ -s "$pidfile" ]]; then
+			cat "$pidfile"
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "the alert listener did not come up; its output:" >&2
+	sed 's/^/    /' "$logfile" >&2 2>/dev/null || true
+	return 1
+}
+
+# Stops it. The PID is checked against the process's command line before it is
+# signalled: one recorded by a session that did not survive a reboot may now name
+# anything. With no usable PID it falls back to the script path, which nothing else runs.
+#   alert_listener_stop [pid]
+alert_listener_stop() {
+	local pid="${1:-}"
+	if [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] \
+		&& [[ "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" == *alert_listener.py* ]]; then
+		kill "$pid" 2>/dev/null || true
+		return 0
+	fi
+	pkill -f -- "Firewall/alert_listener.py" 2>/dev/null || true
+}
