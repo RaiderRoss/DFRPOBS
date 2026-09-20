@@ -10,6 +10,7 @@ import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willThrow;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -37,12 +38,17 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockMultipartHttpServletRequestBuilder;
 
 import za.co.dfraas.config.SecurityConfiguration;
+import za.co.dfraas.dto.CustodyEventDto;
 import za.co.dfraas.dto.EvidenceItemDto;
+import za.co.dfraas.dto.IntegrityCheckResult;
+import za.co.dfraas.entity.CustodyAction;
 import za.co.dfraas.entity.EvidenceStatus;
 import za.co.dfraas.exception.DuplicateResourceException;
+import za.co.dfraas.exception.EvidenceStorageException;
 import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.exception.ResourceNotFoundException;
 import za.co.dfraas.service.EvidenceItemService;
+import za.co.dfraas.service.IntegrityCheckService;
 
 /**
  * Web-layer contract for {@link EvidenceItemResource}: the multipart upload shape, and the
@@ -50,6 +56,10 @@ import za.co.dfraas.service.EvidenceItemService;
  * (400), an unregistered source (404), an artifact already preserved (409) and bytes that
  * did not survive the trip (422). The service is mocked; what it actually verifies is
  * covered by {@code EvidenceItemServiceTest}.
+ *
+ * <p>Also the integrity-check endpoint's contract: a mismatch is a 200 with the finding in
+ * the body, because the check ran and the evidence is what failed; only an unreachable store
+ * is an error. What the check records is covered by {@code IntegrityCheckServiceTest}.
  */
 @WebMvcTest(EvidenceItemResource.class)
 @Import({SecurityConfiguration.class, ApiExceptionHandler.class})
@@ -65,11 +75,18 @@ class EvidenceItemResourceTest {
 	private static final String CONTENT_SHA256 =
 			"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
+	/** SHA-256 of "goodbye" — a valid digest of the wrong bytes. */
+	private static final String OTHER_SHA256 =
+			"82e35a63ceba37e9646434c5dd412ea577147f1e4a41ccde1614253187e3dbf9";
+
 	@Autowired
 	private MockMvc mockMvc;
 
 	@MockitoBean
 	private EvidenceItemService service;
+
+	@MockitoBean
+	private IntegrityCheckService integrityCheckService;
 
 	@Test
 	@DisplayName("GET lists preserved artifacts as a page, not a bare array")
@@ -263,6 +280,94 @@ class EvidenceItemResourceTest {
 						"2026-09-05T14:30:30Z")))
 				.andExpect(status().isBadRequest())
 				.andExpect(jsonPath("$.fieldErrors.sourceSha256").exists());
+	}
+
+	@Test
+	@DisplayName("POST integrity-checks runs the check as the authenticated principal and returns the result")
+	void integrityCheckReturnsTheResultAttributedToTheCaller() throws Exception {
+		given(integrityCheckService.check(eq(ITEM_ID), eq("user")))
+				.willReturn(checkResult(true, CONTENT_SHA256, EvidenceStatus.PRESERVED, CustodyAction.HASH_VERIFIED));
+
+		mockMvc.perform(post("/api/evidence-items/{id}/integrity-checks", ITEM_ID))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.intact").value(true))
+				.andExpect(jsonPath("$.expectedHash").value(CONTENT_SHA256))
+				.andExpect(jsonPath("$.observedHash").value(CONTENT_SHA256))
+				.andExpect(jsonPath("$.status").value("PRESERVED"))
+				.andExpect(jsonPath("$.custodyEvent.action").value("HASH_VERIFIED"))
+				.andExpect(jsonPath("$.custodyEvent.sequence").value(1));
+
+		then(integrityCheckService).should().check(ITEM_ID, "user");
+	}
+
+	/**
+	 * The ingest path's 422 means "rejected, resend". A re-verification that finds a mismatch
+	 * is the opposite: the finding was recorded and the item marked, and the request did
+	 * exactly what was asked. The evidence failed; the request did not.
+	 */
+	@Test
+	@DisplayName("A mismatch is a 200 with the finding in the body, not a 4xx")
+	void integrityMismatchIsOkWithTheFindingInTheBody() throws Exception {
+		given(integrityCheckService.check(any(), any()))
+				.willReturn(checkResult(false, OTHER_SHA256, EvidenceStatus.COMPROMISED, CustodyAction.HASH_MISMATCH));
+
+		mockMvc.perform(post("/api/evidence-items/{id}/integrity-checks", ITEM_ID))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.intact").value(false))
+				.andExpect(jsonPath("$.expectedHash").value(CONTENT_SHA256))
+				.andExpect(jsonPath("$.observedHash").value(OTHER_SHA256))
+				.andExpect(jsonPath("$.status").value("COMPROMISED"))
+				.andExpect(jsonPath("$.custodyEvent.action").value("HASH_MISMATCH"))
+				.andExpect(jsonPath("$.custodyEvent.artifactHashBefore").value(CONTENT_SHA256))
+				.andExpect(jsonPath("$.custodyEvent.artifactHashAfter").value(OTHER_SHA256));
+	}
+
+	@Test
+	@DisplayName("An integrity check on an unknown item is 404")
+	void integrityCheckOnUnknownItemIsNotFound() throws Exception {
+		willThrow(ResourceNotFoundException.of("EvidenceItem", ITEM_ID))
+				.given(integrityCheckService).check(any(), any());
+
+		mockMvc.perform(post("/api/evidence-items/{id}/integrity-checks", ITEM_ID))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.title").value("Resource not found"));
+	}
+
+	/**
+	 * An unreachable store is the one outcome that is an error rather than a finding, and the
+	 * response must not carry the object key the exception's own message names.
+	 */
+	@Test
+	@DisplayName("An unreachable store is 503 and the body does not name the storage key")
+	void integrityCheckStorageFailureIsServiceUnavailable() throws Exception {
+		willThrow(new EvidenceStorageException("Could not read evidence object pde-sim-ufw-01/" + ARTIFACT_ID, null))
+				.given(integrityCheckService).check(any(), any());
+
+		String body = mockMvc.perform(post("/api/evidence-items/{id}/integrity-checks", ITEM_ID))
+				.andExpect(status().isServiceUnavailable())
+				.andExpect(jsonPath("$.title").value("Evidence store unavailable"))
+				.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).doesNotContain("pde-sim-ufw-01/");
+	}
+
+	private static IntegrityCheckResult checkResult(
+			boolean intact, String observed, EvidenceStatus status, CustodyAction action) {
+		CustodyEventDto entry = new CustodyEventDto(
+				UUID.fromString("44444444-4444-4444-4444-444444444444"),
+				ITEM_ID,
+				1L,
+				action,
+				"user",
+				OffsetDateTime.parse("2026-09-06T09:15:00.123456Z"),
+				OffsetDateTime.parse("2026-09-06T09:15:00.125000Z"),
+				CONTENT_SHA256,
+				observed,
+				"3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+				"b1f5a6d7c8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071829",
+				(short) 1,
+				"Re-verified on demand.");
+		return new IntegrityCheckResult(ITEM_ID, intact, CONTENT_SHA256, observed, status, entry);
 	}
 
 	private static MockMultipartHttpServletRequestBuilder upload(String metadata) {

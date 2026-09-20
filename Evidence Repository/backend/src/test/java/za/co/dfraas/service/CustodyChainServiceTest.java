@@ -279,6 +279,46 @@ class CustodyChainServiceTest {
 				.hasMessageContaining("canonical version 99");
 	}
 
+	/**
+	 * "No such item" and "item with no chain" are both an empty result from this table, and
+	 * they mean opposite things: one is a caller's typo, the other is an artifact this system
+	 * holds and cannot account for. Reporting the first as the second would let a mistyped
+	 * id read as a finding against the evidence.
+	 */
+	@Test
+	@DisplayName("Verifying an artifact that does not exist is a not-found, never a missing origin")
+	void verifyUnknownItemIsNotFound() {
+		assertThatThrownBy(() -> service.verify(UUID.randomUUID()))
+				.isInstanceOf(ResourceNotFoundException.class);
+	}
+
+	@Test
+	@DisplayName("The chain is read back whole and in ledger order, unverified")
+	void chainIsReadInSequenceOrder() {
+		service.recordCreation(item, PRINCIPAL, "Preserved on streamed ingest.");
+		append(1, "Re-verified on read.");
+		append(2, "Re-verified on read.");
+		entityManager.flush();
+		entityManager.clear();
+
+		// A tampered row is still returned — the listing shows what the ledger says, and
+		// verify() is a separate answer to whether it can be believed.
+		execute("UPDATE custody_event SET performed_by = 'someone.else' "
+				+ "WHERE evidence_item_id = :itemId AND \"sequence\" = 1");
+
+		List<CustodyEvent> chain = service.chainOf(item.getId());
+		assertThat(chain).extracting(CustodyEvent::getSequence).containsExactly(0L, 1L, 2L);
+		assertThat(chain.get(1).getPerformedBy()).isEqualTo("someone.else");
+		assertThat(service.verify(item.getId()).firstDivergentSequence()).isEqualTo(1L);
+	}
+
+	@Test
+	@DisplayName("Reading the chain of an artifact that does not exist is a not-found")
+	void chainOfUnknownItemIsNotFound() {
+		assertThatThrownBy(() -> service.chainOf(UUID.randomUUID()))
+				.isInstanceOf(ResourceNotFoundException.class);
+	}
+
 	@Test
 	@DisplayName("Appending to an artifact that does not exist is rejected")
 	void appendToUnknownItemIsRejected() {

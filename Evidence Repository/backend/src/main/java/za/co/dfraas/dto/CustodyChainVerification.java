@@ -2,6 +2,8 @@ package za.co.dfraas.dto;
 
 import java.util.UUID;
 
+import io.swagger.v3.oas.annotations.media.Schema;
+
 /**
  * The outcome of walking one artifact's chain of custody.
  *
@@ -39,12 +41,46 @@ import java.util.UUID;
  *                              witnessed outside this database to close the one gap the chain
  *                              cannot close for itself — a truncation of its own end
  */
+@Schema(name = "CustodyChainVerification",
+		description = """
+				The result of walking an artifact's chain of custody from its genesis hash. Reports \
+				where the ledger stops agreeing with itself, not merely whether it does. Note what an \
+				intact result does and does not prove: interior edits, reorderings and deleted middle \
+				entries are detected; truncation of the chain's end is not, which is why headEntryHash \
+				is returned — it is the value to witness outside this system.
+				""")
 public record CustodyChainVerification(
+
+		@Schema(description = "The artifact whose chain was walked", example = "c4d1f7a2-33b8-4e19-9a06-5f2b8e4c1d73")
 		UUID evidenceItemId,
+
+		@Schema(description = "True when every entry is contiguous from 0 and every digest agrees", example = "true")
 		boolean intact,
+
+		@Schema(description = """
+				True when the chain is empty. Never a legitimate state — every item gets an opening \
+				entry in the transaction that creates it — so this means the item predates the ledger \
+				or its chain was deleted wholesale.
+				""",
+				example = "false")
 		boolean missingOrigin,
+
+		@Schema(description = """
+				The position at which the ledger stopped agreeing with itself, or null when it never \
+				did. The expected position, not a value read from a row, so a deleted middle entry is \
+				reported at the hole rather than past it.
+				""",
+				example = "null", nullable = true)
 		Long firstDivergentSequence,
+
+		@Schema(description = "How many entries were read, kept even when verification failed", example = "3")
 		int length,
+
+		@Schema(description = """
+				The last entry's entryHash when the chain is intact, null otherwise. Witness this \
+				outside the repository to detect truncation of the chain's end.
+				""",
+				example = "3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b", nullable = true)
 		String headEntryHash) {
 
 	public static CustodyChainVerification intact(UUID evidenceItemId, int length, String headEntryHash) {

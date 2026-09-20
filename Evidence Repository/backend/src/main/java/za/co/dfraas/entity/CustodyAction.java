@@ -28,19 +28,17 @@ package za.co.dfraas.entity;
  *       OTP step-up it does not implement, so nothing in this application can serve
  *       evidence bytes and nothing could write this entry.</li>
  *   <li>{@code STATUS_CHANGED} — no endpoint or scheduled task changes
- *       {@code EvidenceItem.status} after ingest.</li>
- *   <li>{@code HASH_MISMATCH} — needs {@code IntegrityCheck} and the re-verification pass.
- *       Note that the mismatches the ingest path already detects cannot be recorded here:
- *       both abort the transaction, and {@code CustodyChainService.append} joins the caller's
- *       transaction by design, so the entry would roll back with the row it describes. A
- *       failed ingest leaves no artifact and therefore no chain to append to.</li>
+ *       {@code EvidenceItem.status} by operator decision. The one status transition that
+ *       does exist, to {@code COMPROMISED}, is a consequence of {@link #HASH_MISMATCH} and
+ *       is recorded by that entry rather than by a second one in the same transaction.</li>
  *   <li>{@code ACCESSED} — belongs to {@code AccessLog}, which the README keeps separate
  *       from this table on purpose: reads are high-volume and do not change custody, and
  *       mixing them in would bury the handful of entries that do.</li>
  * </ul>
  *
  * <p>Adding any of them is one {@code ALTER TABLE} against
- * {@code ck_custody_event_action}, in the same changeset as the code that emits it.
+ * {@code ck_custody_event_action}, in the same changeset as the code that emits it —
+ * changeset {@code 0007} is what that looks like.
  */
 public enum CustodyAction {
 
@@ -60,5 +58,41 @@ public enum CustodyAction {
 	 * {@code artifactHashBefore}: there was no prior state. That is the anchor for every
 	 * later change to {@code EvidenceItem.currentHash}, which is mutable by design.
 	 */
-	CREATED
+	CREATED,
+
+	/**
+	 * The stored object was read back, re-hashed, and the digest matched
+	 * {@code EvidenceItem.currentHash}. Written by {@code IntegrityCheckService.check}.
+	 *
+	 * <p><strong>The hash pair reads as expected/observed on this entry</strong>, not
+	 * before/after: a verification does not change the bytes, so {@code artifactHashBefore}
+	 * is the digest the item was expected to have and {@code artifactHashAfter} is the one
+	 * recomputed from storage. They are equal here by definition, and both are carried
+	 * rather than one, so a reader does not have to infer what the check compared against
+	 * from whichever {@code CREATED} entry happens to be at the top of the chain.
+	 *
+	 * <p>Recorded even though nothing changed, because "this artifact was re-verified on
+	 * this date by this principal and was intact" is a custody fact in its own right — it
+	 * is the evidence that the evidence was looked after. A chain that only ever records
+	 * failures cannot show that anyone was checking.
+	 */
+	HASH_VERIFIED,
+
+	/**
+	 * The stored object was read back, re-hashed, and the digest did not match
+	 * {@code EvidenceItem.currentHash}. Written by {@code IntegrityCheckService.check}, which
+	 * moves the item to {@link EvidenceStatus#COMPROMISED} in the same transaction.
+	 *
+	 * <p>Reads as expected/observed like {@link #HASH_VERIFIED}: {@code artifactHashBefore}
+	 * is the digest the item should have produced, {@code artifactHashAfter} is what it did
+	 * produce. This entry <em>is</em> the record of what was found — there is no separate
+	 * integrity-check table, for the reason changeset {@code 0007} gives — and it is the
+	 * most consequential thing the ledger can hold, which is exactly why it sits in the
+	 * chain that cannot be edited.
+	 *
+	 * <p>{@code EvidenceItem.currentHash} is deliberately <em>not</em> updated to the observed
+	 * value. That column is the expectation; overwriting it with the observation would erase
+	 * the discrepancy this entry exists to preserve, and would make a subsequent check pass.
+	 */
+	HASH_MISMATCH
 }

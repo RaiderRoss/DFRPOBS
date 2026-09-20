@@ -32,4 +32,8 @@
          preserved artifact. Must follow 0003 — every chain hangs off an evidence_item. -->
     <include file="changes/0006-create-custody-event.xml" relativeToChangelogFile="true"/>
 
+    <!-- Integrity re-verification: widens the custody action list to hold the two outcomes
+         of re-hashing a stored artifact against its recorded digest. Must follow 0006. -->
+    <include file="changes/0007-widen-custody-actions-for-integrity-checks.xml" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>

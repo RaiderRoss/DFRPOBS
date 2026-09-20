@@ -230,8 +230,16 @@ public class CustodyChainService {
 	 *
 	 * <p>Recomputation is dispatched on each row's {@code canonicalVersion}, so entries keep
 	 * verifying under the rules they were written under.
+	 *
+	 * <p>An id that names no item at all is a {@link ResourceNotFoundException}, not a
+	 * {@code missingOrigin}. The two look alike from inside this table — both are an empty
+	 * result — and they mean opposite things: one is a caller's typo, the other is an
+	 * artifact this system holds and cannot account for. Reporting the first as the second
+	 * would let a mistyped id read as a finding against the evidence.
 	 */
 	public CustodyChainVerification verify(UUID evidenceItemId) {
+		requireItem(evidenceItemId);
+
 		List<CustodyEvent> chain = repository.findByEvidenceItemIdOrderBySequenceAsc(evidenceItemId);
 		if (chain.isEmpty()) {
 			log.error("Custody chain has no origin: itemId={}", evidenceItemId);
@@ -264,6 +272,33 @@ public class CustodyChainService {
 		}
 
 		return CustodyChainVerification.intact(evidenceItemId, chain.size(), expectedPrev);
+	}
+
+	/**
+	 * One artifact's chain in ledger order, as it is — for an investigator reading an
+	 * exhibit's history, and for whatever witnesses the head hash outside this database.
+	 *
+	 * <p><strong>Deliberately not verified on the way out.</strong> A listing that silently
+	 * dropped or annotated entries it could not verify would be making a judgement the
+	 * reader should make with the full record in front of them, and a listing that refused
+	 * to show a tampered chain would hide exactly the rows an investigation most needs to
+	 * see. The chain is returned complete and {@link #verify} is a separate call, so the two
+	 * answers — what the ledger says, and whether it agrees with itself — are never
+	 * conflated in one response.
+	 *
+	 * <p>Unpaged for the reasons {@link CustodyEventRepository#findByEvidenceItemIdOrderBySequenceAsc}
+	 * gives: a chain is bounded by how often one artifact is handled, not by what the estate
+	 * produces.
+	 */
+	public List<CustodyEvent> chainOf(UUID evidenceItemId) {
+		requireItem(evidenceItemId);
+		return repository.findByEvidenceItemIdOrderBySequenceAsc(evidenceItemId);
+	}
+
+	private void requireItem(UUID evidenceItemId) {
+		if (!evidenceItemRepository.existsById(evidenceItemId)) {
+			throw ResourceNotFoundException.of(RESOURCE, evidenceItemId);
+		}
 	}
 
 	/**
