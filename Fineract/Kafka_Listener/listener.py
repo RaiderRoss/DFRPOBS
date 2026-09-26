@@ -375,61 +375,69 @@ def dead_letter(msg, reason, record=None):
 
 
 # Main
-if not SECURERS_API_KEY:
-    raise SystemExit(
-        "SECURERS_API_KEY is not set. Create an API key in the SecureRS admin "
-        "(https://localhost:8443/admin/ -> API Key Permissions -> API keys) and "
-        "pass the full '<prefix>.<secret>' value."
-    )
-
-print(f"{BOLD}Loading Avro schemas from {SCHEMA_DIRS}...{RESET}", flush=True)
-schemas = load_schemas(SCHEMA_DIRS)
-print(f"Loaded {len(schemas)} schemas", flush=True)
-
-print(f"{BOLD}SecureRS target{RESET}  {SECURERS_URL}", flush=True)
-print(f"  {DIM}tls verify:{RESET} {VERIFY}", flush=True)
-print(f"  {DIM}attributed:{RESET} ip={SOURCE_IP} rank={RANK}", flush=True)
-print(f"  {DIM}dead-letter:{RESET} {DEAD_LETTER_PATH or '(disabled — failures are logged only)'}", flush=True)
-
-consumer = None
-while consumer is None:
-    try:
-        consumer = KafkaConsumer(
-            bootstrap_servers=BOOTSTRAP,
-            auto_offset_reset=AUTO_OFFSET_RESET,
-            group_id=GROUP_ID,
-            enable_auto_commit=False,
+# Guarded so the decoding helpers above can be imported without starting a consumer:
+# PDE Sources' window collector (collect_window.py) reads the same topic with the same
+# schemas, and a second copy of load_schemas would drift from this one.
+def main():
+    if not SECURERS_API_KEY:
+        raise SystemExit(
+            "SECURERS_API_KEY is not set. Create an API key in the SecureRS admin "
+            "(https://localhost:8443/admin/ -> API Key Permissions -> API keys) and "
+            "pass the full '<prefix>.<secret>' value."
         )
-        print(f"{GREEN}Connected to Kafka at {BOOTSTRAP}{RESET}", flush=True)
-    except NoBrokersAvailable:
-        print("Kafka not ready, retrying in 5s...", flush=True)
-        time.sleep(5)
 
-consumer.subscribe(TOPICS)
-print(f"Subscribed to: {TOPICS} as group '{GROUP_ID}'", flush=True)
-print(f"{CYAN}Waiting for events...{RESET}\n", flush=True)
+    print(f"{BOLD}Loading Avro schemas from {SCHEMA_DIRS}...{RESET}", flush=True)
+    schemas = load_schemas(SCHEMA_DIRS)
+    print(f"Loaded {len(schemas)} schemas", flush=True)
 
-for msg in consumer:
-    if msg.topic not in TOPICS:
+    print(f"{BOLD}SecureRS target{RESET}  {SECURERS_URL}", flush=True)
+    print(f"  {DIM}tls verify:{RESET} {VERIFY}", flush=True)
+    print(f"  {DIM}attributed:{RESET} ip={SOURCE_IP} rank={RANK}", flush=True)
+    print(f"  {DIM}dead-letter:{RESET} {DEAD_LETTER_PATH or '(disabled — failures are logged only)'}", flush=True)
+
+    consumer = None
+    while consumer is None:
+        try:
+            consumer = KafkaConsumer(
+                bootstrap_servers=BOOTSTRAP,
+                auto_offset_reset=AUTO_OFFSET_RESET,
+                group_id=GROUP_ID,
+                enable_auto_commit=False,
+            )
+            print(f"{GREEN}Connected to Kafka at {BOOTSTRAP}{RESET}", flush=True)
+        except NoBrokersAvailable:
+            print("Kafka not ready, retrying in 5s...", flush=True)
+            time.sleep(5)
+
+    consumer.subscribe(TOPICS)
+    print(f"Subscribed to: {TOPICS} as group '{GROUP_ID}'", flush=True)
+    print(f"{CYAN}Waiting for events...{RESET}\n", flush=True)
+
+    for msg in consumer:
+        if msg.topic not in TOPICS:
+            consumer.commit()
+            continue
+
+        record, error = build_record(msg, schemas)
+        if record is None:
+            dead_letter(msg, error)
+            consumer.commit()
+            continue
+
+        ok, detail = submit(record)
+        if ok:
+            log(
+                f"{GREEN}✓{RESET} {BOLD}{record['event_type']}{RESET} "
+                f"{DIM}{record['category']}  p{msg.partition} o{msg.offset}  "
+                f"{len(record['blob'])}B  md5={record['digest'][:8]}…{RESET}"
+            )
+            if VERBOSE:
+                print(record["blob"].decode("utf-8"), flush=True)
+        else:
+            dead_letter(msg, detail, record)
+
         consumer.commit()
-        continue
 
-    record, error = build_record(msg, schemas)
-    if record is None:
-        dead_letter(msg, error)
-        consumer.commit()
-        continue
 
-    ok, detail = submit(record)
-    if ok:
-        log(
-            f"{GREEN}✓{RESET} {BOLD}{record['event_type']}{RESET} "
-            f"{DIM}{record['category']}  p{msg.partition} o{msg.offset}  "
-            f"{len(record['blob'])}B  md5={record['digest'][:8]}…{RESET}"
-        )
-        if VERBOSE:
-            print(record["blob"].decode("utf-8"), flush=True)
-    else:
-        dead_letter(msg, detail, record)
-
-    consumer.commit()
+if __name__ == "__main__":
+    main()
