@@ -68,10 +68,18 @@ MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,
 # overlap BENIGN_PORTS, MALICIOUS_PORTS or PRESERVE_PORTS.
 ALERT_PORTS="13337,17171,24242,28282"
 
+# The bank, as the simulated users see it. Fineract runs on the research VM; the lab
+# forwards HOST_IP:BANK_PORT to it over an IAP SSH tunnel (see Remote/vm-lib.sh), so a
+# user in the namespace reaches the bank the way a customer reaches a bank's API: through
+# this host's firewall, where ufw logs it on INPUT like any other permitted connection.
+# That forward is what lets one actor appear in the firewall log, the IDS evidence and
+# the bank's own audit trail for the same window. None may overlap the lists above.
+BANK_PORT=8443
+
 # Everything the subnet is permitted to reach, for the verdict LOG rules. The BLOCK rule
 # is "everything else", so a permitted port missing from here is logged as BLOCK.
 # iptables multiport accepts at most 15 ports.
-ALLOWED_PORTS="$BENIGN_PORTS,$ALERT_PORTS"
+ALLOWED_PORTS="$BENIGN_PORTS,$ALERT_PORTS,$BANK_PORT"
 
 ALERT_LISTENER="$PDE_ROOT/Firewall/alert_listener.py"
 
@@ -83,6 +91,30 @@ PRESERVE_PORTS="22,5432,5433,8080,9000,9001,19092,8081"
 
 UFW_LOG="/var/log/ufw.log"
 KERN_LOG="/var/log/kern.log"
+
+# The research VM that hosts Fineract, the Evidence Repository and Slips. The lab itself
+# stays on this machine; see Remote/README.md for why the split falls where it does.
+# Overridable in pde.conf.
+VM_PROJECT="${VM_PROJECT:-fineract-slips-research}"
+VM_NAME="${VM_NAME:-fineract-slips}"
+VM_ZONE="${VM_ZONE:-africa-south1-a}"
+# The account the lab uses on the VM. gcloud would otherwise log in as whatever your local
+# username is — different on Windows and in WSL, different for every teammate — and each
+# would land in an empty home with no checkout and no docker access. One shared account,
+# with everyone's key mapped onto it, makes the VM the same place for all of them.
+VM_USER="${VM_USER:-pde}"
+# The VM's checkout of this repository, relative to VM_USER's home. It is updated with
+# `./vm.sh sync`, which ships a bundle: the VM holds no credential for the repo.
+VM_REPO_DIR="${VM_REPO_DIR:-DFRPOBS}"
+# A named gcloud configuration, passed on every call and never activated, so nothing
+# here can change which project the machine's default configuration points at.
+VM_GCLOUD_CONFIG="${VM_GCLOUD_CONFIG:-fineract-research}"
+# Where the VM's services appear on this machine while the admin tunnel is up. Not the
+# services' own ports: a locally-run Evidence Repository already owns 8080. The frontend
+# is deliberately absent — its CORS rule names localhost:5173 exactly, so it is browsed
+# through a tunnel on its real ports (Remote/README.md), not a remapped one.
+VM_LOCAL_REPO_PORT="${VM_LOCAL_REPO_PORT:-18080}"
+VM_LOCAL_FINERACT_PORT="${VM_LOCAL_FINERACT_PORT:-18443}"
 
 # Starts the accept-and-close listener behind ALERT_PORTS, detached, so it outlives the
 # script that started it — lab.sh exits as soon as the lab is up.

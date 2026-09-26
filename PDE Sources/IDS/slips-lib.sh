@@ -229,3 +229,150 @@ slips_alert_count() {
 	n=$(grep -cE "(Generated an alert|Is blocked) given enough evidence on timewindow" "$1" 2>/dev/null || true)
 	printf '%s' "${n:-0}"
 }
+
+# ===========================================================================
+# Remote mode: the sensor here, the analysis on the research VM.
+#
+# tcpdump writes the veth to one pcap for the life of the lab — the sensor never stops.
+# Each window is the slice of that file written while the window was open, taken by byte
+# offset exactly as the ufw log is, then shipped to the VM and analysed there by Slips in
+# file mode. Packets keep the timestamps the kernel gave them here, on the same clock the
+# window bounds and the firewall log use, so the IDS evidence lines up with them without
+# any correction. Slips starts fresh per window, which is the one thing this mode gives up:
+# its per-source profile no longer carries over between windows.
+#
+# Requires Remote/vm-lib.sh sourced (vm_ssh).
+# ===========================================================================
+
+# Starts the capture, detached, and echoes tcpdump's PID once the file exists.
+#   pcap_capture_start <iface> <pcap> <logfile>
+pcap_capture_start() {
+	local iface="$1" pcap="$2" logfile="$3" i
+	mkdir -p "$(dirname "$pcap")"
+	# -U: write each packet as it is captured, so the file on disk is never more than one
+	# packet behind the wire — what makes a byte offset a meaningful moment.
+	# -Z root: keep writing as root; the output directory is not the tcpdump user's.
+	# -s 0: whole packets. The IDS needs payloads only for what is unencrypted, but a
+	# truncated capture is a decision nobody could undo later.
+	setsid tcpdump -i "$iface" -U -s 0 -Z root -w "$pcap" </dev/null >"$logfile" 2>&1 &
+	local pid=$!
+	for ((i = 0; i < 50; i++)); do
+		# The pcap global header is 24 bytes and is written as soon as the file opens.
+		if [[ -s "$pcap" ]] && [[ $(stat -c %s "$pcap") -ge 24 ]]; then
+			echo "$pid"
+			return 0
+		fi
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.1
+	done
+	echo "tcpdump did not start on $iface; its output:" >&2
+	sed 's/^/    /' "$logfile" >&2 2>/dev/null || true
+	return 1
+}
+
+# PID checked against the command line before it is signalled, as the alert listener's is.
+pcap_capture_stop() {
+	local pid="${1:-}"
+	if [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] \
+		&& [[ "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" == *tcpdump* ]]; then
+		kill -INT "$pid" 2>/dev/null || true   # INT: tcpdump flushes and closes the file
+	fi
+}
+
+pcap_offset() { stat -c %s "$1" 2>/dev/null || echo 0; }
+
+# Writes the packets captured after <offset> to <dest> as a standalone pcap.
+#   pcap_slice <pcap> <offset> <dest>     echoes "<packets> <first_ts> <last_ts>"
+#
+# Walks record headers from the start of the file rather than seeking to the offset: the
+# offset was taken while tcpdump was writing and may fall inside a record, and a slice
+# that began mid-record would be garbage from its first byte. A record belongs to the
+# window if it *starts* at or after the offset; one still being written at the end is
+# left out, and is picked up whole by the next window instead of split across two.
+pcap_slice() {
+	python3 - "$1" "$2" "$3" <<'PY'
+import os, struct, sys
+src, offset, dest = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+size = os.path.getsize(src)                     # boundary taken once, now
+with open(src, "rb") as fh:
+    header = fh.read(24)
+    if len(header) < 24:
+        sys.exit("capture has no pcap header")
+    magic = struct.unpack("<I", header[:4])[0]
+    if magic in (0xa1b2c3d4, 0xa1b23c4d):
+        endian = "<"
+    elif magic in (0xd4c3b2a1, 0x4d3cb2a1):
+        endian = ">"
+    else:
+        sys.exit("not a pcap file (magic %08x)" % magic)
+    nano = magic in (0xa1b23c4d, 0x4d3cb2a1)
+    pos, count, first, last = 24, 0, None, None
+    with open(dest, "wb") as out:
+        out.write(header)
+        while pos + 16 <= size:
+            fh.seek(pos)
+            rec = fh.read(16)
+            ts_sec, ts_frac, incl, _orig = struct.unpack(endian + "IIII", rec)
+            end = pos + 16 + incl
+            if end > size:
+                break                                # still being written
+            if pos >= offset:
+                fh.seek(pos)
+                out.write(fh.read(16 + incl))
+                ts = ts_sec + ts_frac / (1e9 if nano else 1e6)
+                first = ts if first is None else first
+                last = ts
+                count += 1
+            pos = end
+print(count, "%.6f" % (first or 0), "%.6f" % (last or 0))
+PY
+}
+
+SLIPS_REMOTE_DIR="${SLIPS_REMOTE_DIR:-pde-slips}"
+
+slips_remote_preflight() {
+	vm_reachable || {
+		echo "the research VM is not reachable (status: $(vm_status || echo unknown)) — ./vm.sh start" >&2
+		return 1
+	}
+	vm_ssh "docker image inspect '$SLIPS_IMG' >/dev/null 2>&1" </dev/null || {
+		echo "the VM has no Slips image ($SLIPS_IMG) — on the VM: docker pull $SLIPS_IMG" >&2
+		return 1
+	}
+	# Not a failure — the first window would simply wait for the feeds — but worth saying
+	# before a capture looks hung for several minutes.
+	local warm
+	warm=$(vm_ssh "bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/slips-warm.sh\" status" </dev/null 2>/dev/null || true)
+	if [[ "$warm" != "warm" ]]; then
+		echo "note: Slips' threat-intel cache on the VM is $warm; the first window may take ~7 min" >&2
+	fi
+	return 0
+}
+
+# Ships one window's pcap to the VM, runs Slips over it, and brings the output home.
+#   slips_remote_analyse <pcap> <stamp> <dest_dir>
+# dest_dir receives Slips' whole output tree (alerts.log, alerts.json, zeek_files/...).
+slips_remote_analyse() {
+	local pcap="$1" stamp="$2" dest="$3"
+	local rdir="$SLIPS_REMOTE_DIR/$stamp"
+
+	vm_ssh "rm -rf \"\$HOME/$rdir\" && mkdir -p \"\$HOME/$rdir\" && cat > \"\$HOME/$rdir/window.pcap\"" < "$pcap" \
+		|| { echo "could not upload the window's pcap" >&2; return 1; }
+
+	# Redis is the VM's standing one (Remote/slips-warm.sh), which also holds Slips' cache
+	# of ~45 threat-intel feeds: a Slips run against an empty cache downloads them all first
+	# (measured at 7 minutes), against a warm one it analyses a window in about one. Slips in
+	# file mode exits on its own once it has read the whole capture; the timeout guards a hang.
+	vm_ssh "set -e
+		bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/slips-warm.sh\" redis
+		timeout 900 docker run --rm --net=host -v \"\$HOME/$rdir\":/output '$SLIPS_IMG' \
+			./slips.py -f /output/window.pcap -o /output/out > \"\$HOME/$rdir/slips-run.log\" 2>&1
+		sudo chown -R \"\$(id -u):\$(id -g)\" \"\$HOME/$rdir\"
+		mkdir -p \"\$HOME/$rdir/out/alerts\"
+		test -f \"\$HOME/$rdir/out/alerts/alerts.log\" || touch \"\$HOME/$rdir/out/alerts/alerts.log\"" </dev/null \
+		|| { echo "Slips failed on the VM; see ~/$rdir/slips-run.log there" >&2; return 1; }
+
+	mkdir -p "$dest"
+	vm_ssh "tar -C \"\$HOME/$rdir/out\" -cf - ." </dev/null | tar -C "$dest" -xf - \
+		|| { echo "could not fetch Slips' output" >&2; return 1; }
+}

@@ -51,6 +51,9 @@ source "$PDE_ROOT/lab-config.sh"
 # keeps the one-shot path — and its exit trap — exactly as it was.
 LAB_MODE=0
 LAB_WITH_IDS=0
+LAB_IDS_MODE=local
+LAB_PCAP=""
+LAB_WITH_BANKING=0
 LAB_SLIPS_OUT=""
 LAB_USERS=0
 LAB_STARTED_UTC=""
@@ -62,12 +65,22 @@ if [[ -f "$LAB_STATE" ]]; then
 	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$LAB_NS"; then
 		LAB_MODE=1
 		LAB_WITH_IDS=$(lab_get LAB_WITH_IDS 0)
+		LAB_IDS_MODE=$(lab_get LAB_IDS_MODE local)
+		LAB_PCAP=$(lab_get LAB_PCAP "")
+		LAB_WITH_BANKING=$(lab_get LAB_WITH_BANKING 0)
 		LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
 		LAB_USERS=$(lab_get LAB_USERS 0)
 		LAB_STARTED_UTC=$(lab_get LAB_STARTED_UTC "?")
 		LAB_VETH_HOST=$(lab_get LAB_VETH_HOST "$VETH_HOST")
 	fi
 fi
+
+# The banking source: the bank's audit trail and its event stream over the same window,
+# driven by generate_banking.py alongside the network traffic. Lab-only — the bank lives
+# on the research VM, and only a lab holds the tunnel that reaches it.
+WITH_BANKING=0
+BANK_RATE=0.5
+BANK_PROFILE=loan-fraud
 
 usage() {
 	sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
@@ -90,6 +103,11 @@ usage() {
 	                         startup before the window, and --ids-drain after)
 	  --ids-drain S          seconds to keep Slips running past the window so it
 	                         can raise evidence for it       (default $IDS_DRAIN)
+	  --with-banking         also drive the bank and collect its audit trail and
+	                         event stream for the window (needs a lab started
+	                         with --with-banking; the bank is on the research VM)
+	  --bank-rate R          benign banking operations per second (default $BANK_RATE)
+	  --bank-profile P       loan-fraud|none                  (default $BANK_PROFILE)
 
 	Note that --malicious-pct and --malicious-users are independent knobs. "10%" of
 	events and a 10:1 user ratio are not the same statement, and a brief should say
@@ -111,6 +129,9 @@ while [[ $# -gt 0 ]]; do
 		--keep-firewall) KEEP_FIREWALL=1; shift ;;
 		--with-ids) WITH_IDS=1; shift ;;
 		--ids-drain) IDS_DRAIN="$2"; shift 2 ;;
+		--with-banking) WITH_BANKING=1; shift ;;
+		--bank-rate) BANK_RATE="$2"; shift 2 ;;
+		--bank-profile) BANK_PROFILE="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -176,6 +197,46 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	fi
 fi
 
+# Where the IDS runs is the lab's decision too. Remote: the lab's tcpdump has been writing
+# the veth to LAB_PCAP since it started, and this window's packets go to Slips on the VM.
+IDS_REMOTE=0
+if [[ $LAB_MODE -eq 1 && $WITH_IDS -eq 1 && "$LAB_IDS_MODE" == "remote" ]]; then
+	IDS_REMOTE=1
+fi
+
+# Banking, likewise, is whatever the running lab was built with; it cannot be conjured for
+# one capture, because the tunnel to the bank belongs to the lab.
+if [[ $LAB_MODE -eq 1 ]]; then
+	if [[ $WITH_BANKING -eq 1 && "${LAB_WITH_BANKING:-0}" -ne 1 ]]; then
+		die "the running lab was built without the banking source; './lab.sh down' then './lab.sh up --with-banking'"
+	fi
+	WITH_BANKING="${LAB_WITH_BANKING:-0}"
+elif [[ $WITH_BANKING -eq 1 ]]; then
+	die "--with-banking needs a running lab (the bank tunnel belongs to it): ./lab.sh up --with-banking"
+fi
+
+if [[ $IDS_REMOTE -eq 1 || $WITH_BANKING -eq 1 ]]; then
+	# shellcheck source=../Remote/vm-lib.sh
+	source "$PDE_ROOT/Remote/vm-lib.sh"
+fi
+if [[ $WITH_BANKING -eq 1 ]]; then
+	# shellcheck source=../Banking/banking-lib.sh
+	source "$PDE_ROOT/Banking/banking-lib.sh"
+fi
+
+if [[ $DRY_RUN -eq 0 && $IDS_REMOTE -eq 1 ]]; then
+	# An empty or stopped capture would not fail anything below: the slice would simply be
+	# empty and Slips would report nothing — a quiet IDS that is really a dead sensor.
+	[[ -n "$LAB_PCAP" && -s "$LAB_PCAP" ]] || die "the lab records a remote IDS but no capture file; restart the lab"
+	_tpid=$(lab_get LAB_TCPDUMP_PID "")
+	[[ -n "$_tpid" && -d "/proc/$_tpid" ]] || die "the lab's packet capture is not running; restart the lab"
+	slips_remote_preflight || die "remote IDS preflight failed"
+fi
+if [[ $DRY_RUN -eq 0 && $WITH_BANKING -eq 1 ]]; then
+	banking_preflight || die "banking preflight failed"
+	vm_tunnel_running bank || die "the lab's bank tunnel is down; restart the lab"
+fi
+
 # guaranteed-alert depends on a listener and permit rules. A lab started before they
 # existed has neither: every attempt would be denied, Slips would rate it MEDIUM at best,
 # and the run would look like the IDS failing to alert. One-shot captures build their own.
@@ -224,6 +285,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	  # Order matters, and these are applied in this order:
 	  ufw allow from $SUBNET to any port <${BENIGN_PORTS}> proto tcp
 	  ufw allow from $SUBNET to any port <${ALERT_PORTS}> proto tcp    # guaranteed-alert target
+	  ufw allow from $SUBNET to any port ${BANK_PORT} proto tcp           # the bank, via the lab's tunnel
 	  ufw deny  from $SUBNET                                 # everything else = the attacker
 	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp    # keep dev stack reachable
 
@@ -383,6 +445,10 @@ else
 		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 	done
 
+	# The bank's port is in ALLOWED_PORTS, so the verdict rules call it ALLOW; permitted
+	# here too, so the rule and the label agree even with no bank behind it.
+	ufw allow from "$SUBNET" to any port "$BANK_PORT" proto tcp >/dev/null
+
 	# Everything else from the test subnet is the attacker. An explicit deny is clearer
 	# than relying on the default policy and, unlike the default, it is unambiguously
 	# attributable to this run.
@@ -425,6 +491,18 @@ fi
 # ---------------------------------------------------------------------------
 # Capture window
 # ---------------------------------------------------------------------------
+
+# The bank's event stream is bounded by broker offsets, which take a few seconds to read
+# over IAP. Taken before the window opens rather than at its first instant: everything
+# published after this point is at or beyond these offsets, so nothing in the window can
+# be missed, and the window start stays the moment traffic actually begins.
+BANK_OFFSETS=""
+if [[ $WITH_BANKING -eq 1 ]]; then
+	log "recording the bank's event-stream offsets"
+	BANK_OFFSETS=$(banking_offsets) || die "could not read the bank's event-stream offsets"
+	[[ -n "$BANK_OFFSETS" ]] || die "the events collector returned no offsets"
+fi
+
 WINDOW_START_EPOCH=$(date -u +%s)
 WINDOW_START_ISO=$(date -u -d "@$WINDOW_START_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 STAMP=$(date -u -d "@$WINDOW_START_EPOCH" +%Y%m%d%H%M%S)
@@ -439,7 +517,12 @@ log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
 # Same mechanism for the IDS, and for the same reason: both sources keep running and
 # writing throughout, and the window is a bounded read against them rather than a pause.
 IDS_ALERTS_OFFSET=0
-if [[ $WITH_IDS -eq 1 ]]; then
+PCAP_OFFSET=0
+if [[ $IDS_REMOTE -eq 1 ]]; then
+	# Remote: the offset is into the lab's packet capture, and the window's packets are what
+	# tcpdump writes after it.
+	PCAP_OFFSET=$(pcap_offset "$LAB_PCAP")
+elif [[ $WITH_IDS -eq 1 ]]; then
 	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
 fi
 
@@ -454,6 +537,21 @@ mkdir -p "$RUN_DIR"
 GT_JSON="$RUN_DIR/firewall_${STAMP}.groundtruth.json"
 OUT_LOG="$RUN_DIR/firewall_${STAMP}.log"
 MANIFEST="$RUN_DIR/firewall_${STAMP}.manifest.json"
+
+BANK_GT="$RUN_DIR/banking_${STAMP}.groundtruth.json"
+BANK_GEN_PID=""
+if [[ $WITH_BANKING -eq 1 ]]; then
+	# Alongside the network traffic, from the same namespace and the same user addresses:
+	# the attacker who scans is the one who logs into the bank. Started first, since its
+	# plan begins at the same t0 as the traffic's.
+	log "driving the bank: benign ${BANK_RATE}/s, profile=${BANK_PROFILE}"
+	ip netns exec "$LAB_NS" python3 "$BANK_GEN" \
+		--seed-file "$BANK_SEED" --url "$BANK_URL" \
+		--users "$USERS_CSV" --malicious-users "$MALICIOUS_CSV" \
+		--duration "$DURATION" --rate "$BANK_RATE" --profile "$BANK_PROFILE" \
+		--seed "$SEED" --out "$BANK_GT" &
+	BANK_GEN_PID=$!
+fi
 
 log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PCT}% malicious, profile=${ATTACK_PROFILE}"
 # $LAB_NS, not $NS: under a lab the namespace is whichever one that session recorded,
@@ -473,7 +571,21 @@ ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--seed "$SEED" \
 	--out "$GT_JSON"
 
-WINDOW_END_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CAPTURE_ERRORS=0
+if [[ -n "$BANK_GEN_PID" ]]; then
+	if ! wait "$BANK_GEN_PID" || [[ ! -s "$BANK_GT" ]]; then
+		echo "error: the banking generator failed; the window has no banking evidence" >&2
+		WITH_BANKING=0
+		CAPTURE_ERRORS=1
+	fi
+fi
+
+# Rounded UP to the whole second. Bounds are recorded in whole seconds, and truncating the
+# end drops whatever happened in the window's last partial second: the start is floored
+# and the end ceilinged, so both err outward and nothing inside the window falls outside
+# its bounds. (Measured: two deposits at hh:mm:11.2 and .9 were lost from a window that
+# closed at 11.95 and was recorded as ending at 11.)
+WINDOW_END_ISO=$(date -u -d "@$(( $(date -u +%s) + 1 ))" +%Y-%m-%dT%H:%M:%SZ)
 
 # rsyslog batches writes; without this the tail of the window is routinely missing.
 log "waiting for rsyslog to flush"
@@ -608,7 +720,8 @@ manifest = {
         "ids.alerts.log; see the timestamps block. Nothing has been rewritten — a "
         "source's own output is left as the source produced it",
         "syslog timestamps carry no year and no sub-second precision; the authoritative "
-        "window bounds are window.start_utc/end_utc recorded by the generator",
+        "window bounds are window.start_utc/end_utc, in whole seconds with the start rounded "
+        "down and the end rounded up, so that nothing inside the window falls outside them",
         "lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the "
         "same window is excluded. Both directions are kept, so the host's RST replies to "
         "refused connections appear alongside the inbound attempts",
@@ -635,25 +748,64 @@ json.dump(manifest, open(sys.argv[1], "w"), indent=2)
 PY
 
 # ---------------------------------------------------------------------------
-# IDS evidence for the same window
+# The other sources' evidence for the same window
+#
+# Banking starts first. Its collectors run on the VM and spend most of their time waiting
+# for the bank's publish job, so they run while the IDS is being analysed, not after it.
 # ---------------------------------------------------------------------------
 IDS_LOG="$RUN_DIR/ids_${STAMP}.alerts.log"
 GROUP_MANIFEST="$RUN_DIR/window_${STAMP}.group.json"
+BANK_MANIFEST="$RUN_DIR/banking_${STAMP}.manifest.json"
 IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"; IDS_ALERTS=0
+IDS_OK=0
+IDS_PCAP=""; IDS_PCAP_SHA=""; IDS_PCAP_PACKETS=0
+BANK_COLLECT_PID=""
+BANK_SUMMARY=""
 
-if [[ $WITH_IDS -eq 1 ]]; then
+if [[ $WITH_BANKING -eq 1 ]]; then
+	BANK_EXPECT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["executed_ok"])' "$BANK_GT")
+	log "collecting the bank's evidence on $VM_NAME: events and audit trail for ${BANK_EXPECT} operations"
+	banking_collect "$STAMP" "$BANK_OFFSETS" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$BANK_EXPECT" "$RUN_DIR" \
+		> "$RUN_DIR/.banking-collect.log" 2>&1 &
+	BANK_COLLECT_PID=$!
+fi
+
+if [[ $IDS_REMOTE -eq 1 ]]; then
+	# The sensor's side of it: this window's packets, cut from the lab's capture by the
+	# offset taken as the window opened, and hashed before they leave this machine.
+	IDS_PCAP="$RUN_DIR/ids_${STAMP}.pcap"
+	read -r IDS_PCAP_PACKETS _ _ <<< "$(pcap_slice "$LAB_PCAP" "$PCAP_OFFSET" "$IDS_PCAP" || echo "0 0 0")" || true
+	IDS_PCAP_PACKETS=${IDS_PCAP_PACKETS:-0}
+	IDS_PCAP_SHA=$(sha256sum "$IDS_PCAP" | cut -d' ' -f1)
+	chmod 444 "$IDS_PCAP"
+	# Slips' whole output tree comes home beside the evidence: zeek_files/conn.log is the
+	# flow record behind the findings, and "on what basis" is a question an investigation
+	# will ask.
+	SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
+	log "analysing the window's ${IDS_PCAP_PACKETS} packets with Slips on $VM_NAME (about a minute)"
+	if slips_remote_analyse "$IDS_PCAP" "$STAMP" "$SLIPS_OUT"; then
+		IDS_ALERTS_OFFSET=0
+		IDS_OK=1
+	else
+		echo "error: remote IDS analysis failed; the window has no IDS evidence" >&2
+		CAPTURE_ERRORS=1
+	fi
+elif [[ $WITH_IDS -eq 1 ]]; then
 	# Slips raises evidence in batches once it has seen the flows, so the window's
 	# findings do not exist yet at this point. Draining is not politeness, it is the
 	# difference between collecting the evidence and collecting an empty file.
 	log "draining Slips for ${IDS_DRAIN}s so it can raise evidence for the window"
 	sleep "$IDS_DRAIN"
+	IDS_OK=1
+fi
 
-	# Collected while Slips is still running. An IDS is a continuously running system
-	# that gets *read* against; halting one to gather evidence is not something a bank
-	# would do, and modelling it that way here would carry the wrong assumption into
-	# the Evidence Repository's ingestion design. Consistency comes from the byte
-	# offset and the timestamp slice, exactly as it does for the ufw log while rsyslog
-	# keeps writing underneath it.
+if [[ $IDS_OK -eq 1 ]]; then
+	# Locally, collected while Slips is still running. An IDS is a continuously running
+	# system that gets *read* against; halting one to gather evidence is not something a
+	# bank would do. Consistency comes from the byte offset and the timestamp slice, exactly
+	# as it does for the ufw log while rsyslog keeps writing underneath it. Remotely, Slips
+	# analysed only this window's packets, so the whole file is the window and the offset
+	# is 0; the timestamp slice still applies.
 	#
 	# Defended rather than trusted: `read` returns non-zero on an empty herestring,
 	# which under `set -e` would abort the run at the point where the evidence has been
@@ -662,9 +814,7 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	read -r IDS_TOTAL IDS_KEPT <<< "$IDS_COUNTS" || true
 	IDS_TOTAL=${IDS_TOTAL:-0}
 	IDS_KEPT=${IDS_KEPT:-0}
-	# Must be exactly five numbers: the group manifest unpacks them positionally, and a
-	# short read there is a ValueError that would lose the whole manifest after the
-	# evidence has already been collected.
+	# Must be exactly five numbers: the group manifest unpacks them positionally.
 	IDS_SEVERITIES=$(slips_severity_counts "$IDS_LOG")
 	if [[ $(printf '%s\n' $IDS_SEVERITIES | grep -c .) -ne 5 ]]; then
 		echo "warning: severity counts unreadable ('$IDS_SEVERITIES'); recording zeros" >&2
@@ -676,91 +826,149 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	chmod 444 "$IDS_LOG"
 	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} lines fall inside the window, ${IDS_ALERTS} of them alerts"
 
-	# Under a lab, Slips outlives this capture and keeps writing into its session
-	# directory: stopping it or moving that directory would end the lab's IDS on the
-	# first window and break every window after it. The alerts slice above is all this
-	# capture takes; lab.sh down hands over the session tree at the end.
-	if [[ $LAB_MODE -eq 0 ]]; then
-		# One-shot only. Stopped now, and not in order to read it — the veth it is
-		# attached to is about to be torn down with the rest of the run. Teardown,
-		# not a step in collecting evidence.
+	# Under a local lab, Slips outlives this capture and keeps writing into its session
+	# directory; the slice above is all this capture takes. One-shot only: Slips is stopped
+	# because the veth it is attached to is about to be torn down — teardown, not a step in
+	# collecting — and its tree is moved in beside the evidence.
+	if [[ $IDS_REMOTE -eq 0 && $LAB_MODE -eq 0 ]]; then
 		slips_stop
-
-		# Keep Slips' full working tree, not just the alerts: zeek_files/conn.log is
-		# the flow record behind the findings, and an investigator asking "on what
-		# basis" needs it. Moved only after the container has let go of the mount.
 		if [[ -d "$SLIPS_OUT" ]]; then
 			rm -rf "$RUN_DIR/ids_${STAMP}"
 			mv "$SLIPS_OUT" "$RUN_DIR/ids_${STAMP}"
 			SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
 		fi
 	fi
+fi
 
-	# The group is the point of the exercise: one window, one attack, two independent
-	# sources that saw it. This is the record an EvidenceGroup row would be built from.
-	python3 - "$GROUP_MANIFEST" <<PY
-import json, sys
-crit, high, med, low, info = "${IDS_SEVERITIES}".split()
+if [[ -n "$BANK_COLLECT_PID" ]]; then
+	if wait "$BANK_COLLECT_PID"; then
+		BANK_SUMMARY=$(python3 "$BANK_MANIFEST_BUILDER" --run-dir "$RUN_DIR" --stamp "$STAMP" \
+			--start "$WINDOW_START_ISO" --end "$WINDOW_END_ISO" --duration "$DURATION" --rate "$BANK_RATE" \
+			--vm "$VM_NAME" --fineract-image "$BANK_FINERACT_IMAGE" --bank-url "$BANK_URL") || BANK_SUMMARY=""
+	fi
+	if [[ -z "$BANK_SUMMARY" ]]; then
+		echo "error: banking collection failed; the window has no banking evidence. Collector output:" >&2
+		sed 's/^/    /' "$RUN_DIR/.banking-collect.log" >&2 2>/dev/null || true
+		WITH_BANKING=0
+		CAPTURE_ERRORS=1
+	else
+		chmod 444 "$RUN_DIR/banking-events_${STAMP}.jsonl" "$RUN_DIR/banking-audit_${STAMP}.jsonl" \
+			"$RUN_DIR/banking-events_${STAMP}.raw.jsonl"
+		log "$BANK_SUMMARY"
+	fi
+	rm -f "$RUN_DIR/.banking-collect.log"
+fi
+
+# The group is the point of the exercise: one window, one attack, independent sources that
+# each saw part of it. This is the record an EvidenceGroup row would be built from. Values
+# go in through the environment rather than being pasted into the Python source.
+if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 ]]; then
+	G_STAMP="$STAMP" G_START="$WINDOW_START_ISO" G_END="$WINDOW_END_ISO" G_DURATION="$DURATION" \
+	G_USERS="$USERS" G_MAL_USERS="$MALICIOUS_USERS" G_MAL_PCT="$MALICIOUS_PCT" G_PROFILE="$ATTACK_PROFILE" \
+	G_SEED="$SEED" G_SUBNET="$SUBNET" G_TZ_NAME="$TZ_NAME" G_TZ_OFFSET="$TZ_OFFSET" G_VETH="$VETH_HOST" \
+	G_VM="${VM_NAME:-}" G_HOST_IP="$HOST_IP" G_BANK_PORT="$BANK_PORT" \
+	G_FW_SHA="$SHA256" G_FW_LINES="$LOG_LINES" G_FW_BLOCK="$BLOCKED" G_FW_ALLOW="$ALLOWED" G_FW_AUDIT="$AUDITED" \
+	G_IDS_OK="$IDS_OK" G_IDS_REMOTE="$IDS_REMOTE" G_IDS_SHA="$IDS_SHA" G_IDS_KEPT="$IDS_KEPT" \
+	G_IDS_TOTAL="$IDS_TOTAL" G_IDS_ALERTS="$IDS_ALERTS" G_IDS_SEV="$IDS_SEVERITIES" \
+	G_IDS_PCAP_SHA="$IDS_PCAP_SHA" G_IDS_PCAP_PACKETS="$IDS_PCAP_PACKETS" \
+	G_BANK_MANIFEST="$([[ $WITH_BANKING -eq 1 ]] && echo "$BANK_MANIFEST")" \
+	python3 - "$GROUP_MANIFEST" <<'PY'
+import json, os, sys
+E = os.environ
+n = lambda k: int(E.get(k) or 0)
+stamp = E["G_STAMP"]
+
+items = [{
+    "pde_source": "firewall", "product": "ufw", "file": "firewall_%s.log" % stamp,
+    "sha256": E["G_FW_SHA"], "lines": n("G_FW_LINES"), "ufw_block_lines": n("G_FW_BLOCK"),
+    "ufw_allow_lines": n("G_FW_ALLOW"), "ufw_audit_lines": n("G_FW_AUDIT"),
+}]
+correlation, caveats = [], []
+
+if E["G_IDS_OK"] == "1":
+    crit, high, med, low, info = (E["G_IDS_SEV"].split() + ["0"] * 5)[:5]
+    ids = {
+        "pde_source": "ids", "product": "slips", "file": "ids_%s.alerts.log" % stamp,
+        "sha256": E["G_IDS_SHA"], "evidence_lines": n("G_IDS_KEPT"),
+        "evidence_lines_seen_total": n("G_IDS_TOTAL"), "alerts": n("G_IDS_ALERTS"),
+        "threat_levels": {"critical": int(crit), "high": int(high), "medium": int(med),
+                          "low": int(low), "info": int(info)},
+    }
+    remote = E["G_IDS_REMOTE"] == "1"
+    if remote:
+        ids["analysed"] = "on %s, by Slips in file mode, from this window's packets only" % E["G_VM"]
+        ids["input_pcap"] = {"file": "ids_%s.pcap" % stamp, "sha256": E["G_IDS_PCAP_SHA"],
+                             "packets": n("G_IDS_PCAP_PACKETS")}
+        correlation.append(
+            "The firewall and IDS items describe the same packets: tcpdump captured %s here while ufw "
+            "logged the same traffic crossing the INPUT chain, and Slips analysed that capture — so the "
+            "two are independent accounts of one attack rather than one record split in two." % E["G_VETH"])
+    else:
+        correlation.append(
+            "The firewall and IDS items describe the same packets. Slips sniffed %s live while ufw logged "
+            "the same traffic crossing the INPUT chain, so the two are independent accounts of one attack "
+            "rather than one record split in two." % E["G_VETH"])
+    items.append(ids)
+    caveats += [
+        "firewall.log is RFC 3164 syslog in LOCAL time (%s, %s, no year, whole seconds) while "
+        "ids.alerts.log is RFC 3339 in UTC with microseconds. The same instant reads differently "
+        "between them, and neither has been rewritten. window.start_utc/end_utc are UTC and are the "
+        "common reference; the firewall manifest carries the conversion facts" % (E["G_TZ_NAME"], E["G_TZ_OFFSET"]),
+        "IDS findings are sliced to the window by the timestamp on each evidence line; a line whose "
+        "timestamp cannot be parsed is kept rather than dropped",
+        "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on timewindow "
+        "N'). They carry no threat level, so threat_levels does not include them",
+    ]
+    if remote:
+        caveats.append(
+            "Slips analysed this window on its own, starting fresh: its per-source profile and alert "
+            "threshold do not carry over from earlier windows, as they would for a Slips sniffing "
+            "continuously. An alert here was earned inside this window. The packets keep the timestamps "
+            "this machine's kernel gave them, on the same clock as the window bounds")
+    else:
+        caveats.append(
+            "Slips keeps its own 1-hour timewindows internally and its alert threshold accumulates per "
+            "profile across that hour, not across this %ss window" % E["G_DURATION"])
+
+if E.get("G_BANK_MANIFEST"):
+    bm = json.load(open(E["G_BANK_MANIFEST"]))
+    out, col, comp = bm["output"], bm["collection"], bm["completeness"]
+    events_file, audit_file = "banking-events_%s.jsonl" % stamp, "banking-audit_%s.jsonl" % stamp
+    items.append({
+        "pde_source": "banking-events", "product": "fineract", "file": events_file,
+        "sha256": out[events_file]["sha256"], "events": col["banking-events"]["events_in_window"],
+        "by_type": col["banking-events"]["by_type"], "completeness": comp["banking-events"],
+    })
+    items.append({
+        "pde_source": "banking-audit", "product": "fineract", "file": audit_file,
+        "sha256": out[audit_file]["sha256"], "rows": col["banking-audit"]["rows"],
+        "by_maker": col["banking-audit"]["by_maker"], "completeness": comp["banking-audit"],
+    })
+    sc = bm["scenario"]
+    if sc.get("attacker_ip") and sc.get("attacker_used_login"):
+        correlation.append(
+            "The banking items record what the same users did at the bank. They reached it from their own "
+            "addresses through the lab's tunnel on %s:%s, so the attacker (%s) appears in the firewall log "
+            "as permitted connections to port %s and in the traffic the IDS analysed, and what those "
+            "connections did appears in the bank's audit trail under the login they used (%s) and in its "
+            "event stream." % (E["G_HOST_IP"], E["G_BANK_PORT"], sc["attacker_ip"], E["G_BANK_PORT"],
+                              sc["attacker_used_login"]))
+    else:
+        correlation.append("The banking items record the same users' activity at the bank in this window.")
+    caveats.append(
+        "banking timestamps are UTC from the bank's clock on the research VM, not this machine's; the "
+        "banking manifest records the measured offset (bank_minus_lab_seconds) and how to read each field")
+
 group = {
-    "group_id": "${STAMP}",
-    "window": {
-        "start_utc": "${WINDOW_START_ISO}",
-        "end_utc": "${WINDOW_END_ISO}",
-        "duration_seconds": ${DURATION},
-    },
-    "scenario": {
-        "users": ${USERS},
-        "malicious_users": ${MALICIOUS_USERS},
-        "malicious_event_pct": ${MALICIOUS_PCT},
-        "attack_profile": "${ATTACK_PROFILE}",
-        "seed": ${SEED},
-        "subnet": "${SUBNET}",
-    },
-    "items": [
-        {
-            "pde_source": "firewall",
-            "product": "ufw",
-            "file": "firewall_${STAMP}.log",
-            "sha256": "${SHA256}",
-            "lines": ${LOG_LINES},
-            "ufw_block_lines": ${BLOCKED},
-            "ufw_allow_lines": ${ALLOWED},
-            "ufw_audit_lines": ${AUDITED},
-        },
-        {
-            "pde_source": "ids",
-            "product": "slips",
-            "file": "ids_${STAMP}.alerts.log",
-            "sha256": "${IDS_SHA}",
-            "evidence_lines": ${IDS_KEPT},
-            "evidence_lines_seen_total": ${IDS_TOTAL},
-            "alerts": ${IDS_ALERTS},
-            "threat_levels": {
-                "critical": int(crit), "high": int(high),
-                "medium": int(med), "low": int(low), "info": int(info),
-            },
-        },
-    ],
-    "correlation": (
-        "Both items describe the same packets. Slips sniffed ${VETH_HOST} live while "
-        "ufw logged the same traffic crossing the INPUT chain, so the two are "
-        "independent accounts of one attack rather than one record split in two."
-    ),
-    "caveats": [
-        "the two items timestamp differently: firewall.log is RFC 3164 syslog in LOCAL "
-        "time (${TZ_NAME}, ${TZ_OFFSET}, no year, whole seconds) while ids.alerts.log is "
-        "RFC 3339 in UTC with microseconds. The same instant reads differently between "
-        "them, and neither has been rewritten. window.start_utc/end_utc below are UTC "
-        "and are the common reference; firewall.manifest.json carries the conversion "
-        "facts, including kernel boot time for the microsecond-precision uptime field",
-        "IDS findings are sliced to the window by the timestamp on each evidence line; "
-        "Slips keeps its own 1-hour timewindows internally and its alert threshold "
-        "accumulates per profile across that hour, not across this ${DURATION}s window",
-        "a line whose timestamp cannot be parsed is kept rather than dropped",
-        "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on "
-        "timewindow N'). They are sliced by their own leading timestamp, which is the flow that "
-        "completed the alert, and carry no threat level, so threat_levels does not include them",
-    ],
+    "group_id": stamp,
+    "window": {"start_utc": E["G_START"], "end_utc": E["G_END"], "duration_seconds": n("G_DURATION"),
+               "bounds": "whole seconds, start rounded down and end rounded up"},
+    "scenario": {"users": n("G_USERS"), "malicious_users": n("G_MAL_USERS"),
+                 "malicious_event_pct": n("G_MAL_PCT"), "attack_profile": E["G_PROFILE"],
+                 "seed": n("G_SEED"), "subnet": E["G_SUBNET"]},
+    "items": items,
+    "correlation": " ".join(correlation),
+    "caveats": caveats,
 }
 json.dump(group, open(sys.argv[1], "w"), indent=2)
 PY
@@ -769,26 +977,38 @@ fi
 # Files are created by root; hand them back to whoever invoked sudo.
 if [[ -n "${SUDO_USER:-}" ]]; then
 	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
-	if [[ $WITH_IDS -eq 1 ]]; then
-		chown "$SUDO_USER" "$IDS_LOG" "$GROUP_MANIFEST" 2>/dev/null || true
-		# Slips writes its working tree as root inside the container. Under a lab that
-		# tree is still in use and is handed over by `lab.sh down` instead.
-		if [[ $LAB_MODE -eq 0 ]]; then
+	[[ -f "$GROUP_MANIFEST" ]] && chown "$SUDO_USER" "$GROUP_MANIFEST" 2>/dev/null || true
+	if [[ $IDS_OK -eq 1 ]]; then
+		chown "$SUDO_USER" "$IDS_LOG" 2>/dev/null || true
+		[[ -n "$IDS_PCAP" ]] && chown "$SUDO_USER" "$IDS_PCAP" 2>/dev/null || true
+		# Slips' tree: under a local lab it is still in use and `lab.sh down` hands it over.
+		if [[ $IDS_REMOTE -eq 1 || $LAB_MODE -eq 0 ]]; then
 			chown -R "$SUDO_USER" "$SLIPS_OUT" 2>/dev/null || true
 		fi
 	fi
+	chown "$SUDO_USER" "$RUN_DIR"/banking* 2>/dev/null || true
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
-if [[ $WITH_IDS -eq 1 ]]; then
-	log "IDS: ${IDS_KEPT} lines in the window, ${IDS_ALERTS} of them alerts"
-fi
+[[ $IDS_OK -eq 1 ]] && log "IDS: ${IDS_KEPT} lines in the window, ${IDS_ALERTS} of them alerts"
+[[ -n "$BANK_SUMMARY" ]] && log "$BANK_SUMMARY"
 log "sha256 $SHA256"
 log "window directory: $RUN_DIR"
 log "  firewall_${STAMP}.log              the evidence"
 log "  firewall_${STAMP}.manifest.json    provenance and digest"
 log "  firewall_${STAMP}.groundtruth.json labels, known before sending"
-if [[ $WITH_IDS -eq 1 ]]; then
+if [[ $IDS_OK -eq 1 ]]; then
 	log "  ids_${STAMP}.alerts.log            IDS evidence for the same window"
-	log "  window_${STAMP}.group.json         both sources, one window"
+	[[ -n "$IDS_PCAP" ]] && log "  ids_${STAMP}.pcap                  the packets Slips analysed"
+fi
+if [[ $WITH_BANKING -eq 1 ]]; then
+	log "  banking-events_${STAMP}.jsonl      the bank's business events"
+	log "  banking-audit_${STAMP}.jsonl       the bank's audit trail"
+	log "  banking_${STAMP}.manifest.json     provenance, completeness, digests"
+fi
+[[ -f "$GROUP_MANIFEST" ]] && log "  window_${STAMP}.group.json         every source, one window"
+
+if [[ $CAPTURE_ERRORS -ne 0 ]]; then
+	echo "the capture completed with errors: a source above produced no evidence for this window" >&2
+	exit 1
 fi

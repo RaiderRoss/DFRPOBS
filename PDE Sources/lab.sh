@@ -19,15 +19,26 @@
 #  IMPORTANT: while the lab is up your firewall is enabled with
 #  test rules and full logging. `down` puts it back. `status`
 #  detects a session that did not survive a reboot and offers to.
+#
+#  Two sources can live on the research VM instead (Remote/):
+#    --ids-remote     the IDS is a tcpdump on the veth here; each
+#                     window's packets are analysed by Slips there
+#    --with-banking   the bank is Fineract there, reached from the
+#                     namespace through a tunnel on HOST_IP:BANK_PORT
 # ==============================================================
 set -euo pipefail
 
 PDE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lab-config.sh
 source "$PDE_ROOT/lab-config.sh"
+# shellcheck source=Remote/vm-lib.sh
+source "$PDE_ROOT/Remote/vm-lib.sh"
 IDS_LIB="$PDE_ROOT/IDS/slips-lib.sh"
+BANK_SEED="${BANK_SEED:-$PDE_ROOT/Banking/seed.json}"
 
 WITH_IDS=0
+IDS_REMOTE=0
+WITH_BANKING=0
 IDS_READY_TIMEOUT=240
 USERS=10
 
@@ -39,7 +50,8 @@ usage() {
 	cat <<-EOF
 
 	Commands:
-	  up [--with-ids] [--users N]   build the lab and leave it running
+	  up [--with-ids [--ids-remote]] [--with-banking] [--users N]
+	                                build the lab and leave it running
 	  down                          restore the firewall and tear everything down
 	  status                        report what is up, and detect a stale session
 
@@ -71,7 +83,16 @@ lab_up() {
 		[[ -f "$IDS_LIB" ]] || die "--with-ids needs $IDS_LIB"
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
-		slips_preflight || die "IDS preflight failed"
+		if [[ $IDS_REMOTE -eq 1 ]]; then
+			command -v tcpdump >/dev/null || die "--ids-remote needs tcpdump (apt install tcpdump)"
+			slips_remote_preflight || die "remote IDS preflight failed"
+		else
+			slips_preflight || die "IDS preflight failed"
+		fi
+	fi
+	if [[ $WITH_BANKING -eq 1 ]]; then
+		[[ -r "$BANK_SEED" ]] || die "--with-banking needs a seeded bank ($BANK_SEED); see Banking/README.md"
+		vm_reachable || die "--with-banking needs the research VM (status: $(vm_status || echo unknown)); ./vm.sh start"
 	fi
 
 	modprobe xt_LOG 2>/dev/null || true
@@ -101,6 +122,8 @@ lab_up() {
 	LAB_STAMP="$lab_stamp"
 	LAB_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 	LAB_WITH_IDS="$WITH_IDS"
+	LAB_IDS_MODE="$([[ $IDS_REMOTE -eq 1 ]] && echo remote || echo local)"
+	LAB_WITH_BANKING="$WITH_BANKING"
 	LAB_USERS="$USERS"
 	LAB_ORIG_ENABLED="$orig_enabled"
 	LAB_ORIG_LOGLEVEL="$orig_loglevel"
@@ -142,7 +165,19 @@ lab_up() {
 	EOF
 
 	# --- IDS, before the firewall so `logging full` is not on during its startup ---
-	if [[ $WITH_IDS -eq 1 ]]; then
+	if [[ $WITH_IDS -eq 1 && $IDS_REMOTE -eq 1 ]]; then
+		# The sensor stays here, the analysis goes to the VM: tcpdump writes the veth for
+		# the whole session, and each capture slices its window out and ships it.
+		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+		local tcpdump_pid
+		log "capturing $VETH_HOST to $slips_out/veth.pcap (analysed per window by Slips on $VM_NAME)"
+		tcpdump_pid=$(pcap_capture_start "$VETH_HOST" "$slips_out/veth.pcap" "$LAB_DIR/tcpdump.log") \
+			|| die "could not start the packet capture"
+		cat >> "$LAB_STATE" <<-EOF
+		LAB_TCPDUMP_PID="$tcpdump_pid"
+		LAB_PCAP="$slips_out/veth.pcap"
+		EOF
+	elif [[ $WITH_IDS -eq 1 ]]; then
 		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
 		mkdir -p "$slips_out"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
@@ -150,6 +185,16 @@ lab_up() {
 		slips_start "$VETH_HOST" "$slips_out" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
+	fi
+
+	# --- the bank, on the host side of the veth ------------------------------
+	# Bound to HOST_IP, so it can only open once the veth carries that address. A simulated
+	# user reaching https://HOST_IP:BANK_PORT crosses this host's INPUT chain — ufw logs it —
+	# and the tunnel carries it on to Fineract on the VM.
+	if [[ $WITH_BANKING -eq 1 ]]; then
+		log "opening the bank tunnel $HOST_IP:$BANK_PORT -> $VM_NAME:8443"
+		vm_bank_tunnel_start || die "could not open the bank tunnel"
+		echo 'LAB_BANK_TUNNEL="1"' >> "$LAB_STATE"
 	fi
 
 	# --- firewall -------------------------------------------------------------
@@ -169,6 +214,9 @@ lab_up() {
 	for p in "${_alert[@]}"; do
 		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 	done
+	# The bank's port is in ALLOWED_PORTS, so the verdict rules label it ALLOW whether or
+	# not banking is on; permitting it always keeps the label and the rule in agreement.
+	ufw allow from "$SUBNET" to any port "$BANK_PORT" proto tcp >/dev/null
 	ufw deny from "$SUBNET" >/dev/null
 	IFS=',' read -ra _preserve <<< "$PRESERVE_PORTS"
 	for p in "${_preserve[@]}"; do
@@ -219,11 +267,22 @@ lab_down() {
 	alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
 	rm -f "$LAB_DIR/alert-listener.pid"
 
+	# The bank tunnel is bound to the veth's address; closed before that address goes.
+	if [[ "$(lab_get LAB_BANK_TUNNEL 0)" == "1" ]] || vm_tunnel_running bank; then
+		log "closing the bank tunnel"
+		vm_tunnel_stop bank
+	fi
+
 	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" ]]; then
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
-		log "stopping Slips"
-		slips_stop
+		if [[ "$(lab_get LAB_IDS_MODE local)" == "remote" ]]; then
+			log "stopping the packet capture"
+			pcap_capture_stop "$(lab_get LAB_TCPDUMP_PID "")"
+		else
+			log "stopping Slips"
+			slips_stop
+		fi
 	fi
 
 	log "tearing down namespace ${LAB_NS:-$NS}"
@@ -271,7 +330,25 @@ lab_status() {
 		echo "lab: UP since $started"
 		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
 		echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
-		echo "  ids         $([[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && echo "slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")" || echo "not running")"
+		if [[ "$(lab_get LAB_WITH_IDS 0)" -ne 1 ]]; then
+			echo "  ids         not running"
+		elif [[ "$(lab_get LAB_IDS_MODE local)" == "remote" ]]; then
+			local tpid; tpid=$(lab_get LAB_TCPDUMP_PID "")
+			if [[ -n "$tpid" && -d "/proc/$tpid" ]]; then
+				echo "  ids         capturing $(lab_get LAB_VETH_HOST "$VETH_HOST") (pid $tpid); Slips on $VM_NAME per window"
+			else
+				echo "  ids         capture NOT running — windows would have no packets for Slips"
+			fi
+		else
+			echo "  ids         slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")"
+		fi
+		if [[ "$(lab_get LAB_WITH_BANKING 0)" -eq 1 ]]; then
+			if vm_tunnel_running bank; then
+				echo "  bank        tunnel $HOST_IP:$BANK_PORT -> $VM_NAME (Fineract)"
+			else
+				echo "  bank        tunnel DOWN — banking windows will fail; restart the lab"
+			fi
+		fi
 		local lpid; lpid=$(lab_get LAB_LISTENER_PID "")
 		if [[ -n "$lpid" && -d "/proc/$lpid" ]]; then
 			echo "  listener    ports $(lab_get LAB_ALERT_PORTS "?") on $HOST_IP (pid $lpid)"
@@ -301,6 +378,8 @@ cmd="${1:-}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--with-ids) WITH_IDS=1; shift ;;
+		--ids-remote) IDS_REMOTE=1; shift ;;
+		--with-banking) WITH_BANKING=1; shift ;;
 		--users) USERS="$2"; shift 2 ;;
 		*) die "unknown option '$1'" ;;
 	esac

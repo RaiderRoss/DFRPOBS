@@ -39,6 +39,39 @@ The ordering is not incidental:
   Slips is stopped afterwards only because the veth it is attached to is being
   destroyed with the rest of the run.
 
+## Remote mode — the sensor here, the analysis on the research VM
+
+The default now (`IDS_REMOTE=1`), because Slips is the heaviest thing in the lab and the
+research VM has room for it:
+
+```
+lab up --with-ids --ids-remote
+  └─ tcpdump -U on veth-pde-h → output/sessions/ids-<ts>/veth.pcap      all session
+capture:
+  └─ pcap byte offset recorded
+       └─ WINDOW
+       └─ the window's packets sliced out by that offset → ids_<ts>.pcap, hashed
+            └─ shipped to the VM, `slips.py -f` over it, output tree brought home
+```
+
+The slice uses the same mechanism as the ufw log. A packet belongs to the window if its
+record *starts* after the offset. A record still being written at the end is left for the
+next window, whole, rather than split across two. The packets keep the timestamps this
+machine's kernel gave them, on the same clock as the window bounds and the firewall log, so
+the IDS evidence lines up with both without correction. Measured: 740 packets analysed in
+63 s, 21 alerts.
+
+What this mode changes is the principle below that Slips is never stopped to be read.
+**The sensor is never stopped; the analysis is per window.** Slips starts fresh for each
+window, so its per-source profile and alert threshold do not carry over between windows as
+they do for a Slips sniffing continuously. An alert in remote mode was earned inside that
+window alone. The group manifest says which mode produced it.
+
+Slips caches ~45 threat-intel feeds in redis on the VM. A run against an empty cache
+downloads them all first — 7 minutes, measured — and a VM stop empties it, so the VM
+re-warms the cache after every start (`Remote/slips-warm.sh`). Set `IDS_REMOTE=0` in
+`pde.conf` to run Slips locally in Docker, as described below.
+
 ## Usage
 
 ```bash
@@ -81,9 +114,10 @@ Inside the captured window's own directory, `output/<ts>/`:
 
 | File | |
 |---|---|
-| `ids.alerts.log` | evidence sliced to the window, `chmod 444` |
-| `group.json` | both sources, the shared window, and both digests |
-| `ids/` | Slips' full working tree — one-shot captures only |
+| `ids_<ts>.alerts.log` | evidence sliced to the window, `chmod 444` |
+| `ids_<ts>.pcap` | remote mode: the packets Slips analysed, hashed before they left |
+| `window_<ts>.group.json` | every source, the shared window, and every digest |
+| `ids_<ts>/` | Slips' full working tree — remote mode and one-shot captures |
 
 Under a lab, Slips spans many windows, so its working tree lives once per session at
 `output/sessions/ids-<lab-ts>/` rather than being copied into each window.

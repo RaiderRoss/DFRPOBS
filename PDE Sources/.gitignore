@@ -10,4 +10,8 @@ output/
 # Local defaults set from the console.
 pde.conf
 
+# Written by `./vm.sh seed`: the bank's sandbox staff credentials and the database ids
+# of one particular Fineract instance. Meaningless on another, and credentials besides.
+Banking/seed.json
+
 __pycache__/

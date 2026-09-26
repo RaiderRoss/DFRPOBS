@@ -1,0 +1,28 @@
+# Override for the Evidence Repository's compose file, used on the research VM:
+#
+#   docker compose -f "Evidence Repository/docker-compose.yml" -f "PDE Sources/Remote/er-compose.vm.yml" ...
+#
+# minio/minio and minio/mc have been withdrawn from both Docker Hub and quay.io, so a
+# machine that does not already have them cached cannot start the repository at all. The
+# base compose file needs the same fix; this keeps the VM working until it has it.
+#
+# Chainguard publishes current MinIO builds, but without curl, so the upstream health
+# check cannot run. It is disabled rather than replaced with a check that always passes:
+# MinIO reports as running, not healthy, and minio-init retries until MinIO answers.
+services:
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    healthcheck:
+      disable: true
+  minio-init:
+    image: cgr.dev/chainguard/minio-client:latest
+    depends_on: !override
+      minio:
+        condition: service_started
+    # The Chainguard client has no shell, so the bucket is created in one mc invocation
+    # with its credentials in MC_HOST_<alias> instead of an `mc alias set` step.
+    entrypoint: ["/usr/bin/mc"]
+    command: ["mb", "--ignore-existing", "local/evidence-store"]
+    environment:
+      MC_HOST_local: http://dfraas_admin:dfraas_dev_only@minio:9000
+    restart: on-failure:20
