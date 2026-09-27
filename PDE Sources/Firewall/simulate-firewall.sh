@@ -974,9 +974,10 @@ json.dump(group, open(sys.argv[1], "w"), indent=2)
 PY
 fi
 
-# Files are created by root; hand them back to whoever invoked sudo.
+# Files are created by root; hand them back to whoever invoked sudo. The window's directory
+# too — left root's, it is the one place in output/ its owner cannot add a note to.
 if [[ -n "${SUDO_USER:-}" ]]; then
-	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
+	chown "$SUDO_USER" "$RUN_DIR" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
 	[[ -f "$GROUP_MANIFEST" ]] && chown "$SUDO_USER" "$GROUP_MANIFEST" 2>/dev/null || true
 	if [[ $IDS_OK -eq 1 ]]; then
 		chown "$SUDO_USER" "$IDS_LOG" 2>/dev/null || true

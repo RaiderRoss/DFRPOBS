@@ -93,7 +93,23 @@ vm_reachable() {
 #   bank   HOST_IP:BANK_PORT, bound to the lab's veth address so simulated users reach
 #          the bank through this host's firewall. Can only exist while the lab does.
 # ---------------------------------------------------------------------------
-_vm_tunnel_pidfile() { printf '%s/tunnel-%s.pid' "$LAB_DIR" "$1"; }
+# Tunnel state lives in a per-user runtime directory, not in .lab/: .lab is created by
+# lab.sh as root (it holds the ufw backups) and the admin tunnel runs as the user, who
+# could not write there. Keyed by the user the tunnel runs as — SUDO_USER when root starts
+# one on their behalf — so root and the user see the same pidfiles. /tmp is right for it:
+# the processes these name do not survive a reboot either.
+_vm_tunnel_dir() {
+	local u
+	if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then u="$SUDO_USER"; else u="$(id -un)"; fi
+	local d="/tmp/pde-tunnels-$u"
+	if [[ ! -d "$d" ]]; then
+		mkdir -p "$d" && chmod 700 "$d"
+		[[ $EUID -eq 0 && "$u" != "root" ]] && chown "$u" "$d"
+	fi
+	printf '%s' "$d"
+}
+
+_vm_tunnel_pidfile() { printf '%s/tunnel-%s.pid' "$(_vm_tunnel_dir)" "$1"; }
 
 vm_tunnel_running() {
 	local pidfile pid
@@ -111,8 +127,7 @@ vm_tunnel_start() {
 	local name="$1"; shift
 	local pidfile log
 	pidfile="$(_vm_tunnel_pidfile "$name")"
-	log="$LAB_DIR/tunnel-$name.log"
-	mkdir -p "$LAB_DIR"
+	log="$(_vm_tunnel_dir)/tunnel-$name.log"
 	vm_tunnel_running "$name" && return 0
 	_vm_gcloud_cmd || return 1
 

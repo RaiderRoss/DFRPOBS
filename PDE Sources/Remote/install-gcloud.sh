@@ -44,8 +44,11 @@ if ! "$G" config configurations describe "$VM_GCLOUD_CONFIG" >/dev/null 2>&1; th
 	"$G" config configurations create "$VM_GCLOUD_CONFIG" --no-activate >/dev/null
 	echo "created configuration $VM_GCLOUD_CONFIG (not activated)"
 fi
-cfg config set project "$VM_PROJECT" >/dev/null 2>&1
-cfg config set compute/zone "$VM_ZONE" >/dev/null 2>&1
+cfg config set project "$VM_PROJECT" >/dev/null 2>&1 || true
+# Tolerated: gcloud validates a zone through the API, which fails before login, and under
+# set -e that silently ended this script before it could say how to log in. Nothing depends
+# on it — every call passes --zone.
+cfg config set compute/zone "$VM_ZONE" >/dev/null 2>&1 || true
 
 account="$("$G" auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null | head -1)"
 if [[ -z "$account" ]]; then
