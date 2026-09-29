@@ -8,6 +8,8 @@
 #    ./vm.sh sync          ship this branch's committed HEAD to it
 #    ./vm.sh tunnel up     the repository and Fineract on this machine
 #    ./vm.sh tunnel down
+#    sudo ./vm.sh tundev up   the layer-3 tunnel device (ssh -w over IAP),
+#                             so the lab's users reach the VM as themselves
 #    ./vm.sh seed          prepare the bank for the banking source
 #    ./vm.sh ssh           a shell on it
 #
@@ -25,6 +27,8 @@ source "$PDE_ROOT/lab-config.sh"
 [[ -f "$PDE_ROOT/pde.conf" ]] && . "$PDE_ROOT/pde.conf"
 # shellcheck source=Remote/vm-lib.sh
 source "$PDE_ROOT/Remote/vm-lib.sh"
+# shellcheck source=Remote/tun-lib.sh
+source "$PDE_ROOT/Remote/tun-lib.sh"
 
 log() { printf '[%(%H:%M:%S)T] %s\n' -1 "$*"; }
 die() { echo "error: $*" >&2; exit 1; }
@@ -141,7 +145,34 @@ cmd_ssh() {
 	exec "${VM_GCLOUD[@]}" compute ssh "$VM_USER@$VM_NAME" --zone "$VM_ZONE" --tunnel-through-iap
 }
 
-[[ $EUID -ne 0 ]] || die "run as yourself, not root: gcloud's login lives in your home"
+# The layer-3 tunnel device, on its own so it can be brought up and proved before a whole
+# lab is built on top of it. The lab does this itself in `lab.sh up`; this is the same
+# thing, standalone.
+cmd_tundev() {
+	[[ $EUID -eq 0 ]] || die "tundev needs root (it creates an interface): sudo ./vm.sh tundev ${1:-up}"
+	case "${1:-up}" in
+		up)
+			vm_reachable || die "the VM is not reachable; ./vm.sh start"
+			tun_up || die "could not bring the tunnel device up"
+			echo "tunnel      $TUN_LOCAL_IP -> $TUN_VM_IP on $TUN_DEV"
+			echo "the bank    users reach it at $TUN_VM_IP:$BANK_PORT once the relay is up"
+			echo "relay       sudo ./vm.sh tundev relay" ;;
+		down)   tun_down ;;
+		status) tun_status ;;
+		relay)
+			vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" relay-up \
+				'$BANK_RELAY_LISTEN_IP' '$BANK_PORT' '$BANK_RELAY_TARGET'" </dev/null ;;
+		*) die "tundev up|down|status|relay" ;;
+	esac
+}
+
+# tundev is the one subcommand that must be root: it makes an interface, sets a sysctl and
+# adds routes. Everything gcloud does underneath it is still handed back to the invoking
+# user by vm-lib.sh, so the credential is still read from that user's home and never root's.
+case "${1:-status}" in
+	tundev) ;;
+	*) [[ $EUID -ne 0 ]] || die "run as yourself, not root: gcloud's login lives in your home" ;;
+esac
 
 case "${1:-status}" in
 	status) cmd_status ;;
@@ -149,8 +180,9 @@ case "${1:-status}" in
 	stop)   cmd_stop ;;
 	sync)   cmd_sync ;;
 	tunnel) cmd_tunnel "${2:-up}" ;;
+	tundev) cmd_tundev "${2:-up}" ;;
 	seed)   cmd_seed ;;
 	ssh)    cmd_ssh ;;
 	-h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//' ;;
-	*) die "unknown command '$1' (status, start, stop, sync, tunnel, seed, ssh)" ;;
+	*) die "unknown command '$1' (status, start, stop, sync, tunnel, tundev, seed, ssh)" ;;
 esac

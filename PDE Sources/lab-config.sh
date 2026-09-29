@@ -116,6 +116,34 @@ VM_GCLOUD_CONFIG="${VM_GCLOUD_CONFIG:-fineract-research}"
 VM_LOCAL_REPO_PORT="${VM_LOCAL_REPO_PORT:-18080}"
 VM_LOCAL_FINERACT_PORT="${VM_LOCAL_FINERACT_PORT:-18443}"
 
+# ---------------------------------------------------------------------------
+# The SSH tunnel device — a layer-3 hop to the VM, inside the IAP session
+#
+# A port forward (-L) gives the VM one source address: its own, because the forward's far
+# end opens the connection locally. That is why the bank tunnel could never be the
+# firewall's evidence, and why ufw had to stay on this machine.
+#
+# `ssh -w` instead puts a tun interface on each end and routes between them, so the
+# namespace's packets arrive at the VM with the source addresses they left with. Ten users
+# are ten sources there, which is what lets the VM's ufw log them on INPUT and Slips
+# profile them apart. It rides the same IAP session, so it opens no new firewall hole.
+#
+# The far end is a DIFFERENT subnet from SUBNET on purpose. SUBNET is directly connected on
+# the veth here, so an address inside it is answered by this host and never reaches the
+# tunnel; the users have to aim at something this machine has to route.
+TUN_NUM="${TUN_NUM:-7}"                       # ssh -w takes a number; the device is tun<N>
+TUN_DEV="tun${TUN_NUM}"
+TUN_LOCAL_IP="${TUN_LOCAL_IP:-10.98.0.2}"     # this machine's end of the point-to-point link
+TUN_VM_IP="${TUN_VM_IP:-10.98.0.1}"           # the VM's end — and the address the users target
+
+# Fineract is a Docker-published port, so packets to it are rewritten in nat/PREROUTING and
+# cross FORWARD, never INPUT: the VM's ufw would not log the one connection that matters
+# most. A plain TCP relay on the host terminates the connection on the tun address first —
+# that crosses INPUT and is logged — then opens its own to the container. It passes bytes
+# through untouched, so Fineract's TLS is still end to end from the user's point of view.
+BANK_RELAY_LISTEN_IP="${BANK_RELAY_LISTEN_IP:-$TUN_VM_IP}"
+BANK_RELAY_TARGET="${BANK_RELAY_TARGET:-127.0.0.1:8443}"
+
 # Starts the accept-and-close listener behind ALERT_PORTS, detached, so it outlives the
 # script that started it — lab.sh exits as soon as the lab is up.
 #   alert_listener_start <host> <pidfile> <logfile>    echoes the PID
