@@ -127,7 +127,11 @@ tun_up() {
 }
 
 tun_down() {
-	local num="$1" subnet="$2" dev="tun$num"
+	local num="$1" subnet="$2"
+	# Declared separately, not alongside num: `local` expands every argument before it
+	# assigns any, so "tun$num" here would have used the outer, unset num — which is why
+	# teardown was deleting a device called "tun" and the real one survived every time.
+	local dev="tun$num"
 	ip route del "$subnet" dev "$dev" 2>/dev/null || true
 	ip link del "$dev" 2>/dev/null || true
 	log "$dev removed"
@@ -190,7 +194,8 @@ relay_down() {
 # own `log` keyword hardcodes a rate limit that caps a window at ~11 lines per rule.
 # ---------------------------------------------------------------------------
 firewall_up() {
-	local subnet="$1" allowed_ports="$2" num="$3" dev="tun$num"
+	local subnet="$1" allowed_ports="$2" num="$3"
+	local dev="tun$num"   # separate: see the note in tun_down
 
 	command -v ufw >/dev/null || die "ufw is not installed on the VM"
 
