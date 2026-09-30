@@ -59,6 +59,13 @@ LAB_USERS=0
 LAB_STARTED_UTC=""
 LAB_NS="$NS"
 LAB_VETH_HOST="$VETH_HOST"
+# Tunnel mode: the users stay here but everything that observes them is on the VM, so the
+# firewall log, the IDS and the sessions' own authentication record are all read from there.
+# TARGET_IP is what the generators aim at, and it is the one value that changes the traffic
+# itself rather than only where it is collected from.
+LAB_VIA_TUNNEL=0
+LAB_VM_SLIPS_OUT=""
+TARGET_IP="$HOST_IP"
 if [[ -f "$LAB_STATE" ]]; then
 	# Parsed rather than sourced — see lab_get in lab-config.sh.
 	LAB_NS=$(lab_get LAB_NS "$NS")
@@ -72,6 +79,9 @@ if [[ -f "$LAB_STATE" ]]; then
 		LAB_USERS=$(lab_get LAB_USERS 0)
 		LAB_STARTED_UTC=$(lab_get LAB_STARTED_UTC "?")
 		LAB_VETH_HOST=$(lab_get LAB_VETH_HOST "$VETH_HOST")
+		LAB_VIA_TUNNEL=$(lab_get LAB_VIA_TUNNEL 0)
+		LAB_VM_SLIPS_OUT=$(lab_get LAB_VM_SLIPS_OUT "")
+		TARGET_IP=$(lab_get LAB_TARGET_IP "$HOST_IP")
 	fi
 fi
 
@@ -218,13 +228,27 @@ elif [[ $WITH_BANKING -eq 1 ]]; then
 	die "--with-banking needs a running lab (the bank tunnel belongs to it): ./lab.sh up --with-banking"
 fi
 
-if [[ $IDS_REMOTE -eq 1 || $WITH_BANKING -eq 1 ]]; then
+if [[ $IDS_REMOTE -eq 1 || $WITH_BANKING -eq 1 || $LAB_VIA_TUNNEL -eq 1 ]]; then
 	# shellcheck source=../Remote/vm-lib.sh
 	source "$PDE_ROOT/Remote/vm-lib.sh"
+fi
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	# shellcheck source=../Remote/tun-lib.sh
+	source "$PDE_ROOT/Remote/tun-lib.sh"
+	# shellcheck source=../Remote/remote-source-lib.sh
+	source "$PDE_ROOT/Remote/remote-source-lib.sh"
+	# shellcheck source=../Auth/auth-lib.sh
+	source "$PDE_ROOT/Auth/auth-lib.sh"
 fi
 if [[ $WITH_BANKING -eq 1 ]]; then
 	# shellcheck source=../Banking/banking-lib.sh
 	source "$PDE_ROOT/Banking/banking-lib.sh"
+	# The bank is reached at the tunnel's far end in this mode, through the relay that makes
+	# the call cross the VM's INPUT chain. banking-lib.sh computes this from HOST_IP, which
+	# is this machine — where nothing is listening.
+	if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+		BANK_URL="https://${TARGET_IP}:${BANK_PORT}/fineract-provider"
+	fi
 fi
 
 if [[ $DRY_RUN -eq 0 && $IDS_REMOTE -eq 1 ]]; then
@@ -237,7 +261,23 @@ if [[ $DRY_RUN -eq 0 && $IDS_REMOTE -eq 1 ]]; then
 fi
 if [[ $DRY_RUN -eq 0 && $WITH_BANKING -eq 1 ]]; then
 	banking_preflight || die "banking preflight failed"
-	vm_tunnel_running bank || die "the lab's bank tunnel is down; restart the lab"
+	# In tunnel mode the bank is reached through the relay on the tunnel device, not through
+	# a port forward, so it is the tunnel that has to be up.
+	if [[ $LAB_VIA_TUNNEL -eq 0 ]]; then
+		vm_tunnel_running bank || die "the lab's bank tunnel is down; restart the lab"
+	fi
+fi
+
+if [[ $DRY_RUN -eq 0 && $LAB_VIA_TUNNEL -eq 1 ]]; then
+	# Every source in this mode is read from the VM, so a dropped tunnel is not a degraded
+	# window, it is a window with no evidence in it at all.
+	tun_session_running || die "the lab's tunnel device is down; './lab.sh down' then up"
+	ping -c1 -W2 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1 		|| die "the tunnel device is up but $TUN_VM_IP does not answer; restart the lab"
+	remote_source_preflight || die "the VM's logs cannot be read"
+	auth_preflight || die "the auth source preflight failed"
+	if [[ $WITH_IDS -eq 1 ]]; then
+		[[ -n "$LAB_VM_SLIPS_OUT" ]] || die "the lab records an IDS on the VM but no output directory; restart the lab"
+	fi
 fi
 
 # guaranteed-alert depends on a listener and permit rules. A lab started before they
@@ -512,21 +552,45 @@ STAMP=$(date -u -d "@$WINDOW_START_EPOCH" +%Y%m%d%H%M%S)
 
 # Byte offset rather than a timestamp filter: syslog's traditional format has neither a
 # year nor sub-second precision, so it cannot reliably bound a 30-second window on its own.
-SRC_LOG="$UFW_LOG"
-[[ -f "$SRC_LOG" ]] || SRC_LOG="$KERN_LOG"
-LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
-log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
+# In tunnel mode the firewall is the VM's, so the log is the VM's: the boundary is a byte
+# offset taken there, and the range is fetched back after the window closes. Same mechanism,
+# one machine further away.
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	SRC_LOG="$VM_UFW_LOG"
+	LOG_OFFSET=$(remote_offset "$VM_UFW_LOG")
+	FW_LOG_DESC="$VM_UFW_LOG on $VM_NAME"
+	log "capturing from $SRC_LOG on $VM_NAME at byte offset $LOG_OFFSET"
+else
+	SRC_LOG="$UFW_LOG"
+	[[ -f "$SRC_LOG" ]] || SRC_LOG="$KERN_LOG"
+	LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
+	FW_LOG_DESC="$SRC_LOG"
+	log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
+fi
 
 # Same mechanism for the IDS, and for the same reason: both sources keep running and
 # writing throughout, and the window is a bounded read against them rather than a pause.
 IDS_ALERTS_OFFSET=0
 PCAP_OFFSET=0
+AUTH_OFFSET=""
 if [[ $IDS_REMOTE -eq 1 ]]; then
 	# Remote: the offset is into the lab's packet capture, and the window's packets are what
 	# tcpdump writes after it.
 	PCAP_OFFSET=$(pcap_offset "$LAB_PCAP")
+elif [[ $LAB_VIA_TUNNEL -eq 1 && $WITH_IDS -eq 1 ]]; then
+	# Slips is sniffing the device on the VM and writing there, so its evidence file is read
+	# by an offset taken there, exactly as the firewall's is.
+	IDS_ALERTS_OFFSET=$(remote_offset "$LAB_VM_SLIPS_OUT/alerts/alerts.log")
 elif [[ $WITH_IDS -eq 1 ]]; then
 	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
+fi
+
+# The remote-access source. Taken before the window for the same reason as the others, but
+# it bounds only the *new* records: the login that authorised this window predates it, and
+# the collector gathers that separately. See Auth/README.md.
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	AUTH_OFFSET=$(auth_offset) || AUTH_OFFSET=""
+	[[ -n "$AUTH_OFFSET" ]] || { echo "warning: could not read sshd's offset on the VM; the auth source will be skipped" >&2; }
 fi
 
 # One directory per captured window. The window is the unit of evidence — an
@@ -563,7 +627,7 @@ log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PC
 ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--users "$USERS_CSV" \
 	--malicious-users "$MALICIOUS_CSV" \
-	--target "$HOST_IP" \
+	--target "$TARGET_IP" \
 	--duration "$DURATION" \
 	--rate "$RATE" \
 	--malicious-pct "$MALICIOUS_PCT" \
@@ -597,8 +661,27 @@ sleep 3
 # ---------------------------------------------------------------------------
 # Extract, hash, seal
 # ---------------------------------------------------------------------------
+# In tunnel mode the log is on the VM, so the window's byte range is brought here first and
+# everything below then runs against a local file exactly as it always did. The digest taken
+# on the VM is checked on arrival, so the range is known to have crossed intact; the evidence
+# artifact itself is hashed further down, after the filter.
+FW_RANGE_BYTES=0
+FW_RANGE_SHA=""
+FW_RAW=""
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	FW_RAW="$RUN_DIR/.ufw-range"
+	if read -r FW_RANGE_BYTES FW_RANGE_SHA < <(remote_slice "$VM_UFW_LOG" "$LOG_OFFSET" "$STAMP" "ufw-range.log" "$FW_RAW"); then
+		log "fetched ${FW_RANGE_BYTES} bytes of $VM_UFW_LOG from $VM_NAME"
+		SRC_LOG="$FW_RAW"
+		LOG_OFFSET=0
+	else
+		die "could not bring the firewall's window home from $VM_NAME"
+	fi
+fi
+
 tail -c "+$((LOG_OFFSET + 1))" "$SRC_LOG" 2>/dev/null \
 	| grep -F "SRC=${USER_IP_BASE}" > "$OUT_LOG" || true
+[[ -n "$FW_RAW" ]] && rm -f "$FW_RAW"
 
 # NOT named LINES. `LINES` is a bash special variable: with `checkwinsize` on — the
 # default since bash 5.0, and it applies to scripts too whenever the shell has a
@@ -654,18 +737,29 @@ TZ_OFFSET=$(date +%z)
 SHA256=$(sha256sum "$OUT_LOG" | cut -d' ' -f1)
 chmod 444 "$OUT_LOG"
 
+# Which ufw and which kernel actually logged this. In tunnel mode that is the VM's, and a
+# manifest naming this machine's would be describing software that logged nothing.
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	IFS='|' read -r FW_UFW_VERSION FW_KERNEL FW_HOST <<< "$(remote_firewall_facts)"
+	FW_METHOD="real packets across the INPUT chain of $VM_NAME, arriving on $TUN_DEV from this machine's namespace over the tunnel device; log lines are kernel-generated and were not synthesised"
+else
+	FW_UFW_VERSION="$(ufw --version 2>/dev/null | head -1)"
+	FW_KERNEL="$(uname -r)"
+	FW_HOST="$(hostname)"
+	FW_METHOD="real packets across the host INPUT chain; log lines are kernel-generated and were not synthesised"
+fi
+
 python3 - "$MANIFEST" <<PY
-import json, subprocess, sys
+import json, sys
 manifest = {
     "source": {
         "pde_source": "firewall",
         "product": "ufw",
-        "version": subprocess.run(["ufw","--version"], capture_output=True, text=True)
-                     .stdout.splitlines()[0].strip(),
-        "kernel": subprocess.run(["uname","-r"], capture_output=True, text=True).stdout.strip(),
-        "log_facility": "netfilter LOG target -> rsyslog -> ${SRC_LOG}",
-        "collection_method": "real packets across the host INPUT chain; log lines are "
-                            "kernel-generated and were not synthesised",
+        "version": "${FW_UFW_VERSION}",
+        "kernel": "${FW_KERNEL}",
+        "observed_on": "${FW_HOST}",
+        "log_facility": "netfilter LOG target -> rsyslog -> ${FW_LOG_DESC}",
+        "collection_method": "${FW_METHOD}",
     },
     "window": {
         "start_utc": "${WINDOW_START_ISO}",
@@ -802,6 +896,20 @@ elif [[ $WITH_IDS -eq 1 ]]; then
 	IDS_OK=1
 fi
 
+# Tunnel mode: Slips ran on the VM, live on the device. Its tree comes home and the slicer
+# below is pointed at it with the offset taken on the VM — the fetched alerts.log is that
+# same whole file, so the offset still means there what it meant here.
+if [[ $IDS_OK -eq 1 && $LAB_VIA_TUNNEL -eq 1 ]]; then
+	SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
+	log "fetching Slips' output from $VM_NAME"
+	if ! remote_slips_fetch "$LAB_VM_SLIPS_OUT" "$SLIPS_OUT"; then
+		echo "error: could not fetch the IDS evidence; the window has none" >&2
+		IDS_OK=0
+		CAPTURE_ERRORS=1
+	fi
+fi
+
+
 if [[ $IDS_OK -eq 1 ]]; then
 	# Locally, collected while Slips is still running. An IDS is a continuously running
 	# system that gets *read* against; halting one to gather evidence is not something a
@@ -862,14 +970,42 @@ if [[ -n "$BANK_COLLECT_PID" ]]; then
 	rm -f "$RUN_DIR/.banking-collect.log"
 fi
 
+# The remote-access source. Collected after the window like the others, but it reaches back
+# past the window's start on purpose: the login that authorised this window is older than the
+# window, and an evidence file holding only the window would say nobody authenticated.
+AUTH_OK=0
+AUTH_SHA=""
+AUTH_ACCEPTED=0
+AUTH_FAILED=0
+AUTH_SUMMARY=""
+if [[ $LAB_VIA_TUNNEL -eq 1 && -n "$AUTH_OFFSET" ]]; then
+	log "collecting the tunnel's authentication record from $VM_NAME"
+	if AUTH_SUMMARY=$(auth_collect "$STAMP" "$AUTH_OFFSET" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$RUN_DIR"); then
+		AUTH_OK=1
+		AUTH_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' 			"$RUN_DIR/auth_${STAMP}.meta.json" 2>/dev/null || echo "")
+		read -r AUTH_ACCEPTED AUTH_FAILED < <(python3 -c 'import json,sys
+c = json.load(open(sys.argv[1]))["counts"]
+print(c["accepted_logins"], c["failed_attempts"])' "$RUN_DIR/auth_${STAMP}.meta.json" 2>/dev/null) || true
+		chmod 444 "$RUN_DIR/auth_${STAMP}.log"
+		log "auth evidence: ${AUTH_ACCEPTED:-0} accepted logins, ${AUTH_FAILED:-0} failed attempts"
+	else
+		echo "error: the auth source produced no evidence for this window" >&2
+		CAPTURE_ERRORS=1
+	fi
+fi
+
+
 # The group is the point of the exercise: one window, one attack, independent sources that
 # each saw part of it. This is the record an EvidenceGroup row would be built from. Values
 # go in through the environment rather than being pasted into the Python source.
-if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 ]]; then
+if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 || $AUTH_OK -eq 1 ]]; then
 	G_STAMP="$STAMP" G_START="$WINDOW_START_ISO" G_END="$WINDOW_END_ISO" G_DURATION="$DURATION" \
 	G_USERS="$USERS" G_MAL_USERS="$MALICIOUS_USERS" G_MAL_PCT="$MALICIOUS_PCT" G_PROFILE="$ATTACK_PROFILE" \
 	G_SEED="$SEED" G_SUBNET="$SUBNET" G_TZ_NAME="$TZ_NAME" G_TZ_OFFSET="$TZ_OFFSET" G_VETH="$VETH_HOST" \
 	G_VM="${VM_NAME:-}" G_HOST_IP="$HOST_IP" G_BANK_PORT="$BANK_PORT" \
+	G_VIA_TUNNEL="$LAB_VIA_TUNNEL" G_TARGET_IP="$TARGET_IP" G_TUN_DEV="${TUN_DEV:-}" \
+	G_AUTH_OK="$AUTH_OK" G_AUTH_SHA="$AUTH_SHA" G_AUTH_ACCEPTED="${AUTH_ACCEPTED:-0}" \
+	G_AUTH_FAILED="${AUTH_FAILED:-0}" \
 	G_FW_SHA="$SHA256" G_FW_LINES="$LOG_LINES" G_FW_BLOCK="$BLOCKED" G_FW_ALLOW="$ALLOWED" G_FW_AUDIT="$AUDITED" \
 	G_IDS_OK="$IDS_OK" G_IDS_REMOTE="$IDS_REMOTE" G_IDS_SHA="$IDS_SHA" G_IDS_KEPT="$IDS_KEPT" \
 	G_IDS_TOTAL="$IDS_TOTAL" G_IDS_ALERTS="$IDS_ALERTS" G_IDS_SEV="$IDS_SEVERITIES" \
@@ -954,13 +1090,48 @@ if E.get("G_BANK_MANIFEST"):
             "addresses through the lab's tunnel on %s:%s, so the attacker (%s) appears in the firewall log "
             "as permitted connections to port %s and in the traffic the IDS analysed, and what those "
             "connections did appears in the bank's audit trail under the login they used (%s) and in its "
-            "event stream." % (E["G_HOST_IP"], E["G_BANK_PORT"], sc["attacker_ip"], E["G_BANK_PORT"],
+            "event stream." % (E["G_TARGET_IP"], E["G_BANK_PORT"], sc["attacker_ip"], E["G_BANK_PORT"],
                               sc["attacker_used_login"]))
     else:
         correlation.append("The banking items record the same users' activity at the bank in this window.")
     caveats.append(
         "banking timestamps are UTC from the bank's clock on the research VM, not this machine's; the "
         "banking manifest records the measured offset (bank_minus_lab_seconds) and how to read each field")
+
+if E.get("G_AUTH_OK") == "1":
+    items.append({
+        "pde_source": "auth", "product": "openssh-sshd",
+        "file": "auth_%s.log" % stamp, "sha256": E["G_AUTH_SHA"],
+        "accepted_logins": n("G_AUTH_ACCEPTED"), "failed_attempts": n("G_AUTH_FAILED"),
+        "meta_file": "auth_%s.meta.json" % stamp,
+    })
+    correlation.append(
+        "The auth item is the session everything else in this window arrived inside. The users' "
+        "packets reached %s over the tunnel device %s, which exists only within an authenticated "
+        "SSH session to the VM, and that session's login is what this item records. It is the only "
+        "source here that points at a person rather than at an address or an application login."
+        % (E["G_TARGET_IP"], E["G_TUN_DEV"]))
+    caveats += [
+        "the auth item deliberately reaches back past window.start_utc. The tunnel is opened when "
+        "the lab is built and carries every window after it, so the login that authorised this "
+        "window predates it, and an item holding only the window would read as 'nobody "
+        "authenticated'. The establishing session's lines and the window's own are separated by "
+        "### marker lines, which are the collector's and not sshd's",
+        "sshd records the session's source in Google's IAP forwarder range (35.235.240.0/20), not "
+        "the address the analyst sat at. The real client address and the Google identity are in "
+        "Cloud Audit Logs, which this window does not collect - see Auth/README.md",
+        "every remote command the lab runs opens its own SSH session, so most accepted logins in a "
+        "window are the lab working rather than a person. The tunnel's own session is identified by "
+        "the pids recorded in auth_<ts>.meta.json",
+    ]
+
+if E.get("G_VIA_TUNNEL") == "1":
+    caveats.append(
+        "the firewall item is ufw on %s, not on the machine that generated the traffic. The users' "
+        "packets keep their own source addresses across the tunnel device, so the VM's INPUT chain "
+        "logged them as distinct sources; this machine only forwarded them and its own firewall was "
+        "not in the path. One consequence for timing: the firewall, IDS and auth items are all on "
+        "the VM's clock, and only the ground truth is on this machine's" % E["G_VM"])
 
 group = {
     "group_id": stamp,
@@ -991,6 +1162,7 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 		fi
 	fi
 	chown "$SUDO_USER" "$RUN_DIR"/banking* 2>/dev/null || true
+	chown "$SUDO_USER" "$RUN_DIR"/auth_* 2>/dev/null || true
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
@@ -1009,6 +1181,10 @@ if [[ $WITH_BANKING -eq 1 ]]; then
 	log "  banking-events_${STAMP}.jsonl      the bank's business events"
 	log "  banking-audit_${STAMP}.jsonl       the bank's audit trail"
 	log "  banking_${STAMP}.manifest.json     provenance, completeness, digests"
+fi
+if [[ $AUTH_OK -eq 1 ]]; then
+	log "  auth_${STAMP}.log                  who opened the session it arrived in"
+	log "  auth_${STAMP}.meta.json            provenance, the tunnel session, digest"
 fi
 [[ -f "$GROUP_MANIFEST" ]] && log "  window_${STAMP}.group.json         every source, one window"
 

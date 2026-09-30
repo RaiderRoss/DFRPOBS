@@ -16,15 +16,24 @@
 #    sudo Firewall/simulate-firewall.sh          # window 2
 #    sudo ./lab.sh down
 #
-#  IMPORTANT: while the lab is up your firewall is enabled with
-#  test rules and full logging. `down` puts it back. `status`
-#  detects a session that did not survive a reboot and offers to.
+#  IMPORTANT: in the default mode, while the lab is up YOUR
+#  firewall is enabled with test rules and full logging. `down`
+#  puts it back, and `status` detects a session that did not
+#  survive a reboot. --via-tunnel does not touch it at all.
 #
 #  Two sources can live on the research VM instead (Remote/):
 #    --ids-remote     the IDS is a tcpdump on the veth here; each
 #                     window's packets are analysed by Slips there
 #    --with-banking   the bank is Fineract there, reached from the
 #                     namespace through a tunnel on HOST_IP:BANK_PORT
+#
+#  Or the observation can move there wholesale:
+#    --via-tunnel     the users stay here and keep their addresses,
+#                     but reach the VM over a layer-3 tunnel device,
+#                     so the VM's ufw is the firewall, Slips watches
+#                     the device live, and the tunnel's own login
+#                     becomes a fifth source. YOUR firewall is not
+#                     touched at all in this mode. See Remote/TUNNEL.md.
 # ==============================================================
 set -euo pipefail
 
@@ -39,6 +48,7 @@ BANK_SEED="${BANK_SEED:-$PDE_ROOT/Banking/seed.json}"
 WITH_IDS=0
 IDS_REMOTE=0
 WITH_BANKING=0
+VIA_TUNNEL=0
 IDS_READY_TIMEOUT=240
 USERS=10
 
@@ -46,11 +56,11 @@ log()  { printf '[%(%H:%M:%S)T] %s\n' -1 "$*"; }
 die()  { echo "error: $*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+	sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
 	cat <<-EOF
 
 	Commands:
-	  up [--with-ids [--ids-remote]] [--with-banking] [--users N]
+	  up [--with-ids [--ids-remote]] [--with-banking] [--via-tunnel] [--users N]
 	                                build the lab and leave it running
 	  down                          restore the firewall and tear everything down
 	  status                        report what is up, and detect a stale session
@@ -75,22 +85,53 @@ netns_exists() {
 lab_up() {
 	[[ $EUID -eq 0 ]] || die "must run as root (firewall rules and network namespaces)"
 	lab_is_up && die "a lab is already up — './lab.sh status', or './lab.sh down' first"
-	command -v ufw >/dev/null || die "ufw not installed"
 	command -v iptables >/dev/null || die "iptables not installed"
-	pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw lines would not reach $UFW_LOG"
+	# In tunnel mode the firewall is the VM's, so this machine needs neither ufw nor a
+	# running rsyslog — and its own firewall is left completely alone.
+	if [[ $VIA_TUNNEL -eq 0 ]]; then
+		command -v ufw >/dev/null || die "ufw not installed"
+		pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw lines would not reach $UFW_LOG"
+	fi
 	# Before any rule is written: a contradiction between the port lists cannot be seen in
 	# the finished dataset, only in the labels disagreeing with each other.
 	lab_check_port_lists || die "the port lists contradict each other; fix lab-config.sh"
+
+	# In tunnel mode the traffic arrives on the VM, so the IDS has to be there and watching
+	# the device live. --ids-remote is the older split — sensor here, analysis there — and
+	# the two cannot both be true of one lab.
+	if [[ $VIA_TUNNEL -eq 1 && $IDS_REMOTE -eq 1 ]]; then
+		die "--via-tunnel and --ids-remote are different designs; --via-tunnel already puts the IDS on the VM"
+	fi
 
 	if [[ $WITH_IDS -eq 1 ]]; then
 		[[ -f "$IDS_LIB" ]] || die "--with-ids needs $IDS_LIB"
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
-		if [[ $IDS_REMOTE -eq 1 ]]; then
+		if [[ $VIA_TUNNEL -eq 1 ]]; then
+			: # checked below, once the VM has been confirmed reachable
+		elif [[ $IDS_REMOTE -eq 1 ]]; then
 			command -v tcpdump >/dev/null || die "--ids-remote needs tcpdump (apt install tcpdump)"
 			slips_remote_preflight || die "remote IDS preflight failed"
 		else
 			slips_preflight || die "IDS preflight failed"
+		fi
+	fi
+
+	if [[ $VIA_TUNNEL -eq 1 ]]; then
+		# shellcheck source=Remote/tun-lib.sh
+		source "$PDE_ROOT/Remote/tun-lib.sh"
+		# shellcheck source=Remote/remote-source-lib.sh
+		source "$PDE_ROOT/Remote/remote-source-lib.sh"
+		# shellcheck source=Auth/auth-lib.sh
+		source "$PDE_ROOT/Auth/auth-lib.sh"
+		vm_reachable || die "--via-tunnel needs the research VM (status: $(vm_status || echo unknown)); ./vm.sh start"
+		remote_source_preflight || die "the VM cannot be read as a source"
+		auth_preflight || die "the auth source preflight failed"
+		vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\"" </dev/null 2>/dev/null \
+			|| die "the VM's checkout predates Remote/vm-net.sh — ./vm.sh sync"
+		if [[ $WITH_IDS -eq 1 ]]; then
+			vm_ssh "docker image inspect '${SLIPS_IMG:-stratosphereips/slips:latest}' >/dev/null 2>&1" </dev/null \
+				|| die "the VM has no Slips image — on the VM: docker pull ${SLIPS_IMG:-stratosphereips/slips:latest}"
 		fi
 	fi
 	if [[ $WITH_BANKING -eq 1 ]]; then
@@ -104,11 +145,19 @@ lab_up() {
 	mkdir -p "$LAB_DIR"
 
 	# --- snapshot before touching anything -----------------------------------
+	# Only in the local mode. In tunnel mode this host's firewall is not in the path and is
+	# never touched, so there is nothing to snapshot and nothing that could be left behind —
+	# the failure mode the whole restore mechanism exists for cannot occur.
 	local orig_enabled orig_loglevel
-	orig_enabled=$(grep -E '^ENABLED=' /etc/ufw/ufw.conf | cut -d= -f2)
-	orig_loglevel=$(grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf | cut -d= -f2)
-	cp -a /etc/ufw/user.rules "$LAB_DIR/user.rules.bak"
-	cp -a /etc/ufw/user6.rules "$LAB_DIR/user6.rules.bak"
+	if [[ $VIA_TUNNEL -eq 1 ]]; then
+		orig_enabled="untouched"
+		orig_loglevel="untouched"
+	else
+		orig_enabled=$(grep -E '^ENABLED=' /etc/ufw/ufw.conf | cut -d= -f2)
+		orig_loglevel=$(grep -E '^LOGLEVEL=' /etc/ufw/ufw.conf | cut -d= -f2)
+		cp -a /etc/ufw/user.rules "$LAB_DIR/user.rules.bak"
+		cp -a /etc/ufw/user6.rules "$LAB_DIR/user6.rules.bak"
+	fi
 
 	# Written before the changes are made, not after. If this script dies halfway
 	# through the setup, `down` still has everything it needs to undo the parts that
@@ -127,6 +176,10 @@ lab_up() {
 	LAB_WITH_IDS="$WITH_IDS"
 	LAB_IDS_MODE="$([[ $IDS_REMOTE -eq 1 ]] && echo remote || echo local)"
 	LAB_WITH_BANKING="$WITH_BANKING"
+	LAB_VIA_TUNNEL="$VIA_TUNNEL"
+	LAB_TUN_DEV="$TUN_DEV"
+	LAB_TUN_VM_IP="$TUN_VM_IP"
+	LAB_TARGET_IP="$([[ $VIA_TUNNEL -eq 1 ]] && echo "$TUN_VM_IP" || echo "$HOST_IP")"
 	LAB_USERS="$USERS"
 	LAB_ORIG_ENABLED="$orig_enabled"
 	LAB_ORIG_LOGLEVEL="$orig_loglevel"
@@ -154,21 +207,70 @@ lab_up() {
 	done
 	ip netns exec "$NS" ip link set "$VETH_NS" up
 
-	# --- listener behind the alert ports --------------------------------------
-	# Bound to the host address, so it can only start once the veth carries it. Recorded in
-	# the state file immediately: it runs in the root namespace, so deleting the namespace
-	# would not stop it, and `down` must be able to find it even if setup fails after this.
-	log "starting the alert listener on $HOST_IP ports $ALERT_PORTS"
-	local listener_pid
-	listener_pid=$(alert_listener_start "$HOST_IP" "$LAB_DIR/alert-listener.pid" "$LAB_DIR/alert-listener.log") \
-		|| die "could not start the alert listener"
-	cat >> "$LAB_STATE" <<-EOF
-	LAB_LISTENER_PID="$listener_pid"
-	LAB_ALERT_PORTS="$ALERT_PORTS"
-	EOF
+	# --- the tunnel, and everything the users now talk to on the far side ------
+	#
+	# Built after the namespace, because the route the users need is added inside it, and
+	# before anything on the VM is bound to the tunnel address, which does not exist until
+	# the device is up. Recorded before each step rather than after, so `down` can undo
+	# whatever did land if a later step fails.
+	if [[ $VIA_TUNNEL -eq 1 ]]; then
+		log "opening the tunnel device $TUN_LOCAL_IP -> $TUN_VM_IP ($TUN_DEV) over IAP"
+		echo 'LAB_TUNNEL="1"' >> "$LAB_STATE"
+		tun_up "$NS" || die "could not bring the tunnel device up"
+
+		echo 'LAB_VM_SERVICES="1"' >> "$LAB_STATE"
+		log "starting the alert listener on $VM_NAME at $TUN_VM_IP ports $ALERT_PORTS"
+		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" listener-up \
+			'$TUN_VM_IP' '$ALERT_PORTS'" </dev/null || die "could not start the alert listener on the VM"
+
+		if [[ $WITH_BANKING -eq 1 ]]; then
+			log "starting the bank relay on $VM_NAME at $TUN_VM_IP:$BANK_PORT"
+			vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" relay-up \
+				'$BANK_RELAY_LISTEN_IP' '$BANK_PORT' '$BANK_RELAY_TARGET'" </dev/null \
+				|| die "could not start the bank relay on the VM"
+		fi
+		cat >> "$LAB_STATE" <<-EOF
+		LAB_ALERT_PORTS="$ALERT_PORTS"
+		EOF
+	else
+		# --- listener behind the alert ports ----------------------------------
+		# Bound to the host address, so it can only start once the veth carries it. Recorded
+		# in the state file immediately: it runs in the root namespace, so deleting the
+		# namespace would not stop it, and `down` must be able to find it even if setup
+		# fails after this.
+		log "starting the alert listener on $HOST_IP ports $ALERT_PORTS"
+		local listener_pid
+		listener_pid=$(alert_listener_start "$HOST_IP" "$LAB_DIR/alert-listener.pid" "$LAB_DIR/alert-listener.log") \
+			|| die "could not start the alert listener"
+		cat >> "$LAB_STATE" <<-EOF
+		LAB_LISTENER_PID="$listener_pid"
+		LAB_ALERT_PORTS="$ALERT_PORTS"
+		EOF
+	fi
 
 	# --- IDS, before the firewall so `logging full` is not on during its startup ---
-	if [[ $WITH_IDS -eq 1 && $IDS_REMOTE -eq 1 ]]; then
+	if [[ $WITH_IDS -eq 1 && $VIA_TUNNEL -eq 1 ]]; then
+		# Live on the device, on the VM. This is the mode the lab had before the IDS was
+		# split, and the better one: Slips watches an interface continuously and its
+		# per-source profile carries across windows, where file-mode analysis starts fresh
+		# each window and can never accumulate. It reuses the VM's standing redis, so it
+		# inherits the warm threat-intel cache instead of refetching ~45 feeds.
+		local vm_slips_sub="pde-slips/live-$lab_stamp"
+		log "starting Slips on $VM_NAME, reading $TUN_DEV (loading modules and feeds)"
+		echo "LAB_VM_SLIPS_SUB=\"$vm_slips_sub\"" >> "$LAB_STATE"
+		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-up \
+			'$TUN_DEV' '$VM_USER' '$vm_slips_sub'" </dev/null || die "could not start Slips on the VM"
+		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-ready \
+			'$IDS_READY_TIMEOUT'" </dev/null || die "Slips on the VM never became ready"
+		local vm_slips_out
+		vm_slips_out=$(vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-outdir" \
+			</dev/null | tr -d '\r' | head -1)
+		[[ -n "$vm_slips_out" ]] || die "Slips is up on the VM but did not report its output directory"
+		cat >> "$LAB_STATE" <<-EOF
+		LAB_VM_SLIPS_OUT="$vm_slips_out"
+		EOF
+		log "Slips is reading $TUN_DEV on $VM_NAME (output $vm_slips_out)"
+	elif [[ $WITH_IDS -eq 1 && $IDS_REMOTE -eq 1 ]]; then
 		# The sensor stays here, the analysis goes to the VM: tcpdump writes the veth for
 		# the whole session, and each capture slices its window out and ships it.
 		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
@@ -194,13 +296,48 @@ lab_up() {
 	# Bound to HOST_IP, so it can only open once the veth carries that address. A simulated
 	# user reaching https://HOST_IP:BANK_PORT crosses this host's INPUT chain — ufw logs it —
 	# and the tunnel carries it on to Fineract on the VM.
-	if [[ $WITH_BANKING -eq 1 ]]; then
+	# In tunnel mode the bank is already reachable: the relay above listens on the tunnel
+	# address, which is where the users aim, and the port forward this block opens would be
+	# a second, unused path to the same service.
+	if [[ $WITH_BANKING -eq 1 && $VIA_TUNNEL -eq 0 ]]; then
 		log "opening the bank tunnel $HOST_IP:$BANK_PORT -> $VM_NAME:8443"
 		vm_bank_tunnel_start || die "could not open the bank tunnel"
 		echo 'LAB_BANK_TUNNEL="1"' >> "$LAB_STATE"
 	fi
 
 	# --- firewall -------------------------------------------------------------
+	#
+	# In tunnel mode it is the VM's, because the packets now cross the VM's INPUT chain and
+	# this host only forwards them. The same rule set and the same unrate-limited verdict
+	# LOG rules, scoped to what arrives on the tunnel device so nothing else on the VM is
+	# logged into the evidence.
+	#
+	# firewall-up arms a watchdog that disables ufw again unless it is confirmed; the
+	# confirmation is an SSH round trip that only succeeds if the rules did not lock us out.
+	if [[ $VIA_TUNNEL -eq 1 ]]; then
+		log "configuring ufw on $VM_NAME (logging=full, verdict rules on $TUN_DEV)"
+		echo 'LAB_VM_FIREWALL="1"' >> "$LAB_STATE"
+		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" firewall-up \
+			'$SUBNET' '$ALLOWED_PORTS' '$TUN_NUM'" </dev/null || die "could not configure ufw on the VM"
+		# Proof the firewall did not cut the only way in, before the watchdog is cancelled.
+		if vm_ssh true </dev/null >/dev/null 2>&1; then
+			vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" firewall-keep" </dev/null \
+				|| die "the VM's firewall is up but the watchdog could not be cancelled"
+		else
+			die "the VM stopped answering after its firewall came up; the watchdog will disable it shortly"
+		fi
+		# The tunnel itself must still carry traffic with the firewall in place — the rules
+		# are scoped to the device, so a mistake in them shows up here and nowhere else.
+		ping -c1 -W2 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1 \
+			|| die "the VM's firewall is up but $TUN_VM_IP no longer answers over $TUN_DEV"
+		log "lab up (this machine's firewall was not touched)"
+		echo
+		echo "  The firewall evidence is ufw on $VM_NAME, not this machine."
+		echo "  Capture windows with:  sudo Firewall/simulate-firewall.sh"
+		echo "  Tear it down with:     sudo ./lab.sh down"
+		return 0
+	fi
+
 	# Order carries the labelling. PRESERVE_PORTS overlaps MALICIOUS_PORTS (22, 5432);
 	# if the preserve rules came first they would match the simulated attacker too and
 	# those attempts would be logged as permitted. Subnet rules are scoped and go
@@ -265,10 +402,40 @@ lab_down() {
 	LAB_ORIG_LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL low)
 	LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
 
+	local LAB_VIA_TUNNEL; LAB_VIA_TUNNEL=$(lab_get LAB_VIA_TUNNEL 0)
+
+	# --- the VM's side, and the tunnel, first ---------------------------------
+	# Everything here is best effort: the VM may already have been stopped, in which case its
+	# services went with it, and a lab that cannot reach it must still be able to tear down
+	# this machine's namespace and routes.
+	if [[ "$LAB_VIA_TUNNEL" == "1" ]]; then
+		# shellcheck source=Remote/tun-lib.sh
+		source "$PDE_ROOT/Remote/tun-lib.sh"
+		if [[ "$(lab_get LAB_VM_SERVICES 0)" == "1" ]] && vm_reachable; then
+			log "stopping the VM's lab services"
+			local vmnet="\"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\""
+			[[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && \
+				vm_ssh "sudo bash $vmnet slips-down" </dev/null >/dev/null 2>&1 || true
+			vm_ssh "sudo bash $vmnet listener-down" </dev/null >/dev/null 2>&1 || true
+			vm_ssh "sudo bash $vmnet relay-down"    </dev/null >/dev/null 2>&1 || true
+			if [[ "$(lab_get LAB_VM_FIREWALL 0)" == "1" ]]; then
+				log "restoring the VM's firewall"
+				vm_ssh "sudo bash $vmnet firewall-down" </dev/null >/dev/null 2>&1 || true
+			fi
+		elif [[ "$(lab_get LAB_VM_SERVICES 0)" == "1" ]]; then
+			echo "note: the VM is not reachable; its ufw and lab services were left as they are." >&2
+			echo "      They go with the VM when it stops, and 'vm-net.sh firewall-down' undoes the rest." >&2
+		fi
+		log "closing the tunnel device"
+		tun_down
+	fi
+
 	# In the root namespace, so tearing the namespace down below would not stop it.
-	log "stopping the alert listener"
-	alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
-	rm -f "$LAB_DIR/alert-listener.pid"
+	if [[ "$LAB_VIA_TUNNEL" != "1" ]]; then
+		log "stopping the alert listener"
+		alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
+		rm -f "$LAB_DIR/alert-listener.pid"
+	fi
 
 	# The bank tunnel is bound to the veth's address; closed before that address goes.
 	if [[ "$(lab_get LAB_BANK_TUNNEL 0)" == "1" ]] || vm_tunnel_running bank; then
@@ -276,7 +443,9 @@ lab_down() {
 		vm_tunnel_stop bank
 	fi
 
-	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" ]]; then
+	# Not in tunnel mode: Slips ran on the VM and was stopped there above. Calling the local
+	# stop would look for containers on this machine that never existed.
+	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" && "$LAB_VIA_TUNNEL" != "1" ]]; then
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
 		if [[ "$(lab_get LAB_IDS_MODE local)" == "remote" ]]; then
@@ -293,14 +462,20 @@ lab_down() {
 	ip netns del "${LAB_NS:-$NS}" 2>/dev/null || true
 	ip link del "${LAB_VETH_HOST:-$VETH_HOST}" 2>/dev/null || true
 
-	log "restoring firewall"
-	cp -a "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
-	cp -a "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
-	ufw logging "${LAB_ORIG_LOGLEVEL:-low}" >/dev/null 2>&1 || true
-	if [[ "${LAB_ORIG_ENABLED:-no}" == "no" ]]; then
-		ufw --force disable >/dev/null 2>&1 || true
-	else
-		ufw --force enable >/dev/null 2>&1 || true
+	# Only if this machine's firewall was the one in the path. In tunnel mode nothing here
+	# was ever changed, and running the restore anyway would be actively harmful: the
+	# recorded value is the sentinel "untouched", which is not "no", so the branch below
+	# would ENABLE a firewall the lab never enabled.
+	if [[ "$LAB_VIA_TUNNEL" != "1" ]]; then
+		log "restoring firewall"
+		cp -a "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
+		cp -a "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
+		ufw logging "${LAB_ORIG_LOGLEVEL:-low}" >/dev/null 2>&1 || true
+		if [[ "${LAB_ORIG_ENABLED:-no}" == "no" ]]; then
+			ufw --force disable >/dev/null 2>&1 || true
+		else
+			ufw --force enable >/dev/null 2>&1 || true
+		fi
 	fi
 
 	if [[ -n "${SUDO_USER:-}" && -d "${LAB_SLIPS_OUT:-}" ]]; then
@@ -308,7 +483,11 @@ lab_down() {
 	fi
 
 	rm -f "$LAB_STATE" "$LAB_DIR/user.rules.bak" "$LAB_DIR/user6.rules.bak"
-	log "firewall restored to ENABLED=${LAB_ORIG_ENABLED:-no} LOGLEVEL=${LAB_ORIG_LOGLEVEL:-low}"
+	if [[ "$LAB_VIA_TUNNEL" == "1" ]]; then
+		log "this machine's firewall was never touched; nothing to restore"
+	else
+		log "firewall restored to ENABLED=${LAB_ORIG_ENABLED:-no} LOGLEVEL=${LAB_ORIG_LOGLEVEL:-low}"
+	fi
 	[[ -n "${LAB_SLIPS_OUT:-}" ]] && echo "  Slips session output kept: $LAB_SLIPS_OUT"
 	return 0
 }
@@ -332,9 +511,24 @@ lab_status() {
 	if netns_exists "$ns"; then
 		echo "lab: UP since $started"
 		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
-		echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
+		if [[ "$(lab_get LAB_VIA_TUNNEL 0)" == "1" ]]; then
+			echo "  mode        via the tunnel device — the VM observes, this machine forwards"
+			echo "  target      users reach $(lab_get LAB_TARGET_IP "?"); this machine's firewall untouched"
+			# shellcheck source=Remote/tun-lib.sh
+			source "$PDE_ROOT/Remote/tun-lib.sh"
+			if tun_session_running; then
+				echo "  tunnel      $(lab_get LAB_TUN_DEV "$TUN_DEV") up to $VM_NAME"
+			else
+				echo "  tunnel      DOWN — windows would capture nothing; restart the lab"
+			fi
+			echo "  firewall    ufw on $VM_NAME, verdict rules on $(lab_get LAB_TUN_DEV "$TUN_DEV")"
+		else
+			echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
+		fi
 		if [[ "$(lab_get LAB_WITH_IDS 0)" -ne 1 ]]; then
 			echo "  ids         not running"
+		elif [[ "$(lab_get LAB_VIA_TUNNEL 0)" == "1" ]]; then
+			echo "  ids         slips on $VM_NAME, live on $(lab_get LAB_TUN_DEV "$TUN_DEV")"
 		elif [[ "$(lab_get LAB_IDS_MODE local)" == "remote" ]]; then
 			local tpid; tpid=$(lab_get LAB_TCPDUMP_PID "")
 			if [[ -n "$tpid" && -d "/proc/$tpid" ]]; then
@@ -383,6 +577,7 @@ while [[ $# -gt 0 ]]; do
 		--with-ids) WITH_IDS=1; shift ;;
 		--ids-remote) IDS_REMOTE=1; shift ;;
 		--with-banking) WITH_BANKING=1; shift ;;
+		--via-tunnel) VIA_TUNNEL=1; shift ;;
 		--users) USERS="$2"; shift 2 ;;
 		*) die "unknown option '$1'" ;;
 	esac

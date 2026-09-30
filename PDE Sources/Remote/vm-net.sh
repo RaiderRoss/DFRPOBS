@@ -11,6 +11,10 @@
 #    vm-net.sh status [tunN]
 #    vm-net.sh relay-up <listen_ip> <port> <host:port>
 #    vm-net.sh relay-down
+#    vm-net.sh listener-up <listen_ip> <ports>     the alert-profile listener
+#    vm-net.sh listener-down
+#    vm-net.sh slips-up <tunN> <user> <subdir>     the IDS, live on the device
+#    vm-net.sh slips-ready [timeout] | slips-outdir | slips-down
 #    vm-net.sh firewall-up <lab_subnet> <allowed_ports> <tunN>
 #    vm-net.sh firewall-keep          cancel the auto-revert watchdog
 #    vm-net.sh firewall-down
@@ -261,6 +265,101 @@ firewall_down() {
 	fi
 }
 
+# ---------------------------------------------------------------------------
+# The services the lab's users actually talk to, now that they arrive here
+#
+# Both are bound to the tunnel address, not 0.0.0.0. That is what makes a user's connection
+# a local delivery that crosses INPUT — where ufw logs it — and it also means neither is
+# reachable from anywhere else on the VM's network.
+# ---------------------------------------------------------------------------
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
+LISTENER_PID=/run/pde-alert-listener.pid
+
+_user_home() { getent passwd "$1" | cut -d: -f6; }
+
+listener_up() {
+	local ip="$1" ports="$2"
+	local script="$REPO/PDE Sources/Firewall/alert_listener.py"
+	[[ -f "$script" ]] || die "missing $script (run ./vm.sh sync)"
+	if [[ -s "$LISTENER_PID" ]] && kill -0 "$(cat "$LISTENER_PID")" 2>/dev/null; then
+		log "alert listener already running (pid $(cat "$LISTENER_PID"))"
+		return 0
+	fi
+	rm -f "$LISTENER_PID"
+	setsid python3 "$script" --host "$ip" --ports "$ports" --pidfile "$LISTENER_PID" \
+		</dev/null >/var/log/pde-alert-listener.log 2>&1 &
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ -s "$LISTENER_PID" ]] && { log "alert listener on $ip ports $ports"; return 0; }
+		sleep 0.1
+	done
+	log "the alert listener did not come up; its output:"
+	sed 's/^/    /' /var/log/pde-alert-listener.log >&2 2>/dev/null || true
+	die "alert listener failed to start"
+}
+
+listener_down() {
+	[[ -s "$LISTENER_PID" ]] && { kill "$(cat "$LISTENER_PID")" 2>/dev/null || true; rm -f "$LISTENER_PID"; }
+	pkill -f "Firewall/alert_listener.py" 2>/dev/null || true
+	log "alert listener stopped"
+}
+
+# Slips, sniffing the tunnel device live.
+#
+# This is the mode the lab had before the IDS moved to the VM, and it is the better one: a
+# real IDS watches an interface continuously and its per-source profile carries across
+# windows, where file-mode analysis starts fresh each time and cannot accumulate.
+#
+# It reuses the standing redis that slips-warm.sh keeps, so it inherits the warm
+# threat-intel cache rather than downloading ~45 feeds again.
+slips_up() {
+	local dev="$1" user="$2" subdir="$3"
+	local img="${SLIPS_IMG:-stratosphereips/slips:latest}"
+	local home outdir
+	home="$(_user_home "$user")" || die "no home for $user"
+	outdir="$home/$subdir"
+	mkdir -p "$outdir"
+
+	bash "$REPO/PDE Sources/Remote/slips-warm.sh" redis >/dev/null || die "the Slips redis is not up"
+
+	docker rm -f pde-slips >/dev/null 2>&1 || true
+	docker run -d --net=host --cap-add=NET_ADMIN --name pde-slips \
+		-v "$outdir":/output "$img" ./slips.py -i "$dev" -o /output >/dev/null \
+		|| die "could not start Slips on $dev"
+	printf '%s\n' "$outdir" > /run/pde-slips-out
+	log "Slips starting on $dev, output $outdir"
+}
+
+# Nothing may be generated until this returns, or the window's traffic is simply missed.
+slips_ready() {
+	local timeout="${1:-240}" waited=0
+	while [[ $waited -lt $timeout ]]; do
+		if docker logs pde-slips 2>&1 | grep -q "Started Input Process"; then
+			log "Slips is reading packets (${waited}s)"
+			return 0
+		fi
+		if ! docker ps --format '{{.Names}}' | grep -qx pde-slips; then
+			log "Slips exited during startup; last lines:"
+			docker logs pde-slips 2>&1 | tail -5 >&2
+			return 1
+		fi
+		sleep 5; waited=$((waited + 5))
+	done
+	log "Slips did not report readiness within ${timeout}s"
+	return 1
+}
+
+# The output directory, so the lab machine knows where to read alerts.log from.
+slips_outdir() { cat /run/pde-slips-out 2>/dev/null || true; }
+
+slips_down() {
+	docker rm -f pde-slips >/dev/null 2>&1 || true
+	rm -f /run/pde-slips-out
+	# The standing redis is left alone: it holds the warm threat-intel cache and belongs to
+	# the VM, not to this lab session.
+	log "Slips stopped (the standing redis is left up)"
+}
+
 status() {
 	local num="${1:-}" dev
 	[[ -n "$num" ]] && dev="tun$num" || dev=""
@@ -287,6 +386,16 @@ case "${1:-}" in
 		[[ $# -eq 4 ]] || die "relay-up <listen_ip> <port> <host:port>"
 		relay_up "$2" "$3" "$4" ;;
 	relay-down)    relay_down ;;
+	listener-up)
+		[[ $# -eq 3 ]] || die "listener-up <listen_ip> <ports>"
+		listener_up "$2" "$3" ;;
+	listener-down) listener_down ;;
+	slips-up)
+		[[ $# -eq 4 ]] || die "slips-up <tun_dev> <user> <subdir>"
+		slips_up "$2" "$3" "$4" ;;
+	slips-ready)   slips_ready "${2:-240}" ;;
+	slips-outdir)  slips_outdir ;;
+	slips-down)    slips_down ;;
 	firewall-up)
 		[[ $# -eq 4 ]] || die "firewall-up <lab_subnet> <allowed_ports> <tunN>"
 		firewall_up "$2" "$3" "$4" ;;
