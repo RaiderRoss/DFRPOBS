@@ -102,7 +102,10 @@ slips_wait_ready() {
 	local tty=0; [ -t 1 ] && tty=1
 
 	while [ "$waited" -lt "$timeout" ]; do
-		if docker logs "$SLIPS_CONTAINER" 2>&1 | grep -q "Started Input Process"; then
+		# Version-dependent: 1.1.x prints "Started Input Process", the current image prints the
+		# Zeek interface line. Matching only the old one waits out the full timeout against a
+		# Slips that is already reading packets.
+		if docker logs "$SLIPS_CONTAINER" 2>&1 \n			| grep -qE "Started Input Process|Zeek is logging all traffic on interface"; then
 			[ "$tty" = 1 ] && _slips_bar "$waited" 1
 			return 0
 		fi

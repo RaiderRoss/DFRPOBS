@@ -334,7 +334,11 @@ slips_up() {
 slips_ready() {
 	local timeout="${1:-240}" waited=0
 	while [[ $waited -lt $timeout ]]; do
-		if docker logs pde-slips 2>&1 | grep -q "Started Input Process"; then
+		# Two markers, because they differ by Slips version and the string is the only
+		# readiness signal there is. 1.1.x prints "Started Input Process"; the current image
+		# prints the Zeek line instead, and waiting for the old one times out against a Slips
+		# that has been reading packets for minutes.
+		if docker logs pde-slips 2>&1 \n			| grep -qE "Started Input Process|Zeek is logging all traffic on interface"; then
 			log "Slips is reading packets (${waited}s)"
 			return 0
 		fi
