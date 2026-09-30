@@ -167,29 +167,62 @@ sysctl and adds routes. gcloud underneath it still runs as the invoking user.
 
 ## State of this work
 
-Measured against the VM on 2026-09-30, `fineract-slips` in `africa-south1-a`:
+Measured against the VM on 2026-09-30, `fineract-slips` in `africa-south1-a`, over a
+30-second window with 10 users and one attacker.
 
 | | |
 |---|---|
 | tun ownership and unprivileged attach | **verified** on WSL 6.18.33.2 (table above) |
 | the relay: passthrough, 300 KB payloads, 30 concurrent connections, `0.0.0.0` refusal | **verified** locally |
-| `ssh -w` through `gcloud compute ssh --tunnel-through-iap` as non-root `pde` | **verified** — sshd reloaded, `tun7` attached both ends |
-| the layer-3 path itself | **verified** — 9/9 ICMP, 0% loss, RTT 48–142 ms (avg ~59 ms) |
-| **source addresses survive the tunnel** | **verified** — the VM's own `tcpdump -i tun7` recorded `10.99.0.99 > 10.98.0.1` and the reply back, so N users arrive as N sources |
-| the relay is genuinely in the path | **verified** — `curl` to `10.98.0.1:8443` gives exit 7 with the relay stopped and `{"status":"UP"}` with it running |
-| Fineract no longer on `0.0.0.0` | **verified** — only `127.0.0.1:{8443,5432,9092}` listening |
-| moving the firewall and IDS *evidence* to the VM (offsets, slicing, fetch, digests, manifests) | still to do |
-| the sshd/IAP login as a fourth PDE source | still to do |
-| ufw on the VM (`firewall-up`) | written, **never yet run** |
+| `ssh -w` through `gcloud compute ssh --tunnel-through-iap` as non-root `pde` | **verified** |
+| the layer-3 path | **verified** — 0% loss, RTT 48–142 ms (avg ~59 ms) |
+| **source addresses survive the tunnel** | **verified** — the VM's `tcpdump -i tun7` recorded `10.99.0.99 > 10.98.0.1` and the reply back |
+| the relay is genuinely in the path | **verified** — `curl` exit 7 with it stopped, `{"status":"UP"}` with it running |
+| Fineract off `0.0.0.0` | **verified** — only `127.0.0.1:{8443,5432,9092}` listening |
+| **ufw on the VM as the firewall source** | **verified** — 10 distinct sources logged on `IN=tun7`; the attacker BLOCKed on 32 distinct ports; the watchdog armed, access confirmed, watchdog cancelled |
+| **Slips live on the tunnel device** | **verified** — 132 alerts, including *"Detected new vertical port scan to IP 10.98.0.1 from 10.99.0.20"* |
+| **the bank over the relay** | **verified** — 19 of 19 operations present in both the audit trail and the event stream; `pde_officer` CREATE CLIENT / CREATE LOAN / APPROVE / DISBURSE with `checker_username` null |
+| **the auth source** | **verified** — the tunnel's session identified by its fd on `/dev/net/tun`, its login collected |
+| this machine's firewall | **never touched** in this mode, and `down` leaves it that way |
 
-The transport is therefore proved end to end, and the two remaining phases are evidence
-collection rather than plumbing.
+A window therefore holds five sources that independently describe one attacker:
 
-The existing capture path is untouched and still works: `lab.sh` still builds the local ufw
-lab and the `-L` bank tunnel, so windows can still be captured the old way while the new
-path is finished.
+```
+firewall (VM ufw)   10 sources on tun7; 10.99.0.20 BLOCKed on 32 ports
+ids      (Slips)    vertical port scan to 10.98.0.1 from 10.99.0.20
+audit    (Fineract) pde_officer: CREATE CLIENT, CREATE LOAN, APPROVE, DISBURSE — no checker
+events   (Kafka)    ClientCreate, LoanCreated, LoanApproved, LoanDisbursal
+auth     (sshd)     the session all of it arrived inside
+```
 
-RTT is worth remembering for the write-up: ~59 ms average, against a veth's microseconds.
-The scenario's steps are seconds apart, so it does not change the fraud chain, but the bank
-generator's per-call latency is now a network round trip and the `--bank-rate` ceiling is
-lower than it was locally.
+## Things this cost, and what they taught
+
+Worth keeping, because each was silent rather than loud:
+
+- **The firewall is read from the journal, not `/var/log/ufw.log`.** The LOG rules fired 628
+  times for a window; `journalctl -k` held those lines and the file held none of them, with
+  the rules' counters still climbing. rsyslog is in the path for the file and does not
+  deliver them on this host. A window would otherwise report 0 firewall lines and look like
+  a quiet network.
+- **The tun device is remade every bring-up.** A persistent device an earlier sshd session
+  attached to cannot be attached again; reusing one fails as "Tunnel forwarding failed",
+  which says nothing about the cause.
+- **`local a="$1" b="tun$a"` does not work.** `local` expands all its arguments before
+  assigning any, so `b` became `tun`. That made teardown delete a device called `tun` and
+  leave the real one behind, which is what kept breaking the next bring-up.
+- **Two Slips runs saturate four vCPUs**, and the lab's only way in is SSH. Setup now waits
+  for the background cache warm-up before starting the live IDS.
+- **`grep -c` prints `0` and exits 1.** `|| echo 0` therefore yields `0\n0`. The firewall
+  capture documents this; the auth collector walked into it anyway.
+- **`logging full` on a busy VM is 121 MB a window** if the fetch is not filtered to the
+  lab's own addresses. Now 413 KB.
+
+## Still to do
+
+- `MALICIOUS_PORTS` no longer contains 8443, so the attacker's sweep is 34 ports rather than
+  35. `lab_check_port_lists` now refuses any lab whose port lists contradict each other.
+- The auth source records IAP's forwarder address, not the analyst's. Cloud Audit Logs hold
+  the Google identity and the real client address; collecting them would complete the chain.
+- Slips' `--ids-remote` (file mode per window) and `--via-tunnel` (live) are now two distinct
+  designs. The older one still works and is still the only option if the lab cannot reach
+  the VM continuously.
