@@ -256,6 +256,18 @@ lab_up() {
 		# each window and can never accumulate. It reuses the VM's standing redis, so it
 		# inherits the warm threat-intel cache instead of refetching ~45 feeds.
 		local vm_slips_sub="pde-slips/live-$lab_stamp"
+		# Wait for the background threat-intel warm-up to finish first. It is itself a Slips
+		# run, and two of them saturate this VM's four vCPUs: measured load 4.0+, which broke
+		# the SSH/IAP handshake and took out the lab's only way in mid-setup. Warming is
+		# normally over well before this, so this usually returns at once.
+		local warm_waited=0 warm_state=""
+		while [[ $warm_waited -lt 600 ]]; do
+			warm_state=$(vm_ssh "bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/slips-warm.sh\" status" 				</dev/null 2>/dev/null | tr -d '' | head -1)
+			[[ "$warm_state" != "warming" ]] && break
+			[[ $warm_waited -eq 0 ]] && log "the VM is still warming Slips' feed cache; waiting (two Slips runs overload it)"
+			sleep 15; warm_waited=$((warm_waited + 15))
+		done
+		[[ "$warm_state" == "warming" ]] && die "the VM is still warming Slips' cache after ${warm_waited}s; try again shortly"
 		log "starting Slips on $VM_NAME, reading $TUN_DEV (loading modules and feeds)"
 		echo "LAB_VM_SLIPS_SUB=\"$vm_slips_sub\"" >> "$LAB_STATE"
 		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-up \
