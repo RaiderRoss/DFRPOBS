@@ -219,6 +219,10 @@ lab_up() {
 		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" listener-up \
 			'$TUN_VM_IP' '$ALERT_PORTS'" </dev/null || die "could not start the alert listener on the VM"
 
+		log "starting the bank's public web front on $VM_NAME at $TUN_VM_IP (http $WEB_HTTP_PORTS, https $WEB_HTTPS_PORTS)"
+		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" web-up \
+			'$TUN_VM_IP' '$WEB_HTTP_PORTS' '$WEB_HTTPS_PORTS'" </dev/null || die "could not start the web front on the VM"
+
 		if [[ $WITH_BANKING -eq 1 ]]; then
 			log "starting the bank relay on $VM_NAME at $TUN_VM_IP:$BANK_PORT"
 			vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" relay-up \
@@ -426,6 +430,7 @@ lab_down() {
 			[[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && \
 				vm_ssh "sudo bash $vmnet slips-down" </dev/null >/dev/null 2>&1 || true
 			vm_ssh "sudo bash $vmnet listener-down" </dev/null >/dev/null 2>&1 || true
+			vm_ssh "sudo bash $vmnet web-down"      </dev/null >/dev/null 2>&1 || true
 			vm_ssh "sudo bash $vmnet relay-down"    </dev/null >/dev/null 2>&1 || true
 			if [[ "$(lab_get LAB_VM_FIREWALL 0)" == "1" ]]; then
 				log "restoring the VM's firewall"

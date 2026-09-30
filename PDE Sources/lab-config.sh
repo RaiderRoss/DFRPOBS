@@ -47,6 +47,12 @@ VETH_NS="veth-pde-n"
 
 # Ports the firewall permits — ordinary application traffic.
 BENIGN_PORTS="80,443,8080"
+# In tunnel mode the bank server answers them: a public web front (Firewall/benign_web.py)
+# serving plain HTTP and HTTPS, so a benign user loads a page rather than making a bare
+# connect to a closed port — which a flow-based IDS cannot tell from a scan. Together these
+# must equal BENIGN_PORTS.
+WEB_HTTP_PORTS="80,8080"
+WEB_HTTPS_PORTS="443"
 
 # Ports the firewall denies — the sweep an attacker runs looking for a way in.
 #
@@ -228,6 +234,15 @@ lab_check_port_lists() {
 	_overlap BANK_PORT "$BANK_PORT" BENIGN_PORTS    "$BENIGN_PORTS"
 	_overlap BANK_PORT "$BANK_PORT" MALICIOUS_PORTS "$MALICIOUS_PORTS"
 	_overlap BANK_PORT "$BANK_PORT" ALERT_PORTS     "$ALERT_PORTS"
+
+	# The web front must answer exactly the benign ports: a benign port it does not serve puts
+	# bare connects to a closed port back into the benign traffic, which is what made innocent
+	# users look like scanners to the IDS.
+	local web; web=$(printf '%s,%s' "$WEB_HTTP_PORTS" "$WEB_HTTPS_PORTS")
+	if [[ "$(_ports_of "$web" | tr '\n' ,)" != "$(_ports_of "$BENIGN_PORTS" | tr '\n' ,)" ]]; then
+		echo "WEB_HTTP_PORTS + WEB_HTTPS_PORTS ($web) must equal BENIGN_PORTS ($BENIGN_PORTS)" >&2
+		bad=1
+	fi
 
 	# iptables' multiport match takes at most 15 ports, and silently refuses the rule above
 	# that — which would leave a window with no verdict lines at all.

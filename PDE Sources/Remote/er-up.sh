@@ -28,7 +28,10 @@ else
 	# Spring does not read .env itself; the variables have to be in its environment.
 	set -a; . "$ER/.env"; set +a
 	JAR=$(ls target/*.jar | grep -v plain | head -1)
-	nohup java -jar "$JAR" </dev/null > ~/er-backend.log 2>&1 &
+	# Loopback only. Spring's default is every interface, which on this VM includes the lab's
+	# tunnel: the simulated customers could reach the Evidence Repository's API. Everything
+	# that should reach it — the admin tunnel, the frontend — connects to localhost.
+	nohup java -jar "$JAR" --server.address=127.0.0.1 </dev/null > ~/er-backend.log 2>&1 &
 	echo "backend pid $!"
 fi
 

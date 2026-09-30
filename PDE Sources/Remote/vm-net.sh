@@ -331,6 +331,45 @@ listener_up() {
 	die "alert listener failed to start"
 }
 
+WEB_PID=/run/pde-web.pid
+WEB_TLS_DIR=/etc/pde-web
+
+# The bank's public web front, for the benign users' ordinary web traffic. Self-signed TLS,
+# generated once: nothing verifies it, as nothing in the sandbox has a CA to verify against.
+web_up() {
+	local ip="$1" http_ports="$2" https_ports="$3"
+	local script="$REPO/PDE Sources/Firewall/benign_web.py"
+	[[ -f "$script" ]] || die "missing $script (run ./vm.sh sync)"
+	if [[ -s "$WEB_PID" ]] && kill -0 "$(cat "$WEB_PID")" 2>/dev/null; then
+		log "web front already running (pid $(cat "$WEB_PID"))"
+		return 0
+	fi
+	if [[ -n "$https_ports" && ! -s "$WEB_TLS_DIR/cert.pem" ]]; then
+		mkdir -p "$WEB_TLS_DIR" && chmod 700 "$WEB_TLS_DIR"
+		openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=pde-bank.lab" \
+			-keyout "$WEB_TLS_DIR/key.pem" -out "$WEB_TLS_DIR/cert.pem" >/dev/null 2>&1 \
+			|| die "could not create the web front's certificate"
+	fi
+	rm -f "$WEB_PID"
+	setsid python3 "$script" --host "$ip" --http-ports "$http_ports" --https-ports "$https_ports" \
+		--cert "$WEB_TLS_DIR/cert.pem" --key "$WEB_TLS_DIR/key.pem" --pidfile "$WEB_PID" \
+		</dev/null >/var/log/pde-web.log 2>&1 &
+	local i
+	for ((i = 0; i < 50; i++)); do
+		[[ -s "$WEB_PID" ]] && { log "web front on $ip: http $http_ports, https $https_ports"; return 0; }
+		sleep 0.1
+	done
+	log "the web front did not come up; its output:"
+	sed 's/^/    /' /var/log/pde-web.log >&2 2>/dev/null || true
+	die "web front failed to start"
+}
+
+web_down() {
+	[[ -s "$WEB_PID" ]] && { kill "$(cat "$WEB_PID")" 2>/dev/null || true; rm -f "$WEB_PID"; }
+	pkill -f "Firewall/benign_web.py" 2>/dev/null || true
+	log "web front stopped"
+}
+
 listener_down() {
 	[[ -s "$LISTENER_PID" ]] && { kill "$(cat "$LISTENER_PID")" 2>/dev/null || true; rm -f "$LISTENER_PID"; }
 	pkill -f "Firewall/alert_listener.py" 2>/dev/null || true
@@ -446,6 +485,10 @@ case "${1:-}" in
 		[[ $# -eq 3 ]] || die "listener-up <listen_ip> <ports>"
 		listener_up "$2" "$3" ;;
 	listener-down) listener_down ;;
+	web-up)
+		[[ $# -eq 4 ]] || die "web-up <listen_ip> <http_ports> <https_ports>"
+		web_up "$2" "$3" "$4" ;;
+	web-down)      web_down ;;
 	slips-up)
 		[[ $# -eq 4 || $# -eq 5 ]] || die "slips-up <tun_dev> <user> <subdir> [known_service_port]"
 		slips_up "$2" "$3" "$4" "${5:-}" ;;

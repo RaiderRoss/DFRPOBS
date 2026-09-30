@@ -17,6 +17,7 @@ import json
 import math
 import random
 import socket
+import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -224,10 +225,42 @@ def build_plan(users, malicious_ips, duration, rate, malicious_pct,
     return events
 
 
-def attempt(src_ip, dst_ip, dport, timeout):
+# Ports on which a benign request is sent over TLS; the rest are plain HTTP.
+TLS_PORTS = {443}
+_CLIENT_TLS = ssl.create_default_context()
+_CLIENT_TLS.check_hostname = False
+_CLIENT_TLS.verify_mode = ssl.CERT_NONE      # the lab's web front is self-signed
+
+
+def web_request(sock, dst_ip, dport):
+    """Loads a page over an open connection and returns the HTTP status, or None.
+
+    Benign users used to connect and close at once, sending nothing — zero-byte flows that a
+    flow-based IDS reads as a scan. A customer loads a page, so these do: a GET, the reply
+    read to the end. Only benign attempts do this; the attacker's sweep stays a bare connect,
+    because that is what a sweep is."""
+    try:
+        if dport in TLS_PORTS:
+            sock = _CLIENT_TLS.wrap_socket(sock, server_hostname=None)
+        sock.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (PDE lab customer)\r\n"
+                      "Accept: text/html\r\nConnection: close\r\n\r\n" % dst_ip).encode())
+        data = b""
+        while len(data) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        first = data.split(b"\r\n", 1)[0].split()
+        return int(first[1]) if len(first) > 1 and first[1].isdigit() else None
+    except (OSError, ValueError):
+        return None
+
+
+def attempt(src_ip, dst_ip, dport, timeout, request=False):
     """
     One TCP connection attempt. The outcome is incidental — a blocked SYN times out and
     that is fine. What matters is that the packet crossed the firewall and was logged.
+    With request=True a connection that opens is used to load a page (web_request).
 
     Returns the moment the SYN actually went out as well, on both clocks: wall time for
     the record, monotonic for measuring drift against the plan.
@@ -239,9 +272,12 @@ def attempt(src_ip, dst_ip, dport, timeout):
         s.settimeout(timeout)
         s.bind((src_ip, 0))
         sport = s.getsockname()[1]
+        http_status = None
         try:
             s.connect((dst_ip, dport))
             outcome = "connected"
+            if request:
+                http_status = web_request(s, dst_ip, dport)
         except socket.timeout:
             outcome = "timeout"
         except ConnectionRefusedError:
@@ -249,7 +285,7 @@ def attempt(src_ip, dst_ip, dport, timeout):
             outcome = "refused"
         except OSError as exc:
             outcome = "error:%s" % (exc.errno,)
-        return sport, outcome, sent_at, sent_mono
+        return sport, outcome, sent_at, sent_mono, http_status
     finally:
         s.close()
 
@@ -379,7 +415,8 @@ def main():
             else:
                 late += 1
             pending.append((e, pool.submit(attempt, e["src"], args.target,
-                                           e["dport"], args.connect_timeout)))
+                                           e["dport"], args.connect_timeout,
+                                           e["label"] == "benign")))
 
     finished = utc_now()
 
@@ -387,7 +424,7 @@ def main():
     drift_total = 0.0
     drift_max = 0.0
     for e, future in pending:
-        sport, outcome, sent_at, sent_mono = future.result()
+        sport, outcome, sent_at, sent_mono, http_status = future.result()
         # How far the SYN actually went out from where the plan wanted it. Measured
         # rather than assumed: a saturated pool queues silently, and a queued attempt
         # is late in a way the scheduling loop above cannot see.
@@ -405,6 +442,7 @@ def main():
             "dport": e["dport"],
             "label": e["label"],
             "outcome": outcome,
+            "http_status": http_status,
         })
     executed.sort(key=lambda x: x["seq"])
 
