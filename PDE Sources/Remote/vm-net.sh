@@ -346,20 +346,37 @@ listener_down() {
 # It reuses the standing redis that slips-warm.sh keeps, so it inherits the warm
 # threat-intel cache rather than downloading ~45 feeds again.
 slips_up() {
-	local dev="$1" user="$2" subdir="$3"
+	local dev="$1" user="$2" subdir="$3" service_port="${4:-}"
 	local img="${SLIPS_IMG:-stratosphereips/slips:latest}"
-	local home outdir
+	local home outdir services mounts=()
 	home="$(_user_home "$user")" || die "no home for $user"
 	outdir="$home/$subdir"
 	mkdir -p "$outdir"
 
+	# The bank's API port, registered as a known service. Slips raises "connection to unknown
+	# destination port" at threat level HIGH for any port missing from its services.csv, and
+	# 8443 is missing — so every customer's banking session was flagged high. A bank's IDS
+	# knows the bank's own services. The alert-profile ports stay unregistered on purpose:
+	# they were chosen because Slips has no record of them.
+	#
+	# Beside the output directory, not in it: Slips clears its output directory on start.
+	if [[ -n "$service_port" ]]; then
+		services="$outdir.services.csv"
+		docker run --rm "$img" cat slips_files/ports_info/services.csv > "$services" 2>/dev/null \
+			&& [[ -s "$services" ]] || die "could not read Slips' services.csv from $img"
+		grep -qE "^[^#][^,]*,[[:space:]]*$service_port,[[:space:]]*tcp" "$services" \
+			|| printf 'pde-bank-api,%s,tcp,PDE lab bank API (Apache Fineract over HTTPS)\n' \
+				"$service_port" >> "$services"
+		mounts+=(-v "$services:/StratosphereLinuxIPS/slips_files/ports_info/services.csv:ro")
+	fi
+
 	bash "$REPO/PDE Sources/Remote/slips-warm.sh" redis >/dev/null || die "the Slips redis is not up"
 
-	# Slips' own configuration, unchanged. Its local network is the watched interface's own
-	# network, which is why the tunnel's VM end carries a prefix (TUN_VM_PREFIX).
+	# Slips' own configuration otherwise unchanged. Its local network is the watched
+	# interface's own network, which is why the tunnel's VM end carries a prefix (TUN_VM_PREFIX).
 	docker rm -f pde-slips >/dev/null 2>&1 || true
 	docker run -d --net=host --cap-add=NET_ADMIN --name pde-slips \
-		-v "$outdir":/output "$img" ./slips.py -i "$dev" -o /output >/dev/null \
+		-v "$outdir":/output ${mounts[@]+"${mounts[@]}"} "$img" ./slips.py -i "$dev" -o /output >/dev/null \
 		|| die "could not start Slips on $dev"
 	printf '%s\n' "$outdir" > /run/pde-slips-out
 	log "Slips starting on $dev, output $outdir"
@@ -430,8 +447,8 @@ case "${1:-}" in
 		listener_up "$2" "$3" ;;
 	listener-down) listener_down ;;
 	slips-up)
-		[[ $# -eq 4 ]] || die "slips-up <tun_dev> <user> <subdir>"
-		slips_up "$2" "$3" "$4" ;;
+		[[ $# -eq 4 || $# -eq 5 ]] || die "slips-up <tun_dev> <user> <subdir> [known_service_port]"
+		slips_up "$2" "$3" "$4" "${5:-}" ;;
 	slips-ready)   slips_ready "${2:-240}" ;;
 	slips-outdir)  slips_outdir ;;
 	slips-down)    slips_down ;;

@@ -268,7 +268,7 @@ lab_up() {
 		log "starting Slips on $VM_NAME, reading $TUN_DEV (loading modules and feeds)"
 		echo "LAB_VM_SLIPS_SUB=\"$vm_slips_sub\"" >> "$LAB_STATE"
 		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-up \
-			'$TUN_DEV' '$VM_USER' '$vm_slips_sub'" </dev/null || die "could not start Slips on the VM"
+			'$TUN_DEV' '$VM_USER' '$vm_slips_sub' '$BANK_PORT'" </dev/null || die "could not start Slips on the VM"
 		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" slips-ready \
 			'$IDS_READY_TIMEOUT'" </dev/null || die "Slips on the VM never became ready"
 		local vm_slips_out
