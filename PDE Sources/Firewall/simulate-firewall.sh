@@ -759,6 +759,10 @@ if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	FW_TS_ZONE="UTC"
 	FW_TS_OFFSET="+0000"
 	FW_TS_SAME_AS_IDS="yes — both are RFC 3339 UTC and can be compared directly"
+	FW_CAV_TIME="journal timestamps are RFC 3339 in UTC with microseconds and carry the year. The window bounds, window.start_utc/end_utc, are in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
+	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* on the VM before they leave it: the lab's users' packets only. The VM's own replies (SRC=${TUN_VM_IP}) and unrelated host traffic are excluded"
+	FW_CAV_LEVEL="ufw's own logging level on the VM was 'low'. At 'full' it logs every packet the host handles, Docker's internal traffic included, faster than journald drains the kernel's log buffer, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below"
+	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line, and one per packet: a connection's later packets are logged as well as its first"
 else
 	FW_UFW_VERSION="$(ufw --version 2>/dev/null | head -1)"
 	FW_KERNEL="$(uname -r)"
@@ -768,6 +772,10 @@ else
 	FW_TS_ZONE="$TZ_NAME"
 	FW_TS_OFFSET="$TZ_OFFSET"
 	FW_TS_SAME_AS_IDS="no — this log is local time and the IDS evidence is UTC; convert using log_line_utc_offset"
+	FW_CAV_TIME="syslog timestamps carry no year and no sub-second precision; the authoritative window bounds are window.start_utc/end_utc, in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
+	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the same window is excluded. Both directions are kept, so the host's RST replies to refused connections appear alongside the inbound attempts"
+	FW_CAV_LEVEL="ufw logging was set to 'full' for the run; at the default 'low' its LOG rules are rate-limited to 3/min and most of the window would be lost"
+	FW_CAV_AUDIT="at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any verdict line, so lines exceeds the event count: a blocked attempt produces both an AUDIT and a BLOCK entry"
 fi
 
 python3 - "$MANIFEST" <<PY
@@ -837,17 +845,10 @@ manifest = {
         "before comparing this log with the IDS evidence is stated in "
         "timestamps.comparable_with_ids_evidence. Nothing has been rewritten — a source's own "
         "output is left as the source produced it",
-        "syslog timestamps carry no year and no sub-second precision; the authoritative "
-        "window bounds are window.start_utc/end_utc, in whole seconds with the start rounded "
-        "down and the end rounded up, so that nothing inside the window falls outside them",
-        "lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the "
-        "same window is excluded. Both directions are kept, so the host's RST replies to "
-        "refused connections appear alongside the inbound attempts",
-        "ufw logging was set to 'full' for the run; at the default 'low' its LOG rules are "
-        "rate-limited to 3/min and most of the window would be lost",
-        "at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any "
-        "verdict line, so lines exceeds the event count: a blocked attempt produces both "
-        "an AUDIT and a BLOCK entry",
+        "${FW_CAV_TIME}",
+        "${FW_CAV_FILTER}",
+        "${FW_CAV_LEVEL}",
+        "${FW_CAV_AUDIT}",
         "verdict logging ([UFW ALLOW] / [UFW BLOCK]) was installed as unrate-limited LOG "
         "rules in ufw's own ufw-user-input chain rather than via ufw's 'log' keyword, "
         "which hardcodes --limit 3/min --limit-burst 10 regardless of logging level and "

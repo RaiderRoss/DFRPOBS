@@ -183,7 +183,9 @@ relay_down() {
 # This is the one action on this VM that can end in losing access to it, so it is built to
 # fail safe:
 #
-#   * SSH is permitted FIRST, before the policy is set to deny.
+#   * SSH is permitted before ufw is enabled. Its rule comes AFTER the lab subnet's deny,
+#     which cannot touch it: the IAP connections this VM is managed through come from
+#     35.235.240.0/20, never from the lab subnet.
 #   * DEFAULT_FORWARD_POLICY is set to ACCEPT. ufw's default is DROP, and Docker's traffic
 #     between containers and out to the internet crosses FORWARD: leaving it at DROP takes
 #     Fineract's own database connection out. The evidence is INPUT, so this costs nothing.
@@ -215,23 +217,37 @@ firewall_up() {
 		</dev/null >/var/log/pde-fw-watchdog.log 2>&1 &
 	log "watchdog armed: ufw disables itself in ${FW_WATCHDOG_SECONDS}s unless confirmed"
 
-	# 22 first, and from anywhere: the GCP firewall already admits it only from IAP's
-	# range, so this does not widen anything, and scoping it to that range here would lock
-	# the VM out if Google ever changed it.
-	ufw allow 22/tcp >/dev/null
+	# From nothing. ufw keeps its rules across sessions and matches them in the order they
+	# were FIRST added, so an earlier session's rules would survive a re-run in their old
+	# order whatever this function now says. Resetting makes the order below the order that
+	# applies. A reset leaves ufw disabled, which cannot lock anyone out.
+	ufw --force reset >/dev/null
 
 	sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 
+	# The lab subnet's rules first: its permitted ports, then a deny for everything else.
+	# ORDER CARRIES THE LABELLING. The verdict LOG rules label a packet by its port alone,
+	# so any rule that lets a subnet packet through on a port outside the list makes the
+	# evidence say BLOCK for a connection that succeeded. Measured before this order was
+	# fixed: two attacker probes to 22 reached the VM's sshd, one of them logged BLOCK.
 	local p
 	IFS=',' read -ra _allowed <<< "$allowed_ports"
 	for p in "${_allowed[@]}"; do
 		ufw allow from "$subnet" to any port "$p" proto tcp >/dev/null
 	done
-	# Everything else from the lab subnet is the attacker's sweep. Scoped rules first, so
-	# the host-wide allow above can only ever match traffic from somewhere else.
 	ufw deny from "$subnet" >/dev/null
 
-	ufw logging full >/dev/null
+	# SSH for everyone else. The GCP firewall already admits 22 only from IAP, so this widens
+	# nothing, and scoping it to that range here would lock the VM out if Google changed it.
+	ufw allow 22/tcp >/dev/null
+
+	# 'low', not 'full'. At 'full' ufw logs every packet this host handles — Docker's traffic
+	# between Fineract, Kafka and PostgreSQL included — faster than journald can drain the
+	# kernel's log buffer. Measured: journald reported "Missed ~7000 kernel messages" every
+	# ~8s and "/dev/kmsg buffer overrun, some messages lost", and ~6% of the lab's own
+	# attempts never reached the evidence. The lab's traffic does not need 'full': the verdict
+	# LOG rules below log every packet from the subnet on the tunnel device at any level.
+	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
 
 	# Unrate-limited verdict logging, straight into ufw's own chain, scoped to what arrives
@@ -245,7 +261,7 @@ firewall_up() {
 		|| iptables -I ufw-user-input 2 -i "$dev" -s "$subnet" -p tcp -m multiport ! --dports "$allowed_ports" \
 			-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
 
-	log "ufw enabled, logging full, verdict rules on $dev for $subnet"
+	log "ufw enabled, logging low, verdict rules logging every $subnet packet on $dev"
 	log "CONFIRM ACCESS, then: vm-net.sh firewall-keep"
 }
 
@@ -322,21 +338,36 @@ listener_down() {
 # It reuses the standing redis that slips-warm.sh keeps, so it inherits the warm
 # threat-intel cache rather than downloading ~45 feeds again.
 slips_up() {
-	local dev="$1" user="$2" subdir="$3"
+	local dev="$1" user="$2" subdir="$3" clients="${4:-}"
 	local img="${SLIPS_IMG:-stratosphereips/slips:latest}"
-	local home outdir
+	local home outdir conf
 	home="$(_user_home "$user")" || die "no home for $user"
 	outdir="$home/$subdir"
 	mkdir -p "$outdir"
+
+	# Slips' own configuration, taken from the image, with the lab's users declared as the
+	# local network. Left empty, Slips infers the local network from the interface it
+	# watches — here the tunnel device, whose own network is the tunnel's /30 — and every
+	# lab user, benign or not, becomes "a private IP outside the used local network". That
+	# one finding put all nine benign users over the alert threshold in every tunnel window.
+	# Written into the output directory so the exact configuration travels with the evidence.
+	conf="$outdir/lab-slips.yaml"
+	docker run --rm "$img" cat config/slips.yaml > "$conf" 2>/dev/null && [[ -s "$conf" ]] \
+		|| die "could not read Slips' default configuration from $img"
+	if [[ -n "$clients" ]]; then
+		sed -i -E "s|^([[:space:]]*client_ips[[:space:]]*:).*|\1 [$clients]|" "$conf"
+		grep -qE "^[[:space:]]*client_ips[[:space:]]*:[[:space:]]*\[$clients\]" "$conf" \
+			|| die "could not set client_ips in Slips' configuration"
+	fi
 
 	bash "$REPO/PDE Sources/Remote/slips-warm.sh" redis >/dev/null || die "the Slips redis is not up"
 
 	docker rm -f pde-slips >/dev/null 2>&1 || true
 	docker run -d --net=host --cap-add=NET_ADMIN --name pde-slips \
-		-v "$outdir":/output "$img" ./slips.py -i "$dev" -o /output >/dev/null \
+		-v "$outdir":/output "$img" ./slips.py -c /output/lab-slips.yaml -i "$dev" -o /output >/dev/null \
 		|| die "could not start Slips on $dev"
 	printf '%s\n' "$outdir" > /run/pde-slips-out
-	log "Slips starting on $dev, output $outdir"
+	log "Slips starting on $dev, output $outdir, local network ${clients:-inferred}"
 }
 
 # Nothing may be generated until this returns, or the window's traffic is simply missed.
@@ -404,8 +435,8 @@ case "${1:-}" in
 		listener_up "$2" "$3" ;;
 	listener-down) listener_down ;;
 	slips-up)
-		[[ $# -eq 4 ]] || die "slips-up <tun_dev> <user> <subdir>"
-		slips_up "$2" "$3" "$4" ;;
+		[[ $# -eq 4 || $# -eq 5 ]] || die "slips-up <tun_dev> <user> <subdir> [client_cidr]"
+		slips_up "$2" "$3" "$4" "${5:-}" ;;
 	slips-ready)   slips_ready "${2:-240}" ;;
 	slips-outdir)  slips_outdir ;;
 	slips-down)    slips_down ;;
