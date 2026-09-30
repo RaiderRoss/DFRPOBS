@@ -111,10 +111,16 @@ print(m["bytes"], m["sha256"])
 #
 # Read as root: Slips writes its output from inside the container as root, so the lab's
 # account cannot read the tree, and an unreadable tree would arrive as an empty one.
+#
+# Read while Slips keeps running, so a file can grow while tar copies it (its flow database
+# does, every second). tar says so with exit 1; that is the expected state of a live source,
+# not a failed copy — the offsets and the timestamp slice decide what belongs to the window.
+# Exit 2 and above is a real failure and still fails the fetch.
 remote_slips_fetch() {
 	local vm_out="$1" dest="$2"
 	mkdir -p "$dest"
-	vm_ssh "sudo tar -C \"$vm_out\" -cf - ." </dev/null | tar -C "$dest" -xf - \
+	vm_ssh "sudo tar --warning=no-file-changed -C \"$vm_out\" -cf - . || [ \$? -eq 1 ]" </dev/null \
+		| tar -C "$dest" -xf - \
 		|| { echo "could not fetch Slips' output tree from the VM" >&2; return 1; }
 	# Slips creates alerts.log only once it has a finding, and the slicer must have a file to
 	# read: an absent one would abort the capture where an empty one correctly says "nothing".

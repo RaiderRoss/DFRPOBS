@@ -342,8 +342,15 @@ def main():
     ap.add_argument("--alert-ports",
                     help="comma-separated, firewall-permitted and answered by a listener; "
                          "the guaranteed-alert profile's targets")
-    ap.add_argument("--connect-timeout", type=float, default=0.25)
-    ap.add_argument("--max-inflight", type=int, default=64,
+    ap.add_argument("--connect-timeout", type=float, default=0.25,
+                    help="for attempts to denied ports, where nothing will ever answer")
+    ap.add_argument("--answer-timeout", type=float, default=5.0,
+                    help="for attempts to ports something answers (the web front, the alert "
+                         "listener): the time to connect and load the page, as a client "
+                         "would wait for it. Over the tunnel a round trip plus a TLS "
+                         "handshake does not fit in --connect-timeout, and a customer "
+                         "whose page load is cut off leaves a half-finished flow behind")
+    ap.add_argument("--max-inflight", type=int, default=128,
                     help="concurrent connection attempts; must exceed rate * "
                          "connect-timeout or blocked attempts will queue and drift")
     ap.add_argument("--seed", type=int, help="makes a run reproducible")
@@ -414,8 +421,10 @@ def main():
                 time.sleep(delay)
             else:
                 late += 1
-            pending.append((e, pool.submit(attempt, e["src"], args.target,
-                                           e["dport"], args.connect_timeout,
+            answered = e["label"] == "benign" or e["dport"] in alert_ports
+            pending.append((e, pool.submit(attempt, e["src"], args.target, e["dport"],
+                                           args.answer_timeout if answered
+                                           else args.connect_timeout,
                                            e["label"] == "benign")))
 
     finished = utc_now()
@@ -458,6 +467,8 @@ def main():
         "benign_events": sum(1 for e in executed if e["label"] == "benign"),
         # Attempts the scheduling loop reached after their slot had already passed.
         "events_behind_schedule": late,
+        "connect_timeout_s": args.connect_timeout,
+        "answer_timeout_s": args.answer_timeout,
         # What the packets actually did, which is the number that matters: if mean
         # drift approaches the inter-arrival gap, the realised traffic no longer has
         # the temporal shape the profile specified and the run should be rated down.

@@ -27,6 +27,13 @@ PAGE = (b"<!doctype html><html><head><title>PDE Bank</title></head><body>"
         b"<a href=\"/contact\">Contact</a></p></body></html>\n")
 
 
+class Server(ThreadingHTTPServer):
+    # socketserver's default listen backlog is 5, which a burst of customers overflows;
+    # the dropped SYNs would show up as page loads that never started.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PDE-Bank-Web/1.0"
     protocol_version = "HTTP/1.1"
@@ -76,14 +83,13 @@ def main():
     servers = []
     for port in plain + tls:
         try:
-            srv = ThreadingHTTPServer((args.host, port), Handler)
+            srv = Server((args.host, port), Handler)
         except OSError as exc:
             raise SystemExit("cannot bind %s:%d: %s" % (args.host, port, exc))
         if port in tls:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(args.cert, args.key)
             srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-        srv.daemon_threads = True
         servers.append(srv)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
