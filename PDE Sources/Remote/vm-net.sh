@@ -338,7 +338,7 @@ slips_ready() {
 		# readiness signal there is. 1.1.x prints "Started Input Process"; the current image
 		# prints the Zeek line instead, and waiting for the old one times out against a Slips
 		# that has been reading packets for minutes.
-		if docker logs pde-slips 2>&1 \n			| grep -qE "Started Input Process|Zeek is logging all traffic on interface"; then
+		if docker logs pde-slips 2>&1 | grep -qE "Started Input Process|Zeek is logging all traffic on interface"; then
 			log "Slips is reading packets (${waited}s)"
 			return 0
 		fi
