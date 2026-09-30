@@ -104,14 +104,18 @@ tun_up() {
 
 	id "$user" >/dev/null 2>&1 || die "no such user: $user"
 
-	if ! ip link show "$dev" >/dev/null 2>&1; then
-		ip tuntap add dev "$dev" mode tun user "$user" || die "could not create $dev"
-		log "created $dev, owned by $user"
-	fi
+	# Remade every time, never reused. Measured: ssh -w attaches to a device this function
+	# has just created, and fails with "Tunnel forwarding failed" against one an earlier sshd
+	# session already attached to. Whatever state that leaves behind is not resettable from
+	# here, so the device is torn down and made again rather than adopted.
+	#
+	# Safe at this point in the lifecycle: the IDS that sniffs this device is started after
+	# the tunnel and stopped before it, so nothing is reading it when this runs.
+	ip link del "$dev" 2>/dev/null || true
+	ip tuntap add dev "$dev" mode tun user "$user" || die "could not create $dev"
+	log "created $dev, owned by $user"
 
-	if ! ip addr show dev "$dev" | grep -qF "$vm_ip"; then
-		ip addr add "$vm_ip" peer "$peer_ip" dev "$dev" || die "could not address $dev"
-	fi
+	ip addr add "$vm_ip" peer "$peer_ip" dev "$dev" || die "could not address $dev"
 	ip link set "$dev" up || die "could not bring $dev up"
 
 	# The return path. Replies to the simulated users are generated here, so without this

@@ -40,9 +40,11 @@ _tun_statefile() { printf '%s/tundev.state' "$(_vm_tunnel_dir)"; }
 #
 # Created PERSISTENT and owned by the ssh user, deliberately. `ssh -w` does not create
 # interfaces; it opens /dev/net/tun and attaches to tun<N>, which for a non-root process
-# only works if the device already exists and belongs to it. Persistent also means the
-# device survives the ssh session, so a dropped tunnel can be reconnected without
-# rebuilding the addressing and the routes underneath it.
+# only works if the device already exists and belongs to it.
+#
+# It does NOT survive usefully, though: a device an earlier sshd session attached to cannot
+# be attached again, so it is deleted and remade on every bring-up rather than reused. The
+# addressing and routes are cheap to rebuild; adopting the old device is what failed.
 # ---------------------------------------------------------------------------
 tun_local_create() {
 	[[ $EUID -eq 0 ]] || { echo "tun_local_create needs root (creates an interface)" >&2; return 1; }
@@ -54,16 +56,14 @@ tun_local_create() {
 		return 1
 	}
 
-	if ! ip link show "$TUN_DEV" >/dev/null 2>&1; then
-		ip tuntap add dev "$TUN_DEV" mode tun user "$owner" || {
-			echo "could not create $TUN_DEV" >&2; return 1; }
-	fi
+	# Remade every time, for the same reason as on the VM: a device a previous ssh session
+	# attached to cannot be attached again, and adopting one is what produced "Tunnel
+	# forwarding failed" on every run that reused it.
+	ip link del "$TUN_DEV" 2>/dev/null || true
+	ip tuntap add dev "$TUN_DEV" mode tun user "$owner" || {
+		echo "could not create $TUN_DEV" >&2; return 1; }
 
-	# Idempotent: re-running must not fail on an address that is already there, because
-	# `tundev up` is also how a dropped session is brought back.
-	if ! ip addr show dev "$TUN_DEV" | grep -qF "$TUN_LOCAL_IP"; then
-		ip addr add "$TUN_LOCAL_IP" peer "$TUN_VM_IP" dev "$TUN_DEV" || return 1
-	fi
+	ip addr add "$TUN_LOCAL_IP" peer "$TUN_VM_IP" dev "$TUN_DEV" || return 1
 	ip link set "$TUN_DEV" up || return 1
 }
 
