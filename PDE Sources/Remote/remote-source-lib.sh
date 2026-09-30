@@ -23,22 +23,27 @@ REMOTE_READER='PDE Sources/Remote/read-window.sh'
 VM_UFW_LOG="${VM_UFW_LOG:-/var/log/ufw.log}"
 
 remote_source_preflight() {
-	vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/$REMOTE_READER\"" </dev/null 2>/dev/null || {
-		echo "the VM's checkout predates Remote/read-window.sh — ./vm.sh sync" >&2
+	local out
+	# One session for all three conditions, for the same reason as in auth-lib.sh: fewer
+	# chances to hit an intermittent IAP failure, and a failure that names itself.
+	out=$(vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/$REMOTE_READER\" || { echo NOREADER; exit 0; }
+		sudo -n true 2>/dev/null || { echo NOSUDO; exit 0; }
+		pgrep -x rsyslogd >/dev/null || { echo NORSYSLOG; exit 0; }
+		echo OK" </dev/null 2>/dev/null) || {
+		echo "could not reach the VM to check its logs (the SSH call itself failed)" >&2
 		return 1
 	}
-	vm_ssh "sudo -n true" </dev/null 2>/dev/null || {
-		echo "the VM's $VM_USER cannot sudo without a password; its logs cannot be read" >&2
-		return 1
-	}
-	# rsyslog has to be running there for the same reason it had to be running here: the
-	# kernel's LOG target reaches a file through it, and without it the firewall's evidence
-	# is an empty file rather than an error.
-	vm_ssh "pgrep -x rsyslogd >/dev/null" </dev/null 2>/dev/null || {
-		echo "rsyslogd is not running on the VM; ufw lines would never reach $VM_UFW_LOG" >&2
-		return 1
-	}
-	return 0
+	case "$out" in
+		*OK*)       return 0 ;;
+		*NOREADER*) echo "the VM's checkout predates Remote/read-window.sh — ./vm.sh sync" >&2; return 1 ;;
+		*NOSUDO*)   echo "the VM's $VM_USER cannot sudo without a password; its logs cannot be read" >&2
+		            return 1 ;;
+		# The kernel's LOG target reaches a file through rsyslog, exactly as it did here.
+		# Without it the firewall's evidence is an empty file rather than an error.
+		*NORSYSLOG*) echo "rsyslogd is not running on the VM; ufw lines never reach $VM_UFW_LOG" >&2
+		             return 1 ;;
+		*)          echo "unexpected reply from the VM's source preflight: '$out'" >&2; return 1 ;;
+	esac
 }
 
 # Byte size of a VM-side file right now, for use as a later read boundary.

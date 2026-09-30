@@ -18,21 +18,28 @@
 AUTH_COLLECTOR='PDE Sources/Auth/collect-auth.sh'
 
 auth_preflight() {
+	local out
 	vm_reachable || {
 		echo "the research VM is not reachable (status: $(vm_status || echo unknown)) — ./vm.sh start" >&2
 		return 1
 	}
-	vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/$AUTH_COLLECTOR\"" </dev/null 2>/dev/null || {
-		echo "the VM's checkout predates the auth source — ./vm.sh sync" >&2
+	# One session, not three. Every extra SSH round trip is another chance to hit the
+	# intermittent IAP failures this VM shows under load, and the previous version reported
+	# any of them as "cannot sudo" — which sent the reader after a sudoers problem that did
+	# not exist. The remote side names the condition; SSH failing is reported as itself.
+	out=$(vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/$AUTH_COLLECTOR\" || { echo NOCOLLECTOR; exit 0; }
+		sudo -n true 2>/dev/null || { echo NOSUDO; exit 0; }
+		echo OK" </dev/null 2>/dev/null) || {
+		echo "could not reach the VM to check the auth source (the SSH call itself failed)" >&2
 		return 1
 	}
-	# Reading auth.log needs root there, and the lab's account reaches it through sudo. A
-	# failure here is worth naming now rather than as an empty evidence file later.
-	vm_ssh "sudo -n true" </dev/null 2>/dev/null || {
-		echo "the VM's $VM_USER cannot sudo without a password; the auth source cannot read sshd's log" >&2
-		return 1
-	}
-	return 0
+	case "$out" in
+		*OK*)          return 0 ;;
+		*NOCOLLECTOR*) echo "the VM's checkout predates the auth source — ./vm.sh sync" >&2; return 1 ;;
+		*NOSUDO*)      echo "the VM's $VM_USER cannot sudo without a password; sshd's log cannot be read" >&2
+		               return 1 ;;
+		*)             echo "unexpected reply from the VM's auth preflight: '$out'" >&2; return 1 ;;
+	esac
 }
 
 # The boundary taken before the window opens: a byte offset into auth.log, or a journald
