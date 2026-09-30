@@ -572,16 +572,16 @@ if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	SRC_LOG="$VM_UFW_LOG"
 	LOG_OFFSET=$(remote_offset "$VM_UFW_LOG")
 	if [[ "$VM_UFW_LOG" == "journal" ]]; then
-		FW_LOG_DESC="the kernel journal on $VM_NAME (journalctl -k), lines matching [UFW"
+		FW_LOG_DESC="netfilter LOG target -> systemd-journald on $VM_NAME, read with journalctl -k, lines matching [UFW"
 	else
-		FW_LOG_DESC="$VM_UFW_LOG on $VM_NAME"
+		FW_LOG_DESC="netfilter LOG target -> rsyslog -> $VM_UFW_LOG on $VM_NAME"
 	fi
 	log "capturing from $SRC_LOG on $VM_NAME at byte offset $LOG_OFFSET"
 else
 	SRC_LOG="$UFW_LOG"
 	[[ -f "$SRC_LOG" ]] || SRC_LOG="$KERN_LOG"
 	LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
-	FW_LOG_DESC="$SRC_LOG"
+	FW_LOG_DESC="netfilter LOG target -> rsyslog -> $SRC_LOG"
 	log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
 fi
 
@@ -672,7 +672,11 @@ fi
 WINDOW_END_ISO=$(date -u -d "@$(( $(date -u +%s) + 1 ))" +%Y-%m-%dT%H:%M:%SZ)
 
 # rsyslog batches writes; without this the tail of the window is routinely missing.
-log "waiting for rsyslog to flush"
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	log "letting the VM's logging settle"
+else
+	log "waiting for rsyslog to flush"
+fi
 sleep 3
 
 # ---------------------------------------------------------------------------
@@ -759,11 +763,22 @@ chmod 444 "$OUT_LOG"
 if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	IFS='|' read -r FW_UFW_VERSION FW_KERNEL FW_HOST <<< "$(remote_firewall_facts)"
 	FW_METHOD="real packets across the INPUT chain of $VM_NAME, arriving on $TUN_DEV from this machine's namespace over the tunnel device; log lines are kernel-generated and were not synthesised"
+	# The journal renders RFC 3339 in UTC with microseconds, not the RFC 3164 that rsyslog
+	# writes locally. Recording the local machine's zone against these lines would tell an
+	# investigator to shift every one of them by the offset between here and UTC.
+	FW_TS_FORMAT="RFC 3339: 'YYYY-MM-DDThh:mm:ss.ffffff+00:00', UTC, microseconds"
+	FW_TS_ZONE="UTC"
+	FW_TS_OFFSET="+0000"
+	FW_TS_SAME_AS_IDS="yes — both are RFC 3339 UTC and can be compared directly"
 else
 	FW_UFW_VERSION="$(ufw --version 2>/dev/null | head -1)"
 	FW_KERNEL="$(uname -r)"
 	FW_HOST="$(hostname)"
 	FW_METHOD="real packets across the host INPUT chain; log lines are kernel-generated and were not synthesised"
+	FW_TS_FORMAT="RFC 3164 syslog: 'Mon DD HH:MM:SS', LOCAL time, no year, no timezone, whole seconds"
+	FW_TS_ZONE="$TZ_NAME"
+	FW_TS_OFFSET="$TZ_OFFSET"
+	FW_TS_SAME_AS_IDS="no — this log is local time and the IDS evidence is UTC; convert using log_line_utc_offset"
 fi
 
 python3 - "$MANIFEST" <<PY
@@ -775,7 +790,7 @@ manifest = {
         "version": "${FW_UFW_VERSION}",
         "kernel": "${FW_KERNEL}",
         "observed_on": "${FW_HOST}",
-        "log_facility": "netfilter LOG target -> rsyslog -> ${FW_LOG_DESC}",
+        "log_facility": "${FW_LOG_DESC}",
         "collection_method": "${FW_METHOD}",
     },
     "window": {
@@ -786,10 +801,10 @@ manifest = {
     # How to read the timestamps in the log file, which the log file cannot tell you
     # itself. Without this a ufw line is genuinely ambiguous: no year, no zone.
     "timestamps": {
-        "log_line_format": "RFC 3164 syslog: 'Mon DD HH:MM:SS', LOCAL time, no year, "
-                           "no timezone, whole seconds",
-        "log_line_timezone": "${TZ_NAME}",
-        "log_line_utc_offset": "${TZ_OFFSET}",
+        "log_line_format": "${FW_TS_FORMAT}",
+        "log_line_timezone": "${FW_TS_ZONE}",
+        "log_line_utc_offset": "${FW_TS_OFFSET}",
+        "comparable_with_ids_evidence": "${FW_TS_SAME_AS_IDS}",
         "manifest_and_window_bounds": "UTC (RFC 3339, suffix Z)",
         "ids_evidence_format": "RFC 3339 with explicit offset, microseconds — already UTC",
         # Useful for ORDERING, not for conversion. Measured on this host, boot time from
@@ -828,11 +843,11 @@ manifest = {
         "sha256": "${SHA256}",
     },
     "caveats": [
-        "the log's own timestamps are LOCAL (${TZ_NAME}, ${TZ_OFFSET}) while every "
-        "timestamp in this manifest, in the ground truth and in the IDS evidence is UTC. "
-        "The same instant therefore reads two hours apart between firewall.log and "
-        "ids.alerts.log; see the timestamps block. Nothing has been rewritten — a "
-        "source's own output is left as the source produced it",
+        "this log's timestamps are ${FW_TS_ZONE} (${FW_TS_OFFSET}); every timestamp in this "
+        "manifest and in the ground truth is UTC. Whether that means a conversion is needed "
+        "before comparing this log with the IDS evidence is stated in "
+        "timestamps.comparable_with_ids_evidence. Nothing has been rewritten — a source's own "
+        "output is left as the source produced it",
         "syslog timestamps carry no year and no sub-second precision; the authoritative "
         "window bounds are window.start_utc/end_utc, in whole seconds with the start rounded "
         "down and the end rounded up, so that nothing inside the window falls outside them",
@@ -1080,10 +1095,15 @@ if E["G_IDS_OK"] == "1":
             "rather than one record split in two." % E["G_VETH"])
     items.append(ids)
     caveats += [
-        "firewall.log is RFC 3164 syslog in LOCAL time (%s, %s, no year, whole seconds) while "
-        "ids.alerts.log is RFC 3339 in UTC with microseconds. The same instant reads differently "
-        "between them, and neither has been rewritten. window.start_utc/end_utc are UTC and are the "
-        "common reference; the firewall manifest carries the conversion facts" % (E["G_TZ_NAME"], E["G_TZ_OFFSET"]),
+        ("firewall.log and ids.alerts.log are both RFC 3339 in UTC with microseconds here, because "
+         "both were written on the VM, so the two can be compared directly with no conversion. "
+         "window.start_utc/end_utc are UTC and are the common reference"
+         if E.get("G_VIA_TUNNEL") == "1" else
+         "firewall.log is RFC 3164 syslog in LOCAL time (%s, %s, no year, whole seconds) while "
+         "ids.alerts.log is RFC 3339 in UTC with microseconds. The same instant reads differently "
+         "between them, and neither has been rewritten. window.start_utc/end_utc are UTC and are the "
+         "common reference; the firewall manifest carries the conversion facts"
+         % (E["G_TZ_NAME"], E["G_TZ_OFFSET"])),
         "IDS findings are sliced to the window by the timestamp on each evidence line; a line whose "
         "timestamp cannot be parsed is kept rather than dropped",
         "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on timewindow "
