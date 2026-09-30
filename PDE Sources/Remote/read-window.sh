@@ -18,13 +18,13 @@
 #
 #    journal     bounded by a JOURNAL CURSOR. The firewall is read
 #                this way, and not from /var/log/ufw.log, because
-#                on this VM that file does not receive the lines:
-#                measured, the netfilter LOG rules fired 628 times
-#                for a window, `journalctl -k` held those lines,
-#                and /var/log/ufw.log held none of them. rsyslog
-#                is in the path for the file and is not delivering
-#                them; the journal is where the kernel's own
-#                record actually is, so that is what is read.
+#                on this VM that file lags far behind: measured,
+#                the LOG rules fired 628 times for a window and
+#                `journalctl -k` held those lines while the file
+#                held none of them yet. rsyslog writes the file
+#                and was running 20-25 minutes behind real time
+#                under the `logging full` flood; the journal is
+#                where the kernel's record lands first.
 #
 #  This deliberately does no parsing beyond the [UFW prefix the
 #  journal needs to stay a sane size. Slicing to the window,

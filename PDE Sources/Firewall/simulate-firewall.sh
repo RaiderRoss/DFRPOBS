@@ -237,8 +237,6 @@ if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	source "$PDE_ROOT/Remote/tun-lib.sh"
 	# shellcheck source=../Remote/remote-source-lib.sh
 	source "$PDE_ROOT/Remote/remote-source-lib.sh"
-	# shellcheck source=../Auth/auth-lib.sh
-	source "$PDE_ROOT/Auth/auth-lib.sh"
 fi
 if [[ $WITH_BANKING -eq 1 ]]; then
 	# shellcheck source=../Banking/banking-lib.sh
@@ -274,7 +272,6 @@ if [[ $DRY_RUN -eq 0 && $LAB_VIA_TUNNEL -eq 1 ]]; then
 	tun_session_running || die "the lab's tunnel device is down; './lab.sh down' then up"
 	ping -c1 -W2 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1 		|| die "the tunnel device is up but $TUN_VM_IP does not answer; restart the lab"
 	remote_source_preflight || die "the VM's logs cannot be read"
-	auth_preflight || die "the auth source preflight failed"
 	if [[ $WITH_IDS -eq 1 ]]; then
 		[[ -n "$LAB_VM_SLIPS_OUT" ]] || die "the lab records an IDS on the VM but no output directory; restart the lab"
 	fi
@@ -589,7 +586,6 @@ fi
 # writing throughout, and the window is a bounded read against them rather than a pause.
 IDS_ALERTS_OFFSET=0
 PCAP_OFFSET=0
-AUTH_OFFSET=""
 if [[ $IDS_REMOTE -eq 1 ]]; then
 	# Remote: the offset is into the lab's packet capture, and the window's packets are what
 	# tcpdump writes after it.
@@ -602,13 +598,6 @@ elif [[ $WITH_IDS -eq 1 ]]; then
 	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
 fi
 
-# The remote-access source. Taken before the window for the same reason as the others, but
-# it bounds only the *new* records: the login that authorised this window predates it, and
-# the collector gathers that separately. See Auth/README.md.
-if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
-	AUTH_OFFSET=$(auth_offset) || AUTH_OFFSET=""
-	[[ -n "$AUTH_OFFSET" ]] || { echo "warning: could not read sshd's offset on the VM; the auth source will be skipped" >&2; }
-fi
 
 # One directory per captured window. The window is the unit of evidence — an
 # EvidenceGroup is exactly "these files, this window" — so the filesystem says the same
@@ -1002,42 +991,15 @@ if [[ -n "$BANK_COLLECT_PID" ]]; then
 	rm -f "$RUN_DIR/.banking-collect.log"
 fi
 
-# The remote-access source. Collected after the window like the others, but it reaches back
-# past the window's start on purpose: the login that authorised this window is older than the
-# window, and an evidence file holding only the window would say nobody authenticated.
-AUTH_OK=0
-AUTH_SHA=""
-AUTH_ACCEPTED=0
-AUTH_FAILED=0
-AUTH_SUMMARY=""
-if [[ $LAB_VIA_TUNNEL -eq 1 && -n "$AUTH_OFFSET" ]]; then
-	log "collecting the tunnel's authentication record from $VM_NAME"
-	if AUTH_SUMMARY=$(auth_collect "$STAMP" "$AUTH_OFFSET" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$RUN_DIR"); then
-		AUTH_OK=1
-		AUTH_SHA=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha256"])' 			"$RUN_DIR/auth_${STAMP}.meta.json" 2>/dev/null || echo "")
-		read -r AUTH_ACCEPTED AUTH_FAILED < <(python3 -c 'import json,sys
-c = json.load(open(sys.argv[1]))["counts"]
-print(c["accepted_logins"], c["failed_attempts"])' "$RUN_DIR/auth_${STAMP}.meta.json" 2>/dev/null) || true
-		chmod 444 "$RUN_DIR/auth_${STAMP}.log"
-		log "auth evidence: ${AUTH_ACCEPTED:-0} accepted logins, ${AUTH_FAILED:-0} failed attempts"
-	else
-		echo "error: the auth source produced no evidence for this window" >&2
-		CAPTURE_ERRORS=1
-	fi
-fi
-
-
 # The group is the point of the exercise: one window, one attack, independent sources that
 # each saw part of it. This is the record an EvidenceGroup row would be built from. Values
 # go in through the environment rather than being pasted into the Python source.
-if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 || $AUTH_OK -eq 1 ]]; then
+if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 ]]; then
 	G_STAMP="$STAMP" G_START="$WINDOW_START_ISO" G_END="$WINDOW_END_ISO" G_DURATION="$DURATION" \
 	G_USERS="$USERS" G_MAL_USERS="$MALICIOUS_USERS" G_MAL_PCT="$MALICIOUS_PCT" G_PROFILE="$ATTACK_PROFILE" \
 	G_SEED="$SEED" G_SUBNET="$SUBNET" G_TZ_NAME="$TZ_NAME" G_TZ_OFFSET="$TZ_OFFSET" G_VETH="$VETH_HOST" \
 	G_VM="${VM_NAME:-}" G_HOST_IP="$HOST_IP" G_BANK_PORT="$BANK_PORT" \
 	G_VIA_TUNNEL="$LAB_VIA_TUNNEL" G_TARGET_IP="$TARGET_IP" G_TUN_DEV="${TUN_DEV:-}" \
-	G_AUTH_OK="$AUTH_OK" G_AUTH_SHA="$AUTH_SHA" G_AUTH_ACCEPTED="${AUTH_ACCEPTED:-0}" \
-	G_AUTH_FAILED="${AUTH_FAILED:-0}" \
 	G_FW_SHA="$SHA256" G_FW_LINES="$LOG_LINES" G_FW_BLOCK="$BLOCKED" G_FW_ALLOW="$ALLOWED" G_FW_AUDIT="$AUDITED" \
 	G_IDS_OK="$IDS_OK" G_IDS_REMOTE="$IDS_REMOTE" G_IDS_SHA="$IDS_SHA" G_IDS_KEPT="$IDS_KEPT" \
 	G_IDS_TOTAL="$IDS_TOTAL" G_IDS_ALERTS="$IDS_ALERTS" G_IDS_SEV="$IDS_SEVERITIES" \
@@ -1155,33 +1117,6 @@ if E.get("G_BANK_MANIFEST"):
         "banking timestamps are UTC from the bank's clock on the research VM, not this machine's; the "
         "banking manifest records the measured offset (bank_minus_lab_seconds) and how to read each field")
 
-if E.get("G_AUTH_OK") == "1":
-    items.append({
-        "pde_source": "auth", "product": "openssh-sshd",
-        "file": "auth_%s.log" % stamp, "sha256": E["G_AUTH_SHA"],
-        "accepted_logins": n("G_AUTH_ACCEPTED"), "failed_attempts": n("G_AUTH_FAILED"),
-        "meta_file": "auth_%s.meta.json" % stamp,
-    })
-    correlation.append(
-        "The auth item is the session everything else in this window arrived inside. The users' "
-        "packets reached %s over the tunnel device %s, which exists only within an authenticated "
-        "SSH session to the VM, and that session's login is what this item records. It is the only "
-        "source here that points at a person rather than at an address or an application login."
-        % (E["G_TARGET_IP"], E["G_TUN_DEV"]))
-    caveats += [
-        "the auth item deliberately reaches back past window.start_utc. The tunnel is opened when "
-        "the lab is built and carries every window after it, so the login that authorised this "
-        "window predates it, and an item holding only the window would read as 'nobody "
-        "authenticated'. The establishing session's lines and the window's own are separated by "
-        "### marker lines, which are the collector's and not sshd's",
-        "sshd records the session's source in Google's IAP forwarder range (35.235.240.0/20), not "
-        "the address the analyst sat at. The real client address and the Google identity are in "
-        "Cloud Audit Logs, which this window does not collect - see Auth/README.md",
-        "every remote command the lab runs opens its own SSH session, so most accepted logins in a "
-        "window are the lab working rather than a person. The tunnel's own session is identified by "
-        "the pids recorded in auth_<ts>.meta.json",
-    ]
-
 if E.get("G_VIA_TUNNEL") == "1":
     caveats.append(
         "the firewall item is ufw on %s, not on the machine that generated the traffic. The users' "
@@ -1219,7 +1154,6 @@ if [[ -n "${SUDO_USER:-}" ]]; then
 		fi
 	fi
 	chown "$SUDO_USER" "$RUN_DIR"/banking* 2>/dev/null || true
-	chown "$SUDO_USER" "$RUN_DIR"/auth_* 2>/dev/null || true
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
@@ -1238,10 +1172,6 @@ if [[ $WITH_BANKING -eq 1 ]]; then
 	log "  banking-events_${STAMP}.jsonl      the bank's business events"
 	log "  banking-audit_${STAMP}.jsonl       the bank's audit trail"
 	log "  banking_${STAMP}.manifest.json     provenance, completeness, digests"
-fi
-if [[ $AUTH_OK -eq 1 ]]; then
-	log "  auth_${STAMP}.log                  who opened the session it arrived in"
-	log "  auth_${STAMP}.meta.json            provenance, the tunnel session, digest"
 fi
 [[ -f "$GROUP_MANIFEST" ]] && log "  window_${STAMP}.group.json         every source, one window"
 

@@ -30,9 +30,8 @@
 #  Or the observation can move there wholesale:
 #    --via-tunnel     the users stay here and keep their addresses,
 #                     but reach the VM over a layer-3 tunnel device,
-#                     so the VM's ufw is the firewall, Slips watches
-#                     the device live, and the tunnel's own login
-#                     becomes a fifth source. YOUR firewall is not
+#                     so the VM's ufw is the firewall and Slips
+#                     watches the device live. YOUR firewall is not
 #                     touched at all in this mode. See Remote/TUNNEL.md.
 # ==============================================================
 set -euo pipefail
@@ -56,7 +55,7 @@ log()  { printf '[%(%H:%M:%S)T] %s\n' -1 "$*"; }
 die()  { echo "error: $*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+	sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
 	cat <<-EOF
 
 	Commands:
@@ -122,11 +121,8 @@ lab_up() {
 		source "$PDE_ROOT/Remote/tun-lib.sh"
 		# shellcheck source=Remote/remote-source-lib.sh
 		source "$PDE_ROOT/Remote/remote-source-lib.sh"
-		# shellcheck source=Auth/auth-lib.sh
-		source "$PDE_ROOT/Auth/auth-lib.sh"
 		vm_reachable || die "--via-tunnel needs the research VM (status: $(vm_status || echo unknown)); ./vm.sh start"
 		remote_source_preflight || die "the VM cannot be read as a source"
-		auth_preflight || die "the auth source preflight failed"
 		vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\"" </dev/null 2>/dev/null \
 			|| die "the VM's checkout predates Remote/vm-net.sh — ./vm.sh sync"
 		if [[ $WITH_IDS -eq 1 ]]; then
@@ -262,7 +258,8 @@ lab_up() {
 		# normally over well before this, so this usually returns at once.
 		local warm_waited=0 warm_state=""
 		while [[ $warm_waited -lt 600 ]]; do
-			warm_state=$(vm_ssh "bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/slips-warm.sh\" status" 				</dev/null 2>/dev/null | tr -d '' | head -1)
+			warm_state=$(vm_ssh "bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/slips-warm.sh\" status" 				</dev/null 2>/dev/null | tr -d '
+' | head -1)
 			[[ "$warm_state" != "warming" ]] && break
 			[[ $warm_waited -eq 0 ]] && log "the VM is still warming Slips' feed cache; waiting (two Slips runs overload it)"
 			sleep 15; warm_waited=$((warm_waited + 15))

@@ -24,8 +24,9 @@ REMOTE_READER='PDE Sources/Remote/read-window.sh'
 # Not /var/log/ufw.log. Measured on the first tunnel-mode capture: the netfilter LOG rules
 # in ufw-user-input fired 628 times for the window, `journalctl -k` held those lines, and
 # /var/log/ufw.log held none of them — 0 occurrences of SRC=10.99.0 in the whole 17MB file,
-# while the rules' own packet counters kept climbing. rsyslog sits in the path for the file
-# and is not delivering them on this host.
+# while the rules' own packet counters kept climbing. rsyslog writes that file, and on this
+# VM it was running 20-25 minutes behind real time — `logging full` on a busy host is a
+# flood — so a 30-second window read from the file is collected before its own lines land.
 #
 # The journal is where the kernel's record is, so that is what is read, bounded by a cursor
 # instead of a byte offset. read-window.sh understands both.
@@ -33,8 +34,9 @@ VM_UFW_LOG="${VM_UFW_LOG:-journal}"
 
 remote_source_preflight() {
 	local out
-	# One session for all three conditions, for the same reason as in auth-lib.sh: fewer
-	# chances to hit an intermittent IAP failure, and a failure that names itself.
+	# One session for all three conditions, not three. Every extra SSH round trip is another
+	# chance to hit the intermittent IAP failures this VM shows under load, and the previous
+	# version reported any of them as "cannot sudo". A failure now names itself.
 	out=$(vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/$REMOTE_READER\" || { echo NOREADER; exit 0; }
 		sudo -n true 2>/dev/null || { echo NOSUDO; exit 0; }
 		pgrep -x rsyslogd >/dev/null || { echo NORSYSLOG; exit 0; }

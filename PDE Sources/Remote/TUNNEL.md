@@ -21,7 +21,6 @@ WSL                                                     VM (fineract-slips)
                                                         ufw INPUT   ← firewall evidence
                                                         Slips       ← IDS, live on tun7
                                                         relay :8443 ← bank calls, on INPUT
-                                                        sshd log    ← who opened the tunnel
 ```
 
 Nothing new is exposed. The tunnel rides the one port the GCP firewall already admits (22,
@@ -35,11 +34,14 @@ through that remote-access channel — which is exactly what the `loan-fraud` sc
 IAP plays the part of the bank's VPN gateway, and the tunnel is the officer arriving the way
 a remote officer would.
 
-It also opens a source the lab did not have. Every tunnel begins with an authenticated
-login, recorded by the VM's sshd: who connected, when, as whom. That fills the empty
-Authentication row in the sources table, and gives the investigation its first link —
-*this login opened the session → from this address → which scanned the host → and logged
-into the bank as `pde_officer`.*
+An sshd-based authentication source was built on top of this and then removed. It could
+not attribute anything in this lab: every connection reaches the VM through IAP, so sshd
+records Google's forwarder address rather than the person's; every teammate shares the
+`pde` account; and all ten simulated users, attacker included, travel through one tunnel
+session. It added a row to the sources table without telling an investigator anything that
+helps find the attacker. Attribution comes from the bank's audit trail (the login) and the
+firewall and IDS (the address), tied by time. The Authentication row stays with the
+planned identity-provider source.
 
 The alternatives were weighed and rejected: whitelisting a home IP collapses all ten users
 into one NATed address (and still misses the bank calls, which never cross INPUT); a second
@@ -182,17 +184,15 @@ Measured against the VM on 2026-09-30, `fineract-slips` in `africa-south1-a`, ov
 | **ufw on the VM as the firewall source** | **verified** — 10 distinct sources logged on `IN=tun7`; the attacker BLOCKed on 32 distinct ports; the watchdog armed, access confirmed, watchdog cancelled |
 | **Slips live on the tunnel device** | **verified** — 132 alerts, including *"Detected new vertical port scan to IP 10.98.0.1 from 10.99.0.20"* |
 | **the bank over the relay** | **verified** — 19 of 19 operations present in both the audit trail and the event stream; `pde_officer` CREATE CLIENT / CREATE LOAN / APPROVE / DISBURSE with `checker_username` null |
-| **the auth source** | **verified** — the tunnel's session identified by its fd on `/dev/net/tun`, its login collected |
 | this machine's firewall | **never touched** in this mode, and `down` leaves it that way |
 
-A window therefore holds five sources that independently describe one attacker:
+A window therefore holds four sources that independently describe one attacker:
 
 ```
 firewall (VM ufw)   10 sources on tun7; 10.99.0.20 BLOCKed on 32 ports
 ids      (Slips)    vertical port scan to 10.98.0.1 from 10.99.0.20
 audit    (Fineract) pde_officer: CREATE CLIENT, CREATE LOAN, APPROVE, DISBURSE — no checker
 events   (Kafka)    ClientCreate, LoanCreated, LoanApproved, LoanDisbursal
-auth     (sshd)     the session all of it arrived inside
 ```
 
 ## Things this cost, and what they taught
@@ -201,9 +201,10 @@ Worth keeping, because each was silent rather than loud:
 
 - **The firewall is read from the journal, not `/var/log/ufw.log`.** The LOG rules fired 628
   times for a window; `journalctl -k` held those lines and the file held none of them, with
-  the rules' counters still climbing. rsyslog is in the path for the file and does not
-  deliver them on this host. A window would otherwise report 0 firewall lines and look like
-  a quiet network.
+  the rules' counters still climbing. rsyslog writes the file, and on this VM it was running
+  20-25 minutes behind real time under the `logging full` flood, so a window read from the
+  file is collected before its own lines arrive. It would report 0 firewall lines and look
+  like a quiet network.
 - **The tun device is remade every bring-up.** A persistent device an earlier sshd session
   attached to cannot be attached again; reusing one fails as "Tunnel forwarding failed",
   which says nothing about the cause.
@@ -212,8 +213,6 @@ Worth keeping, because each was silent rather than loud:
   leave the real one behind, which is what kept breaking the next bring-up.
 - **Two Slips runs saturate four vCPUs**, and the lab's only way in is SSH. Setup now waits
   for the background cache warm-up before starting the live IDS.
-- **`grep -c` prints `0` and exits 1.** `|| echo 0` therefore yields `0\n0`. The firewall
-  capture documents this; the auth collector walked into it anyway.
 - **`logging full` on a busy VM is 121 MB a window** if the fetch is not filtered to the
   lab's own addresses. Now 413 KB.
 
@@ -221,8 +220,9 @@ Worth keeping, because each was silent rather than loud:
 
 - `MALICIOUS_PORTS` no longer contains 8443, so the attacker's sweep is 34 ports rather than
   35. `lab_check_port_lists` now refuses any lab whose port lists contradict each other.
-- The auth source records IAP's forwarder address, not the analyst's. Cloud Audit Logs hold
-  the Google identity and the real client address; collecting them would complete the chain.
+- The VM's ufw runs at `logging full`, which on a busy host is roughly 4 MB of log a second.
+  Fine for a session of a few windows; worth turning down before long ones, since only the
+  verdict rules the lab installs itself are needed and they do not depend on that level.
 - Slips' `--ids-remote` (file mode per window) and `--via-tunnel` (live) are now two distinct
   designs. The older one still works and is still the only option if the lab cannot reach
   the VM continuously.

@@ -3,8 +3,8 @@
 # Submits one source's evidence from a captured window to the DFRaaS Evidence Repository.
 #
 # One EvidenceItem references one artifact, so a window that captured the firewall, the
-# IDS, the bank and the tunnel's login is five items from five registered sources — not one
-# upload carrying five files. --source picks which one goes; the window supplies the rest.
+# IDS and the bank is four items from four registered sources — not one upload carrying
+# four files. --source picks which one goes; the window supplies the rest.
 #
 # The coverage window is the same for all of them, because they observed one scenario over
 # one period. Only the artifact, the digest and the registered source differ.
@@ -24,7 +24,6 @@
 #   ./submit-evidence.sh                              # firewall log of the latest window
 #   ./submit-evidence.sh --source ids                 # the IDS evidence for that window
 #   ./submit-evidence.sh --source banking-audit       # the bank's audit trail for it
-#   ./submit-evidence.sh --source auth                # who opened the tunnel it arrived in
 #   ./submit-evidence.sh --run 20260906204848 --source ids
 #   ./submit-evidence.sh --list                       # what is available to send
 #
@@ -63,13 +62,6 @@ BANK_AUDIT_SOURCE_KEY="${DFRAAS_BANK_AUDIT_SOURCE_KEY:-pde-sim-fineract-audit-01
 BANK_AUDIT_DISPLAY_NAME="${DFRAAS_BANK_AUDIT_DISPLAY_NAME:-PDE testbed bank audit trail (Fineract)}"
 BANK_AUDIT_SOURCE_TYPE="${DFRAAS_BANK_AUDIT_SOURCE_TYPE:-DB_AUDIT}"
 
-# The remote-access source: sshd on the research VM. It is the only source that attributes a
-# session to a person rather than to an address or a login — see Auth/README.md, including
-# what IAP means for the address it records.
-AUTH_SOURCE_KEY="${DFRAAS_AUTH_SOURCE_KEY:-pde-sim-sshd-01}"
-AUTH_DISPLAY_NAME="${DFRAAS_AUTH_DISPLAY_NAME:-PDE testbed remote access (sshd)}"
-AUTH_SOURCE_TYPE="${DFRAAS_AUTH_SOURCE_TYPE:-AUTH_LOG}"
-
 RUN=""
 SOURCE="firewall"
 DRY_RUN=0
@@ -85,7 +77,7 @@ usage() {
 
 	Options:
 	  --source NAME          which source's evidence to send:
-	                         firewall | ids | banking-events | banking-audit | auth
+	                         firewall | ids | banking-events | banking-audit
 	                                                          (default $SOURCE)
 	  --list                 show the windows and what each holds, then exit
 	  --run ID               window to submit from, e.g. 20260906204848 (default: latest)
@@ -125,8 +117,8 @@ command -v curl    >/dev/null 2>&1 || fail "curl not found on PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
 
 case "$SOURCE" in
-	firewall|ids|banking-events|banking-audit|auth) ;;
-	*) fail "unknown --source '$SOURCE' (firewall | ids | banking-events | banking-audit | auth)" ;;
+	firewall|ids|banking-events|banking-audit) ;;
+	*) fail "unknown --source '$SOURCE' (firewall | ids | banking-events | banking-audit)" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -146,7 +138,7 @@ if [[ "$LIST" -eq 1 ]]; then
 				"$(stat -c %s "$dir/firewall_${stamp}.log")" >&2
 		fi
 		for pair in "ids:ids_${stamp}.alerts.log" "banking-events:banking-events_${stamp}.jsonl" \
-		            "banking-audit:banking-audit_${stamp}.jsonl" "auth:auth_${stamp}.log"; do
+		            "banking-audit:banking-audit_${stamp}.jsonl"; do
 			src="${pair%%:*}" file="${pair#*:}"
 			if [[ -f "$dir/$file" ]]; then
 				printf '    %-15s %-38s %s bytes\n' "$src" "$file" "$(stat -c %s "$dir/$file")" >&2
@@ -199,9 +191,6 @@ case "$SOURCE" in
 		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$BANK_AUDIT_SOURCE_KEY}"
 		DISPLAY_NAME="$BANK_AUDIT_DISPLAY_NAME"; SOURCE_TYPE="$BANK_AUDIT_SOURCE_TYPE"
 		CONTENT_TYPE="application/x-ndjson" ;;
-	auth)
-		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$AUTH_SOURCE_KEY}"
-		DISPLAY_NAME="$AUTH_DISPLAY_NAME"; SOURCE_TYPE="$AUTH_SOURCE_TYPE" ;;
 esac
 # The dedupe key: <source>_<window>, the artifact's own name without its extension.
 ARTIFACT_ID="${SOURCE}_${RUN}"
