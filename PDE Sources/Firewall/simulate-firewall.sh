@@ -687,7 +687,7 @@ FW_RANGE_SHA=""
 FW_RAW=""
 if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	FW_RAW="$RUN_DIR/.ufw-range"
-	if read -r FW_RANGE_BYTES FW_RANGE_SHA < <(remote_slice "$VM_UFW_LOG" "$LOG_OFFSET" "$STAMP" "ufw-range.log" "$FW_RAW"); then
+	if read -r FW_RANGE_BYTES FW_RANGE_SHA < <(remote_slice "$VM_UFW_LOG" "$LOG_OFFSET" "$STAMP" "ufw-range.log" "$FW_RAW" "SRC=${USER_IP_BASE}"); then
 		log "fetched ${FW_RANGE_BYTES} bytes of $VM_UFW_LOG from $VM_NAME"
 		SRC_LOG="$FW_RAW"
 		LOG_OFFSET=0
@@ -1051,7 +1051,21 @@ if E["G_IDS_OK"] == "1":
                           "low": int(low), "info": int(info)},
     }
     remote = E["G_IDS_REMOTE"] == "1"
-    if remote:
+    via_tunnel = E.get("G_VIA_TUNNEL") == "1"
+    if via_tunnel:
+        # Both sources are on the VM in this mode, watching the tunnel device. Naming this
+        # machine's veth here would put the wrong interface, on the wrong host, into the
+        # record an investigation reads.
+        ids["analysed"] = ("on %s, by Slips reading %s live, the interface the lab's traffic "
+                           "arrives on" % (E["G_VM"], E["G_TUN_DEV"]))
+        correlation.append(
+            "The firewall and IDS items describe the same packets, and both observed them on %s: "
+            "Slips read %s live while that host's ufw logged the same traffic crossing its INPUT "
+            "chain. They are independent accounts of one attack rather than one record split in "
+            "two. Because the users' own source addresses survive the tunnel, both sources see the "
+            "individual users rather than a single forwarder, which is what lets the attacker be "
+            "told apart from them." % (E["G_VM"], E["G_TUN_DEV"]))
+    elif remote:
         ids["analysed"] = "on %s, by Slips in file mode, from this window's packets only" % E["G_VM"]
         ids["input_pcap"] = {"file": "ids_%s.pcap" % stamp, "sha256": E["G_IDS_PCAP_SHA"],
                              "packets": n("G_IDS_PCAP_PACKETS")}
@@ -1075,7 +1089,13 @@ if E["G_IDS_OK"] == "1":
         "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on timewindow "
         "N'). They carry no threat level, so threat_levels does not include them",
     ]
-    if remote:
+    if via_tunnel:
+        caveats.append(
+            "Slips ran continuously on the VM across this and every other window of the lab "
+            "session, so its per-source profile and alert threshold carry over between windows "
+            "rather than starting fresh each time, and an alert here may rest partly on evidence "
+            "it gathered earlier in the session")
+    elif remote:
         caveats.append(
             "Slips analysed this window on its own, starting fresh: its per-source profile and alert "
             "threshold do not carry over from earlier windows, as they would for a Slips sniffing "

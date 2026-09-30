@@ -63,6 +63,14 @@ cmd_offset() {
 
 cmd_slice() {
 	local path="$1" offset="$2" outdir="$3" name="$4"
+	# Optional second filter from the caller. At `logging full` on a busy VM, "[UFW " is
+	# every packet the host sees: one 30s window came to 121MB and two minutes on the wire.
+	# The caller knows which addresses are the lab's, so it says so and the transfer becomes
+	# the window's own lines. The digest then covers what was actually sent.
+	# An empty pattern matches every line, so one unconditional grep covers the filtered
+	# and unfiltered cases alike. The branch this replaces fell through to `cat` when the
+	# filter matched nothing, on a stdin grep had already consumed.
+	local extra="${5:-}"
 	mkdir -p "$outdir" || die "cannot write $outdir"
 	local dest="$outdir/$name"
 
@@ -70,13 +78,15 @@ cmd_slice() {
 		local cursor="${offset#cursor:}"
 		if [[ -n "$cursor" ]]; then
 			journalctl -k --after-cursor "$cursor" -o short-iso-precise --no-pager 2>/dev/null \
-				| grep -F "$JOURNAL_FILTER" > "$dest" || : > "$dest"
+				| grep -F "$JOURNAL_FILTER" \
+				| grep -F "$extra" > "$dest" || : > "$dest"
 		else
 			# No cursor to read from — a journal that had nothing in it when the window
 			# opened. Bounded by time instead, generously, since the window's own slicing
 			# happens on the lab machine anyway.
 			journalctl -k --since '-15min' -o short-iso-precise --no-pager 2>/dev/null \
-				| grep -F "$JOURNAL_FILTER" > "$dest" || : > "$dest"
+				| grep -F "$JOURNAL_FILTER" \
+				| grep -F "$extra" > "$dest" || : > "$dest"
 		fi
 	elif [[ ! -e "$path" ]]; then
 		# An empty slice rather than an error, for the same reason as above. The caller is
@@ -99,7 +109,7 @@ cmd_slice() {
 
 case "${1:-}" in
 	offset) [[ $# -eq 2 ]] || die "offset <path|journal>"; cmd_offset "$2" ;;
-	slice)  [[ $# -eq 5 ]] || die "slice <path|journal> <offset> <outdir> <name>"
-	        cmd_slice "$2" "$3" "$4" "$5" ;;
+	slice)  [[ $# -ge 5 ]] || die "slice <path|journal> <offset> <outdir> <name> [filter]"
+	        cmd_slice "$2" "$3" "$4" "$5" "${6:-}" ;;
 	*) sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 1 ;;
 esac

@@ -74,10 +74,11 @@ remote_offset() {
 # hashed separately where it is written.
 remote_slice() {
 	local path="$1" offset="$2" stamp="$3" name="$4" dest="$5"
+	local filter="${6:-}"
 	local rdir="pde-read/$stamp" meta bytes sha local_sha
 
 	meta=$(vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/$REMOTE_READER\" slice '$path' '$offset' \
-		\"\$HOME/$rdir\" '$name'" </dev/null | grep -m1 '^{') \
+		\"\$HOME/$rdir\" '$name' '$filter'" </dev/null | grep -m1 '^{') \
 		|| { echo "could not slice $path on the VM" >&2; return 1; }
 
 	read -r bytes sha < <(python3 -c '
