@@ -27,6 +27,11 @@ PAGE = (b"<!doctype html><html><head><title>PDE Bank</title></head><body>"
         b"<a href=\"/contact\">Contact</a></p></body></html>\n")
 
 
+# How long one customer may hold a connection without sending anything. A browser that
+# stalls is dropped rather than left holding a thread.
+CLIENT_IDLE_SECONDS = 10
+
+
 class Server(ThreadingHTTPServer):
     # socketserver's default listen backlog is 5, which a burst of customers overflows;
     # the dropped SYNs would show up as page loads that never started.
@@ -34,9 +39,35 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
 
+class TLSServer(Server):
+    """HTTPS with the handshake in each connection's own thread.
+
+    Wrapping the listening socket instead does every handshake inside accept(), in the one
+    thread that accepts for the port. One client slow to finish its handshake then holds up
+    every customer behind it: they connect, send their hello and hear nothing — page loads
+    that fail for reasons no real bank's web front would give."""
+
+    def __init__(self, address, handler, context):
+        self.context = context
+        super().__init__(address, handler)
+
+    def finish_request(self, request, client_address):
+        # Runs in the connection's thread (ThreadingMixIn.process_request_thread).
+        request.settimeout(CLIENT_IDLE_SECONDS)
+        try:
+            tls = self.context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, OSError):
+            return
+        try:
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            tls.close()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PDE-Bank-Web/1.0"
     protocol_version = "HTTP/1.1"
+    timeout = CLIENT_IDLE_SECONDS
 
     def do_GET(self):
         self.send_response(200)
@@ -80,16 +111,17 @@ def main():
     if tls and not (args.cert and args.key):
         raise SystemExit("HTTPS ports need --cert and --key")
 
+    ctx = None
+    if tls:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(args.cert, args.key)
     servers = []
     for port in plain + tls:
         try:
-            srv = Server((args.host, port), Handler)
+            srv = (TLSServer((args.host, port), Handler, ctx) if port in tls
+                   else Server((args.host, port), Handler))
         except OSError as exc:
             raise SystemExit("cannot bind %s:%d: %s" % (args.host, port, exc))
-        if port in tls:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(args.cert, args.key)
-            srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
         servers.append(srv)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
