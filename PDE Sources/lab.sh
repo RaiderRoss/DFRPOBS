@@ -78,6 +78,9 @@ lab_up() {
 	command -v ufw >/dev/null || die "ufw not installed"
 	command -v iptables >/dev/null || die "iptables not installed"
 	pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw lines would not reach $UFW_LOG"
+	# Before any rule is written: a contradiction between the port lists cannot be seen in
+	# the finished dataset, only in the labels disagreeing with each other.
+	lab_check_port_lists || die "the port lists contradict each other; fix lab-config.sh"
 
 	if [[ $WITH_IDS -eq 1 ]]; then
 		[[ -f "$IDS_LIB" ]] || die "--with-ids needs $IDS_LIB"

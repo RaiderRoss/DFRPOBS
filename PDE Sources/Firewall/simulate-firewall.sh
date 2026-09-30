@@ -149,6 +149,9 @@ command -v ip >/dev/null || die "iproute2 not installed"
 # Used directly for verdict logging; see the note where the LOG rules are installed.
 command -v iptables >/dev/null || die "iptables not installed"
 command -v python3 >/dev/null || die "python3 not installed"
+# Checked here too, not only in lab.sh: a one-shot capture builds its own rules, so it can
+# mislabel a window on its own without a lab ever having existed.
+lab_check_port_lists || die "the port lists contradict each other; fix lab-config.sh"
 
 # --dry-run is what someone runs *before* deciding to let this touch their firewall, so
 # it must not itself demand root.

@@ -55,7 +55,13 @@ BENIGN_PORTS="80,443,8080"
 # for on one host inside a timewindow — measured at around 10 for Slips. A thin list
 # leaves the IDS silent about an attack the firewall recorded plainly, which is the
 # opposite of the correlation this exists to demonstrate. None may overlap BENIGN_PORTS.
-MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,873,993,995,1080,1433,1521,2049,2375,3306,3389,5060,5432,5900,6379,8443,9200,11211,27017"
+#
+# 8443 is deliberately NOT here. It is BANK_PORT, and it is in ALLOWED_PORTS, so the verdict
+# rules label it ALLOW — an attacker's probe to it was therefore recorded as permitted
+# banking traffic while the ground truth called the same packet malicious. One port
+# contradicting the label on both sides is worse than a slightly narrower sweep, and 34
+# ports is still far above the ~10 distinct ports Slips needs to call it a vertical scan.
+MALICIOUS_PORTS="21,22,23,25,53,110,111,135,137,139,143,161,389,445,512,513,514,873,993,995,1080,1433,1521,2049,2375,3306,3389,5060,5432,5900,6379,9200,11211,27017"
 
 # Ports the guaranteed-alert profile connects to. Permitted from the subnet and answered
 # by a listener on the host, so every attempt completes its handshake.
@@ -180,4 +186,49 @@ alert_listener_stop() {
 		return 0
 	fi
 	pkill -f -- "Firewall/alert_listener.py" 2>/dev/null || true
+}
+
+# The port lists carry the dataset's labels, and the rules that apply them cannot detect a
+# contradiction between two lists — they just produce a window in which some packet is
+# labelled one thing by the firewall and the opposite by the ground truth. 8443 sat in both
+# MALICIOUS_PORTS and ALLOWED_PORTS for several commits without anything noticing, so the
+# invariants the comments above state are now checked before a lab is built.
+#
+# PRESERVE_PORTS overlapping MALICIOUS_PORTS (22, 5432) is the one intended overlap and is
+# NOT flagged: those ports are both a real host service and something an attacker probes,
+# and rule ORDER is what keeps it from mislabelling anything.
+#
+#   lab_check_port_lists    prints every problem it finds; non-zero if there were any
+lab_check_port_lists() {
+	local bad=0
+	_ports_of() { tr ',' '\n' <<< "$1" | sed '/^$/d' | sort -u; }
+	_overlap() {
+		local common
+		common=$(comm -12 <(_ports_of "$2") <(_ports_of "$4") | tr '\n' ' ')
+		if [[ -n "${common// /}" ]]; then
+			echo "port lists $1 and $3 overlap on: ${common% }" >&2
+			bad=1
+		fi
+	}
+
+	_overlap BENIGN_PORTS    "$BENIGN_PORTS"    MALICIOUS_PORTS "$MALICIOUS_PORTS"
+	_overlap BENIGN_PORTS    "$BENIGN_PORTS"    ALERT_PORTS     "$ALERT_PORTS"
+	_overlap MALICIOUS_PORTS "$MALICIOUS_PORTS" ALERT_PORTS     "$ALERT_PORTS"
+	_overlap ALERT_PORTS     "$ALERT_PORTS"     PRESERVE_PORTS  "$PRESERVE_PORTS"
+	# The bank's port must not appear in any of the three, because it is in ALLOWED_PORTS:
+	# anything it shares a list with inherits the ALLOW label whether that is true or not.
+	_overlap BANK_PORT "$BANK_PORT" BENIGN_PORTS    "$BENIGN_PORTS"
+	_overlap BANK_PORT "$BANK_PORT" MALICIOUS_PORTS "$MALICIOUS_PORTS"
+	_overlap BANK_PORT "$BANK_PORT" ALERT_PORTS     "$ALERT_PORTS"
+
+	# iptables' multiport match takes at most 15 ports, and silently refuses the rule above
+	# that — which would leave a window with no verdict lines at all.
+	local n; n=$(_ports_of "$ALLOWED_PORTS" | wc -l)
+	if [[ "$n" -gt 15 ]]; then
+		echo "ALLOWED_PORTS has $n ports; iptables multiport accepts at most 15" >&2
+		bad=1
+	fi
+
+	unset -f _ports_of _overlap
+	return "$bad"
 }
