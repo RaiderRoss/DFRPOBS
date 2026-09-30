@@ -115,6 +115,16 @@ the user and Fineract. It holds no key and is not a TLS terminator. It binds one
 refuses `0.0.0.0`, which would publish the bank — default credentials and all — on every
 interface the VM has.
 
+**The relay cannot work unless Fineract's ports are bound to the loopback first.** The
+tracked compose file publishes 8443 on `0.0.0.0`, so `docker-proxy` owns the tunnel address
+too: the relay fails with `Address already in use`, and — worse — a call to
+`10.98.0.1:8443` still *succeeds*, having gone straight to the published port and across
+FORWARD where ufw cannot see it. The first tunnel run did exactly that and looked healthy.
+`Remote/fineract-compose.vm.yml` binds the publications to `127.0.0.1`, which frees the
+address and closes the exposure at the same time. Nothing inside the compose network
+changes, and `collect-audit.sh` reaches Postgres through `docker exec` rather than a
+published port.
+
 ## ufw on the VM
 
 This is the one action here that can end in losing access to the VM, so it fails safe:
@@ -157,14 +167,29 @@ sysctl and adds routes. gcloud underneath it still runs as the invoking user.
 
 ## State of this work
 
+Measured against the VM on 2026-09-30, `fineract-slips` in `africa-south1-a`:
+
 | | |
 |---|---|
 | tun ownership and unprivileged attach | **verified** on WSL 6.18.33.2 (table above) |
 | the relay: passthrough, 300 KB payloads, 30 concurrent connections, `0.0.0.0` refusal | **verified** locally |
-| `ssh -w` through `gcloud compute ssh --tunnel-through-iap` as non-root `pde` | **not yet run** — needs the VM |
+| `ssh -w` through `gcloud compute ssh --tunnel-through-iap` as non-root `pde` | **verified** — sshd reloaded, `tun7` attached both ends |
+| the layer-3 path itself | **verified** — 9/9 ICMP, 0% loss, RTT 48–142 ms (avg ~59 ms) |
+| **source addresses survive the tunnel** | **verified** — the VM's own `tcpdump -i tun7` recorded `10.99.0.99 > 10.98.0.1` and the reply back, so N users arrive as N sources |
+| the relay is genuinely in the path | **verified** — `curl` to `10.98.0.1:8443` gives exit 7 with the relay stopped and `{"status":"UP"}` with it running |
+| Fineract no longer on `0.0.0.0` | **verified** — only `127.0.0.1:{8443,5432,9092}` listening |
 | moving the firewall and IDS *evidence* to the VM (offsets, slicing, fetch, digests, manifests) | still to do |
 | the sshd/IAP login as a fourth PDE source | still to do |
+| ufw on the VM (`firewall-up`) | written, **never yet run** |
+
+The transport is therefore proved end to end, and the two remaining phases are evidence
+collection rather than plumbing.
 
 The existing capture path is untouched and still works: `lab.sh` still builds the local ufw
-lab and the `-L` bank tunnel. Nothing switches over until the tunnel device has been proved
-on the VM.
+lab and the `-L` bank tunnel, so windows can still be captured the old way while the new
+path is finished.
+
+RTT is worth remembering for the write-up: ~59 ms average, against a veth's microseconds.
+The scenario's steps are seconds apart, so it does not change the fraud chain, but the bank
+generator's per-call latency is now a network round trip and the `--bank-rate` ceiling is
+lower than it was locally.
