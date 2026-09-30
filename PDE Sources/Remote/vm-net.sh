@@ -350,8 +350,10 @@ slips_up() {
 	# watches — here the tunnel device, whose own network is the tunnel's /30 — and every
 	# lab user, benign or not, becomes "a private IP outside the used local network". That
 	# one finding put all nine benign users over the alert threshold in every tunnel window.
-	# Written into the output directory so the exact configuration travels with the evidence.
-	conf="$outdir/lab-slips.yaml"
+	# Beside the output directory, not in it: Slips clears its output directory when it
+	# starts, so a file there is deleted before Slips can read it. Slips copies the
+	# configuration it ran with into its own metadata/, so it still travels with the evidence.
+	conf="$outdir.slips.yaml"
 	docker run --rm "$img" cat config/slips.yaml > "$conf" 2>/dev/null && [[ -s "$conf" ]] \
 		|| die "could not read Slips' default configuration from $img"
 	if [[ -n "$clients" ]]; then
@@ -364,7 +366,8 @@ slips_up() {
 
 	docker rm -f pde-slips >/dev/null 2>&1 || true
 	docker run -d --net=host --cap-add=NET_ADMIN --name pde-slips \
-		-v "$outdir":/output "$img" ./slips.py -c /output/lab-slips.yaml -i "$dev" -o /output >/dev/null \
+		-v "$outdir":/output -v "$conf":/config/lab-slips.yaml:ro "$img" \
+		./slips.py -c /config/lab-slips.yaml -i "$dev" -o /output >/dev/null \
 		|| die "could not start Slips on $dev"
 	printf '%s\n' "$outdir" > /run/pde-slips-out
 	log "Slips starting on $dev, output $outdir, local network ${clients:-inferred}"
