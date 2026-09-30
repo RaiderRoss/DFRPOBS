@@ -22,13 +22,18 @@ if [[ ! -f .env ]]; then
 		"SECURERS_API_KEY=unused-listener-not-started-on-vm" > .env
 fi
 
-docker compose -f docker-compose-fineract.yml up -d --wait --wait-timeout 600 \
+# The override binds the published ports to the loopback. It is not optional on this host:
+# without it docker-proxy owns the tunnel address, the bank relay cannot bind, and bank
+# calls cross FORWARD instead of INPUT so ufw cannot log them. See the file's own comments.
+COMPOSE=(-f docker-compose-fineract.yml -f "$REPO/PDE Sources/Remote/fineract-compose.vm.yml")
+
+docker compose "${COMPOSE[@]}" up -d --wait --wait-timeout 600 \
 	db kafka fineract-manager fineract-worker || { echo "FINERACT FAILED"; exit 1; }
 echo "FINERACT UP"
 
 # Built here rather than at capture time, so the first window after a sync does not pay
 # for it. Cached, so a no-op when Kafka_Listener/ has not changed.
-docker compose -f docker-compose-fineract.yml --profile pde build -q pde-collector \
+docker compose "${COMPOSE[@]}" --profile pde build -q pde-collector \
 	|| { echo "COLLECTOR BUILD FAILED"; exit 1; }
 echo "COLLECTOR READY"
 
