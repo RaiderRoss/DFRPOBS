@@ -206,7 +206,7 @@ tun_session_stop() {
 # ---------------------------------------------------------------------------
 tun_vm_prepare() {
 	vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" up \
-		'$TUN_NUM' '$TUN_VM_IP' '$TUN_LOCAL_IP' '$SUBNET' '$VM_USER'" </dev/null
+		'$TUN_NUM' '$TUN_VM_IP' '$TUN_LOCAL_IP' '$SUBNET' '$VM_USER' '$TUN_VM_PREFIX'" </dev/null
 }
 
 tun_vm_teardown() {

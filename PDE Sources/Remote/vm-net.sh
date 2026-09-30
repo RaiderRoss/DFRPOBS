@@ -96,7 +96,7 @@ sshd_permit_tunnel() {
 # attached. This is also what keeps sshd from needing to create interfaces itself.
 # ---------------------------------------------------------------------------
 tun_up() {
-	local num="$1" vm_ip="$2" peer_ip="$3" subnet="$4" user="$5"
+	local num="$1" vm_ip="$2" peer_ip="$3" subnet="$4" user="$5" prefix="${6:-}"
 	local dev="tun$num"
 
 	modprobe tun 2>/dev/null || true
@@ -115,7 +115,15 @@ tun_up() {
 	ip tuntap add dev "$dev" mode tun user "$user" || die "could not create $dev"
 	log "created $dev, owned by $user"
 
-	ip addr add "$vm_ip" peer "$peer_ip" dev "$dev" || die "could not address $dev"
+	# With a prefix, the VM end sits in a network that contains the lab's users, the way a
+	# VPN's client pool is part of a bank's internal network — and that network is what the
+	# IDS takes as local (see TUN_VM_PREFIX in lab-config.sh). The peer is inside it, so the
+	# route to the lab's end comes with the address.
+	if [[ -n "$prefix" ]]; then
+		ip addr add "$vm_ip/$prefix" dev "$dev" || die "could not address $dev"
+	else
+		ip addr add "$vm_ip" peer "$peer_ip" dev "$dev" || die "could not address $dev"
+	fi
 	ip link set "$dev" up || die "could not bring $dev up"
 
 	# The return path. Replies to the simulated users are generated here, so without this
@@ -123,7 +131,7 @@ tun_up() {
 	# every connection time out while the VM's logs showed the requests arriving.
 	ip route replace "$subnet" dev "$dev" || die "could not route $subnet via $dev"
 
-	log "$dev up: $vm_ip peer $peer_ip, $subnet routed via $dev"
+	log "$dev up: $vm_ip${prefix:+/$prefix} (lab end $peer_ip), $subnet routed via $dev"
 }
 
 tun_down() {
@@ -338,39 +346,23 @@ listener_down() {
 # It reuses the standing redis that slips-warm.sh keeps, so it inherits the warm
 # threat-intel cache rather than downloading ~45 feeds again.
 slips_up() {
-	local dev="$1" user="$2" subdir="$3" clients="${4:-}"
+	local dev="$1" user="$2" subdir="$3"
 	local img="${SLIPS_IMG:-stratosphereips/slips:latest}"
-	local home outdir conf
+	local home outdir
 	home="$(_user_home "$user")" || die "no home for $user"
 	outdir="$home/$subdir"
 	mkdir -p "$outdir"
 
-	# Slips' own configuration, taken from the image, with the lab's users declared as the
-	# local network. Left empty, Slips infers the local network from the interface it
-	# watches — here the tunnel device, whose own network is the tunnel's /30 — and every
-	# lab user, benign or not, becomes "a private IP outside the used local network". That
-	# one finding put all nine benign users over the alert threshold in every tunnel window.
-	# Beside the output directory, not in it: Slips clears its output directory when it
-	# starts, so a file there is deleted before Slips can read it. Slips copies the
-	# configuration it ran with into its own metadata/, so it still travels with the evidence.
-	conf="$outdir.slips.yaml"
-	docker run --rm "$img" cat config/slips.yaml > "$conf" 2>/dev/null && [[ -s "$conf" ]] \
-		|| die "could not read Slips' default configuration from $img"
-	if [[ -n "$clients" ]]; then
-		sed -i -E "s|^([[:space:]]*client_ips[[:space:]]*:).*|\1 [$clients]|" "$conf"
-		grep -qE "^[[:space:]]*client_ips[[:space:]]*:[[:space:]]*\[$clients\]" "$conf" \
-			|| die "could not set client_ips in Slips' configuration"
-	fi
-
 	bash "$REPO/PDE Sources/Remote/slips-warm.sh" redis >/dev/null || die "the Slips redis is not up"
 
+	# Slips' own configuration, unchanged. Its local network is the watched interface's own
+	# network, which is why the tunnel's VM end carries a prefix (TUN_VM_PREFIX).
 	docker rm -f pde-slips >/dev/null 2>&1 || true
 	docker run -d --net=host --cap-add=NET_ADMIN --name pde-slips \
-		-v "$outdir":/output -v "$conf":/config/lab-slips.yaml:ro "$img" \
-		./slips.py -c /config/lab-slips.yaml -i "$dev" -o /output >/dev/null \
+		-v "$outdir":/output "$img" ./slips.py -i "$dev" -o /output >/dev/null \
 		|| die "could not start Slips on $dev"
 	printf '%s\n' "$outdir" > /run/pde-slips-out
-	log "Slips starting on $dev, output $outdir, local network ${clients:-inferred}"
+	log "Slips starting on $dev, output $outdir"
 }
 
 # Nothing may be generated until this returns, or the window's traffic is simply missed.
@@ -422,9 +414,9 @@ status() {
 
 case "${1:-}" in
 	up)
-		[[ $# -eq 6 ]] || die "up <tunN> <vm_ip> <peer_ip> <lab_subnet> <user>"
+		[[ $# -eq 6 || $# -eq 7 ]] || die "up <tunN> <vm_ip> <peer_ip> <lab_subnet> <user> [prefix]"
 		sshd_permit_tunnel
-		tun_up "$2" "$3" "$4" "$5" "$6" ;;
+		tun_up "$2" "$3" "$4" "$5" "$6" "${7:-}" ;;
 	down)
 		[[ $# -eq 3 ]] || die "down <tunN> <lab_subnet>"
 		tun_down "$2" "$3" ;;
@@ -438,8 +430,8 @@ case "${1:-}" in
 		listener_up "$2" "$3" ;;
 	listener-down) listener_down ;;
 	slips-up)
-		[[ $# -eq 4 || $# -eq 5 ]] || die "slips-up <tun_dev> <user> <subdir> [client_cidr]"
-		slips_up "$2" "$3" "$4" "${5:-}" ;;
+		[[ $# -eq 4 ]] || die "slips-up <tun_dev> <user> <subdir>"
+		slips_up "$2" "$3" "$4" ;;
 	slips-ready)   slips_ready "${2:-240}" ;;
 	slips-outdir)  slips_outdir ;;
 	slips-down)    slips_down ;;

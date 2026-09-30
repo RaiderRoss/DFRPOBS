@@ -142,6 +142,14 @@ TUN_DEV="tun${TUN_NUM}"
 TUN_LOCAL_IP="${TUN_LOCAL_IP:-10.98.0.2}"     # this machine's end of the point-to-point link
 TUN_VM_IP="${TUN_VM_IP:-10.98.0.1}"           # the VM's end — and the address the users target
 
+# The VM end's network: both ends of the tunnel AND the lab's users (10.98.0.0 - 10.99.255.255).
+# A bank's remote-access VPN gives its clients addresses from a pool that is part of the
+# internal network, and this models that. It is also what the IDS reads as "local": Slips,
+# sniffing live, takes the local network from the interface's own address and netmask, and
+# with a point-to-point /32 every user — benign or not — was "a private IP outside the used
+# local network", which alone put all nine benign users over its alert threshold.
+TUN_VM_PREFIX="${TUN_VM_PREFIX:-15}"
+
 # Fineract is a Docker-published port, so packets to it are rewritten in nat/PREROUTING and
 # cross FORWARD, never INPUT: the VM's ufw would not log the one connection that matters
 # most. A plain TCP relay on the host terminates the connection on the tun address first —
