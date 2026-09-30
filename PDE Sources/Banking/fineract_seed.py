@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
 Prepares a Fineract instance for the PDE banking source. Idempotent: everything is found
-by a stable key (username, product name, client externalId) before it is created, so this
-is safe to run again — after a database wipe it simply rebuilds.
+by a stable key (username, role name, product name, client externalId) before it is
+created, so this is safe to run again — after a database wipe it simply rebuilds.
 
 What it sets up, and why:
   - external event types      all 131 ship disabled; with none on, Fineract publishes
                               nothing and the events source would see an empty window
-  - two staff users           a teller, whose deposits and withdrawals are the benign
-                              baseline, and a loan officer, whose credential the scenario
-                              treats as phished. Distinct users are what let the bank's
-                              audit trail attribute the fraud to a login.
-  - a savings and a loan product
-  - benign customers          each with an active, funded savings account, so the teller
-                              has real accounts to transact against inside a window
+  - one member of staff       the loan officer, whose credential the scenario treats as
+                              phished. Stock "Super user" role: see Banking/README.md
+  - a "PDE Customer" role     what a customer's login may do: read their accounts, move
+                              money, apply for a loan. Nothing administrative
+  - eight customers           each a client with a funded savings account AND a login of
+                              their own, so the bank's audit trail names every customer
+                              individually rather than one shared account
+  - the mule                  a ninth customer, with a small account and a login, who
+                              applies for the fraudulent loan
+
+Why logins on the standard API rather than Fineract's self-service API: this build
+(1.16.0-SNAPSHOT, fd8fc89) does not have one. The self-service module has been removed —
+no /self endpoints, no classes in any module jar — and only its "Self Service User" role
+survives in the database. The standard API does not stop a customer's login from reading
+or moving another customer's money; a real bank's online-banking layer would. Stated as a
+limitation in Banking/README.md.
 
 Writes the IDs and credentials the traffic generator needs to --out (gitignored). The
 credentials are fixed sandbox values, chosen to satisfy the password policy this Fineract
@@ -33,7 +42,8 @@ from zoneinfo import ZoneInfo
 from fineract_api import DATE_FORMAT, Fineract, FineractError, fineract_date
 
 # Only types that exist on the pinned image (fd8fc8929) are listed; anything this build
-# does not know is reported, not silently skipped.
+# does not know is reported, not silently skipped. An account transfer raises a withdrawal
+# on the payer's account and a deposit on the payee's, so the savings pair covers transfers.
 EVENT_TYPES = [
     "ClientCreateBusinessEvent",
     "ClientActivateBusinessEvent",
@@ -52,26 +62,48 @@ EVENT_TYPES = [
 SUPER_USER_ROLE = 1  # the stock "Super user" role; see Banking/README.md on least privilege
 
 STAFF = {
-    "teller": {"username": "pde_teller", "password": "Tlr#Pde2026bank",
-               "firstname": "Thandi", "lastname": "Mokoena"},
     "officer": {"username": "pde_officer", "password": "Ofc#Pde2026loan",
                 "firstname": "Sipho", "lastname": "Dlamini"},
 }
+
+# What a customer's login may do, and nothing else. Reads of their own accounts, a transfer
+# to another account, and a loan application — what an online-banking customer does.
+# Approving and disbursing a loan are deliberately absent: only staff can do those, which
+# is why the fraud needs the phished officer.
+CUSTOMER_ROLE = "PDE Customer"
+CUSTOMER_PERMISSIONS = [
+    "READ_CLIENT", "READ_SAVINGSACCOUNT", "READ_SAVINGSPRODUCT",
+    "READ_ACCOUNTTRANSFER", "CREATE_ACCOUNTTRANSFER",
+    "READ_LOAN", "READ_LOANPRODUCT", "CREATE_LOAN",
+]
 
 SAVINGS_PRODUCT = "PDE Everyday Savings"
 LOAN_PRODUCT = "PDE Personal Loan"
 PAYMENT_TYPE = "PDE Cash"
 
-# Fictional customers. Their savings accounts are what the teller transacts against.
+# Fictional customers, each with a login of their own.
 CUSTOMERS = [
     ("Lerato", "Nkosi"), ("Johan", "van Wyk"), ("Ayesha", "Patel"), ("Kagiso", "Molefe"),
     ("Naledi", "Khumalo"), ("Pieter", "Botha"), ("Zanele", "Mthembu"), ("Ravi", "Naidoo"),
 ]
 OPENING_BALANCE = 25000
 
+# The mule: a customer like the others, with a small account, whose part in the fraud is to
+# apply for the loan. Not one of the names earlier versions gave a per-run mule, so an older
+# window's mule cannot be mistaken for this one.
+MULE = ("Lwazi", "Ndlovu")
+MULE_EXTERNAL_ID = "pde-mule"
+MULE_OPENING_BALANCE = 500
+
 
 def log(msg):
     print("  " + msg, file=sys.stderr)
+
+
+def login_for(first, last):
+    """A customer's sandbox login. The password shape satisfies this build's policy and has
+    no repeated adjacent characters for any of the names above."""
+    return ("%s.%s" % (first, last)).lower().replace(" ", ""), "Pde#%s2026bk" % first
 
 
 def enable_events(api):
@@ -91,19 +123,38 @@ def enable_events(api):
     return wanted
 
 
-def ensure_user(api, role, spec):
-    users = api.call("GET", "/users", what="list users")
-    found = next((u for u in users if u.get("username") == spec["username"]), None)
+def ensure_customer_role(api):
+    roles = api.call("GET", "/roles", what="list roles")
+    found = next((r for r in roles if r.get("name") == CUSTOMER_ROLE), None)
     if found:
-        log("user %s exists (id %s)" % (spec["username"], found["id"]))
+        role_id = found["id"]
+    else:
+        res = api.call("POST", "/roles", {
+            "name": CUSTOMER_ROLE,
+            "description": "PDE lab: an online-banking customer. Own accounts, transfers, loan applications.",
+        }, what="create customer role")
+        role_id = res["resourceId"]
+        log("created role %s (id %s)" % (CUSTOMER_ROLE, role_id))
+    # Set every time rather than only on creation: it is what makes the role mean what this
+    # file says it means, even if someone has edited it in the UI since.
+    api.call("PUT", "/roles/%s/permissions" % role_id,
+             {"permissions": {p: True for p in CUSTOMER_PERMISSIONS}},
+             what="set customer role permissions")
+    return role_id
+
+
+def ensure_user(api, username, password, first, last, role_id):
+    users = api.call("GET", "/users", what="list users")
+    found = next((u for u in users if u.get("username") == username), None)
+    if found:
         return found["id"]
     res = api.call("POST", "/users", {
-        "username": spec["username"], "firstname": spec["firstname"], "lastname": spec["lastname"],
-        "email": "%s@pde.invalid" % spec["username"], "officeId": 1, "roles": [SUPER_USER_ROLE],
+        "username": username, "firstname": first, "lastname": last,
+        "email": "%s@pde.invalid" % username, "officeId": 1, "roles": [role_id],
         "sendPasswordToEmail": False, "passwordNeverExpires": True,
-        "password": spec["password"], "repeatPassword": spec["password"],
-    }, what="create user %s" % spec["username"])
-    log("created %s user %s (id %s)" % (role, spec["username"], res["resourceId"]))
+        "password": password, "repeatPassword": password,
+    }, what="create user %s" % username)
+    log("created user %s (id %s)" % (username, res["resourceId"]))
     return res["resourceId"]
 
 
@@ -168,8 +219,8 @@ def find_client(api, external_id):
     return None
 
 
-def ensure_customer(api, idx, first, last, product_id, payment_type, today):
-    ext = "pde-benign-%02d" % idx
+def ensure_customer(api, ext, first, last, product_id, payment_type, today, balance_floor):
+    """A client with one active savings account holding at least balance_floor."""
     dated = {"dateFormat": DATE_FORMAT, "locale": "en"}
     client_id = find_client(api, ext)
     if client_id is None:
@@ -192,22 +243,22 @@ def ensure_customer(api, idx, first, last, product_id, payment_type, today):
         api.call("POST", "/savingsaccounts/%s?command=activate" % sid, dict(dated, activatedOnDate=today),
                  what="activate savings")
 
-    # Funded by balance rather than by "just opened": a run that failed between opening
-    # an account and funding it must not leave a customer who can never withdraw.
+    # Topped up by balance rather than only on opening: customers pay each other, so across
+    # many windows some accounts drift down, and a re-seed restores them.
     balance = (api.call("GET", "/savingsaccounts/%s" % sid, what="read balance")
                .get("summary", {}).get("accountBalance", 0)) or 0
-    if balance < OPENING_BALANCE:
+    if balance < balance_floor:
         api.call("POST", "/savingsaccounts/%s/transactions?command=deposit" % sid,
-                 dict(dated, transactionDate=today, transactionAmount=OPENING_BALANCE - balance,
+                 dict(dated, transactionDate=today, transactionAmount=balance_floor - balance,
                       paymentTypeId=payment_type), what="fund savings")
     return {"external_id": ext, "client_id": client_id, "savings_id": sid, "name": "%s %s" % (first, last)}
 
 
-def check_login(base, tenant, spec):
-    """A user who cannot authenticate would make every command of theirs a 401 mid-window,
-    which reads like an attack failing rather than a setup fault. Checked here instead."""
-    api = Fineract(base, spec["username"], spec["password"], tenant)
-    status, body, _ = api.request("GET", "/offices")
+def check_login(base, tenant, username, password, path):
+    """A user who cannot authenticate would make every request of theirs a 401 mid-window,
+    which reads like an attack failing rather than a setup fault. Checked here instead,
+    against something each user is actually allowed to read."""
+    status, _, _ = Fineract(base, username, password, tenant).request("GET", path)
     return status
 
 
@@ -226,34 +277,59 @@ def main():
     admin = Fineract(args.url, args.admin_user, args.admin_password, args.tenant)
     try:
         events = enable_events(admin)
-        user_ids = {role: ensure_user(admin, role, spec) for role, spec in STAFF.items()}
+        staff_ids = {role: ensure_user(admin, s["username"], s["password"], s["firstname"], s["lastname"],
+                                       SUPER_USER_ROLE) for role, s in STAFF.items()}
+        customer_role = ensure_customer_role(admin)
         savings_product = ensure_savings_product(admin)
         loan_product = ensure_loan_product(admin)
         payment_type = ensure_payment_type(admin)
-        customers = [ensure_customer(admin, i + 1, f, l, savings_product, payment_type, today)
-                     for i, (f, l) in enumerate(CUSTOMERS)]
+
+        customers = []
+        for i, (first, last) in enumerate(CUSTOMERS):
+            c = ensure_customer(admin, "pde-benign-%02d" % (i + 1), first, last,
+                                savings_product, payment_type, today, OPENING_BALANCE)
+            username, password = login_for(first, last)
+            c.update(username=username, password=password,
+                     user_id=ensure_user(admin, username, password, first, last, customer_role))
+            customers.append(c)
+
+        mule = ensure_customer(admin, MULE_EXTERNAL_ID, MULE[0], MULE[1],
+                               savings_product, payment_type, today, MULE_OPENING_BALANCE)
+        username, password = login_for(*MULE)
+        mule.update(username=username, password=password,
+                    user_id=ensure_user(admin, username, password, MULE[0], MULE[1], customer_role))
     except FineractError as e:
         sys.exit("seeding failed: %s" % e)
     except OSError as e:
         sys.exit("cannot reach Fineract at %s: %s — is the admin tunnel up? (./vm.sh tunnel up)" % (args.url, e))
-    log("customers ready: %d, each with a funded savings account" % len(customers))
+    log("customers ready: %d, each with a funded savings account and a login; mule %s ready"
+        % (len(customers), mule["username"]))
 
-    logins = {role: check_login(args.url, args.tenant, spec) for role, spec in STAFF.items()}
-    for role, status in logins.items():
-        if status != 200:
-            sys.exit("the %s user cannot log in (HTTP %s)" % (role, status))
-    log("both staff users authenticate")
+    failures = []
+    for role, s in STAFF.items():
+        st = check_login(args.url, args.tenant, s["username"], s["password"], "/offices")
+        if st != 200:
+            failures.append("%s (%s): HTTP %s" % (s["username"], role, st))
+    for c in customers + [mule]:
+        st = check_login(args.url, args.tenant, c["username"], c["password"], "/savingsaccounts/%s" % c["savings_id"])
+        if st != 200:
+            failures.append("%s: HTTP %s" % (c["username"], st))
+    if failures:
+        sys.exit("these logins cannot read what they should:\n  " + "\n  ".join(failures))
+    log("all %d logins authenticate" % (len(STAFF) + len(customers) + 1))
 
     seed = {
         "seeded_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "tenant": args.tenant,
         "tenant_tz": args.tenant_tz,
         "event_types_enabled": events,
-        "staff": {role: dict(spec, user_id=user_ids[role]) for role, spec in STAFF.items()},
+        "staff": {role: dict(s, user_id=staff_ids[role]) for role, s in STAFF.items()},
+        "customer_role": {"name": CUSTOMER_ROLE, "id": customer_role, "permissions": CUSTOMER_PERMISSIONS},
         "savings_product_id": savings_product,
         "loan_product_id": loan_product,
         "payment_type_id": payment_type,
         "customers": customers,
+        "mule": mule,
     }
     with open(args.out, "w") as fh:
         json.dump(seed, fh, indent=2)

@@ -881,8 +881,10 @@ BANK_COLLECT_PID=""
 BANK_SUMMARY=""
 
 if [[ $WITH_BANKING -eq 1 ]]; then
-	BANK_EXPECT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["executed_ok"])' "$BANK_GT")
-	log "collecting the bank's evidence on $VM_NAME: events and audit trail for ${BANK_EXPECT} operations"
+	# The events collector waits until at least this many in-window events have arrived. Not
+	# the operation count: a balance check publishes nothing and a transfer publishes two.
+	BANK_EXPECT=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1])); print(t.get("expected_events_total", t["executed_ok"]))' "$BANK_GT")
+	log "collecting the bank's evidence on $VM_NAME: the audit trail, and waiting for ${BANK_EXPECT} events"
 	banking_collect "$STAMP" "$BANK_OFFSETS" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$BANK_EXPECT" "$RUN_DIR" \
 		> "$RUN_DIR/.banking-collect.log" 2>&1 &
 	BANK_COLLECT_PID=$!
@@ -1103,7 +1105,17 @@ if E.get("G_BANK_MANIFEST"):
         "by_maker": col["banking-audit"]["by_maker"], "completeness": comp["banking-audit"],
     })
     sc = bm["scenario"]
-    if sc.get("attacker_ip") and sc.get("attacker_used_login"):
+    if sc.get("mule_ip") and sc.get("attacker_used_login"):
+        correlation.append(
+            "The banking items record what the same people did at the bank, each from their own address "
+            "and with their own login, reaching it at %s:%s. The customers appear in the firewall and IDS "
+            "items by address and in the audit trail by login. The mule (%s, login %s) applied for the "
+            "loan; the attacker (%s) then approved and disbursed it with the loan officer's phished login "
+            "(%s). The fraud therefore spans two addresses and two logins: the audit trail joins them by "
+            "the loan's id, and the network items place each at its address at the same moments."
+            % (E["G_TARGET_IP"], E["G_BANK_PORT"], sc["mule_ip"], sc["mule_login"],
+               sc["attacker_ip"], sc["attacker_used_login"]))
+    elif sc.get("attacker_ip") and sc.get("attacker_used_login"):
         correlation.append(
             "The banking items record what the same users did at the bank. They reached it from their own "
             "addresses through the lab's tunnel on %s:%s, so the attacker (%s) appears in the firewall log "

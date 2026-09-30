@@ -50,9 +50,20 @@ banking_preflight() {
 
 # The topic's end offsets right now, as the JSON collect_window.py's `offsets` prints.
 # Taken before the window opens; everything published after it is at or beyond these.
+#
+# Retried, because the first capture after `lab.sh up` lands on a loaded VM: Slips is still
+# starting its 27 processes, the load average was measured at 5.5 on four vCPUs, and one SSH
+# round trip in that spike can simply drop. Twice that failed a capture that worked when run
+# again seconds later. A read of offsets is safe to repeat.
 banking_offsets() {
-	local out
-	out=$(vm_ssh "$(_bank_compose) run --rm -T pde-collector offsets 2>/dev/null" </dev/null) || return 1
+	local out attempt
+	for attempt in 1 2 3; do
+		out=$(vm_ssh "$(_bank_compose) run --rm -T pde-collector offsets 2>/dev/null" </dev/null) \
+			&& grep -q '^{' <<< "$out" && break
+		out=""
+		[[ $attempt -lt 3 ]] && { echo "  offsets not read (attempt $attempt); retrying" >&2; sleep 5; }
+	done
+	[[ -n "$out" ]] || return 1
 	# compose may print notices; the result is the one line that is a JSON object.
 	grep -m1 '^{' <<< "$out"
 }

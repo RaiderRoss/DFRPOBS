@@ -427,13 +427,17 @@ if h:
 				--profile "$BANK_PROFILE" --seed "$SEED" 2>&1 \
 			| python3 -c 'import json,sys
 d = json.load(sys.stdin)
-print("    %-20s %s  %s" % ("benign operations", d["benign_operations"],
-      ", ".join("%s %s" % kv for kv in sorted(d["benign_by_kind"].items()))))
+cust = d["customers"]
+octets = sorted(int(ip.rsplit(".", 1)[1]) for ip in cust)
+print("    %-20s %d, at .%d-.%d, each with their own login" % ("customers", len(cust), octets[0], octets[-1]))
+print("    %-20s %s  %s" % ("customer actions", d["customer_actions"],
+      ", ".join("%s %s" % kv for kv in sorted(d["customer_actions_by_kind"].items()))))
+print("    %-20s %s as %s" % ("mule", d["mule"]["ip"], d["mule"]["login"]))
 c = d.get("fraud_chain")
 if c:
-    print("    %-20s %s, logged in as %s, loan of %s" % ("fraud", c["attacker"], c["as_user"], c["principal"]))
+    print("    %-20s %s as %s (phished), loan of %s" % ("attacker", d["attacker"]["ip"], d["attacker"]["login"], c["principal"]))
     for s in c["steps"]:
-        print("      %5.1fs  %s" % (s["at_s"], s["kind"]))'
+        print("      %5.1fs  %-14s by %-8s from %s" % (s["at_s"], s["kind"], s["by"], s["from"]))'
 		else
 			dim "    the bank has not been seeded — sources screen, option s"
 		fi
