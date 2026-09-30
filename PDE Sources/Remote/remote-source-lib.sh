@@ -19,8 +19,17 @@
 
 REMOTE_READER='PDE Sources/Remote/read-window.sh'
 
-# Where the sources write on the VM.
-VM_UFW_LOG="${VM_UFW_LOG:-/var/log/ufw.log}"
+# Where the firewall's record actually is on the VM.
+#
+# Not /var/log/ufw.log. Measured on the first tunnel-mode capture: the netfilter LOG rules
+# in ufw-user-input fired 628 times for the window, `journalctl -k` held those lines, and
+# /var/log/ufw.log held none of them — 0 occurrences of SRC=10.99.0 in the whole 17MB file,
+# while the rules' own packet counters kept climbing. rsyslog sits in the path for the file
+# and is not delivering them on this host.
+#
+# The journal is where the kernel's record is, so that is what is read, bounded by a cursor
+# instead of a byte offset. read-window.sh understands both.
+VM_UFW_LOG="${VM_UFW_LOG:-journal}"
 
 remote_source_preflight() {
 	local out
@@ -49,8 +58,10 @@ remote_source_preflight() {
 # Byte size of a VM-side file right now, for use as a later read boundary.
 #   remote_offset <path>     echoes a number, 0 if the file is not there yet
 remote_offset() {
+	# Either a byte count (a file) or cursor:<c> (the journal). Passed straight back to
+	# read-window.sh, which decides what it means, so this side never has to know.
 	vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/$REMOTE_READER\" offset '$1'" </dev/null 2>/dev/null \
-		| grep -m1 -E '^[0-9]+$' || echo 0
+		| grep -m1 -E '^(cursor:|[0-9]+$)' || echo 0
 }
 
 # Brings one window's byte range home.

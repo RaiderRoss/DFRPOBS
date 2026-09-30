@@ -288,9 +288,22 @@ if [[ "$ATTACK_PROFILE" == "guaranteed-alert" && $DRY_RUN -eq 0 ]]; then
 		if [[ -z "$(lab_get LAB_ALERT_PORTS "")" ]]; then
 			die "the running lab predates the guaranteed-alert profile; restart it ('./lab.sh down', then up)"
 		fi
-		LAB_LISTENER_PID=$(lab_get LAB_LISTENER_PID "")
-		if [[ -z "$LAB_LISTENER_PID" || ! -d "/proc/$LAB_LISTENER_PID" ]]; then
-			die "the lab's alert listener is not running; restart the lab ('./lab.sh down', then up)"
+		if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+			# The listener is on the VM in this mode, bound to the tunnel address, so there is
+			# no local pid to look for. Checked by connecting to the port the way a simulated
+			# user will, which covers the listener, the VM's permit rule and the tunnel at
+			# once — a stronger check than a pid, on either path.
+			_alert_port="${ALERT_PORTS%%,*}"
+			# From INSIDE the namespace. The VM permits 10.99.0.0/24 and denies everything
+			# else, so a probe sourced from this host's own tunnel address is correctly
+			# refused, and would report a healthy lab as broken.
+			ip netns exec "$LAB_NS" bash -c "exec 3<>/dev/tcp/$TUN_VM_IP/$_alert_port" 2>/dev/null \
+				|| die "nothing answers $TUN_VM_IP:$_alert_port on $VM_NAME; restart the lab ('./lab.sh down', then up)"
+		else
+			LAB_LISTENER_PID=$(lab_get LAB_LISTENER_PID "")
+			if [[ -z "$LAB_LISTENER_PID" || ! -d "/proc/$LAB_LISTENER_PID" ]]; then
+				die "the lab's alert listener is not running; restart the lab ('./lab.sh down', then up)"
+			fi
 		fi
 	fi
 	# An alert is the IDS's to raise. Without it the traffic is still sent — permitted
@@ -558,7 +571,11 @@ STAMP=$(date -u -d "@$WINDOW_START_EPOCH" +%Y%m%d%H%M%S)
 if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	SRC_LOG="$VM_UFW_LOG"
 	LOG_OFFSET=$(remote_offset "$VM_UFW_LOG")
-	FW_LOG_DESC="$VM_UFW_LOG on $VM_NAME"
+	if [[ "$VM_UFW_LOG" == "journal" ]]; then
+		FW_LOG_DESC="the kernel journal on $VM_NAME (journalctl -k), lines matching [UFW"
+	else
+		FW_LOG_DESC="$VM_UFW_LOG on $VM_NAME"
+	fi
 	log "capturing from $SRC_LOG on $VM_NAME at byte offset $LOG_OFFSET"
 else
 	SRC_LOG="$UFW_LOG"

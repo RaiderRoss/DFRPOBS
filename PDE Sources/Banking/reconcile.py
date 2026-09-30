@@ -25,11 +25,20 @@ import json
 import statistics
 import sys
 from collections import Counter
+import re
 from datetime import datetime, timezone
 
 
 def parse(ts):
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    ts = ts.replace("Z", "+00:00")
+    # Postgres renders fractional seconds with as many digits as it has, and
+    # datetime.fromisoformat before 3.11 accepts only 3 or 6. A real window died on
+    # '2026-09-30T16:39:16.61888+00:00' — five digits. Padded to six rather than
+    # truncated, so the instant is unchanged.
+    m = re.match(r"^(.*[.])(\d{1,6})([+-]\d{2}:?\d{2}|)$", ts)
+    if m:
+        ts = m.group(1) + m.group(2).ljust(6, "0") + m.group(3)
+    dt = datetime.fromisoformat(ts)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 

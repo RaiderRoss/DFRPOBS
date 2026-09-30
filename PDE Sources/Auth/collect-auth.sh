@@ -106,7 +106,11 @@ cmd_collect() {
 			fi ;;
 		*) die "unrecognised offset '$offset'" ;;
 	esac
-	window_lines=$(grep -c . "$win" 2>/dev/null || echo 0)
+	# `|| true`, never `|| echo 0`: grep -c prints "0" AND exits 1 when nothing
+	# matches, so a fallback echo appends a second 0 and the value arrives as "0\n0".
+	# simulate-firewall.sh documents this trap; this walked into it.
+	window_lines=$(grep -c . "$win" 2>/dev/null || true)
+	window_lines=${window_lines:-0}
 
 	# --- the session the window arrived in --------------------------------
 	# Collected whatever its age, because the login that authorised this window is the
@@ -124,7 +128,11 @@ cmd_collect() {
 			esac
 		done >> "$sess"
 	fi
-	session_lines=$(grep -c . "$sess" 2>/dev/null || echo 0)
+	# `|| true`, never `|| echo 0`: grep -c prints "0" AND exits 1 when nothing
+	# matches, so a fallback echo appends a second 0 and the value arrives as "0\n0".
+	# simulate-firewall.sh documents this trap; this walked into it.
+	session_lines=$(grep -c . "$sess" 2>/dev/null || true)
+	session_lines=${session_lines:-0}
 
 	# The evidence file: the session's establishing lines first, then the window's, each
 	# under a marker. The markers are the collector's, not the source's, and are commented
