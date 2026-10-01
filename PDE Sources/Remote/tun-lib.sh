@@ -150,33 +150,44 @@ tun_session_start() {
 	# ExitOnForwardFailure makes a refused tunnel request kill the session instead of
 	# leaving an SSH connection up with no device behind it — the state that otherwise
 	# looks like a routing problem and is really PermitTunnel being off on the VM.
-	setsid "${VM_GCLOUD[@]}" compute ssh "$VM_USER@$VM_NAME" --zone "$VM_ZONE" \
-		--tunnel-through-iap --quiet \
-		-- -w "$spec" -o Tunnel=point-to-point -N -T \
-		-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-		-o LogLevel=ERROR </dev/null >"$log" 2>&1 &
-	local pid=$!
-	printf '%s\n%s\n' "$pid" "-w $spec" > "$pidfile"
+	local pid i attempt
+	for ((attempt = 1; ; attempt++)); do
+		setsid "${VM_GCLOUD[@]}" compute ssh "$VM_USER@$VM_NAME" --zone "$VM_ZONE" \
+			--tunnel-through-iap --quiet \
+			-- -w "$spec" -o Tunnel=point-to-point -N -T \
+			-o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+			-o LogLevel=ERROR </dev/null >"$log" 2>&1 &
+		pid=$!
+		printf '%s\n%s\n' "$pid" "-w $spec" > "$pidfile"
 
-	local i
-	for ((i = 0; i < 90; i++)); do
-		if ping -c1 -W1 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1; then
-			return 0
-		fi
-		if ! kill -0 "$pid" 2>/dev/null; then
-			echo "the tunnel device session exited; its output:" >&2
-			sed 's/^/    /' "$log" >&2
-			# The most common cause by far, and it is invisible in ssh's own message.
-			grep -qiE 'tunnel|administratively prohibited' "$log" 2>/dev/null \
-				&& echo "    hint: PermitTunnel may be off on the VM — Remote/vm-net.sh up sets it" >&2
-			rm -f "$pidfile"
+		for ((i = 0; i < 90; i++)); do
+			if ping -c1 -W1 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1; then
+				return 0
+			fi
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 1
+		done
+		if ((i == 90)); then
+			echo "the tunnel device came up but $TUN_VM_IP never answered within 90s" >&2
+			tun_session_stop
 			return 1
 		fi
-		sleep 1
+
+		# The session exited. If it never reached IAP, nothing was attached; as for vm_ssh,
+		# that is a dropped route to Google and the session is simply started again.
+		if vm_iap_never_connected "$log" && ((attempt < VM_SSH_ATTEMPTS)); then
+			echo "IAP could not be reached; the tunnel session did not open. Retrying ($attempt of $VM_SSH_ATTEMPTS)" >&2
+			sleep "$VM_SSH_RETRY_PAUSE"
+			continue
+		fi
+		echo "the tunnel device session exited; its output:" >&2
+		sed 's/^/    /' "$log" >&2
+		# The most common cause by far, and it is invisible in ssh's own message.
+		grep -qiE 'tunnel|administratively prohibited' "$log" 2>/dev/null \
+			&& echo "    hint: PermitTunnel may be off on the VM — Remote/vm-net.sh up sets it" >&2
+		rm -f "$pidfile"
+		return 1
 	done
-	echo "the tunnel device came up but $TUN_VM_IP never answered within 90s" >&2
-	tun_session_stop
-	return 1
 }
 
 tun_session_stop() {

@@ -69,12 +69,39 @@ vm_status() {
 		--format='value(status)' 2>/dev/null
 }
 
+# IAP sometimes cannot be reached for a second or two — this machine's route to Google drops
+# and gcloud reports "Error while connecting ... Network is unreachable". When the connection
+# never opened, nothing ran on the VM, so the call is made again. Only then: a failure after
+# the connection opened may have done part of its work, and is the caller's to handle. And
+# only for a call with no input, which a failed attempt may already have consumed.
+VM_SSH_ATTEMPTS="${VM_SSH_ATTEMPTS:-4}"
+VM_SSH_RETRY_PAUSE="${VM_SSH_RETRY_PAUSE:-3}"
+
+# True when gcloud's output says the IAP connection was never established.
+vm_iap_never_connected() {
+	grep -q 'Error while connecting' "$1" 2>/dev/null
+}
+
 # Runs one shell command on the VM. stdin and stdout pass straight through and are
 # binary-safe (-T: no pseudo-terminal), which is how files move in both directions:
 #   vm_ssh 'cat > /tmp/x' < local        vm_ssh 'cat /tmp/x' > local
 vm_ssh() {
-	vm_gcloud compute ssh "$VM_USER@$VM_NAME" --zone "$VM_ZONE" --tunnel-through-iap --quiet \
-		--command "$1" -- -T -o LogLevel=ERROR
+	local err rc attempt
+	err=$(mktemp)
+	for ((attempt = 1; ; attempt++)); do
+		rc=0
+		vm_gcloud compute ssh "$VM_USER@$VM_NAME" --zone "$VM_ZONE" --tunnel-through-iap --quiet \
+			--command "$1" -- -T -o LogLevel=ERROR 2>"$err" || rc=$?
+		if ((rc != 0 && attempt < VM_SSH_ATTEMPTS)) && vm_iap_never_connected "$err" \
+			&& [[ /dev/stdin -ef /dev/null ]]; then
+			echo "IAP could not be reached; the command did not run. Retrying ($attempt of $VM_SSH_ATTEMPTS)" >&2
+			sleep "$VM_SSH_RETRY_PAUSE"
+			continue
+		fi
+		cat "$err" >&2
+		rm -f "$err"
+		return "$rc"
+	done
 }
 
 vm_reachable() {
