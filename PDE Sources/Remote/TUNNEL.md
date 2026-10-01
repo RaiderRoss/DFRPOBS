@@ -276,7 +276,9 @@ Worth keeping, because each was silent rather than loud:
   again. One such drop during setup or collection cost a whole window — five in one batch.
   When the connection never opened nothing ran on the VM, so `vm_ssh` and the tunnel-device
   session now retry it (four attempts); a call that has input, or that failed after
-  connecting, is still not retried.
+  connecting, is still not retried. The message cannot tell those apart — a reconnect
+  mid-session raises the same ones — so the test is where gcloud's traceback places the
+  failure: in `InitiateConnection`, the connection's first opening.
 
 ## Still to do
 

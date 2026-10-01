@@ -70,16 +70,20 @@ vm_status() {
 }
 
 # IAP sometimes cannot be reached for a second or two — this machine's route to Google drops
-# and gcloud reports "Error while connecting ... Network is unreachable". When the connection
-# never opened, nothing ran on the VM, so the call is made again. Only then: a failure after
-# the connection opened may have done part of its work, and is the caller's to handle. And
-# only for a call with no input, which a failed attempt may already have consumed.
+# and gcloud reports "Error while connecting ... Network is unreachable", or "Unexpected error
+# while connecting". When the connection never opened, nothing ran on the VM, so the call is
+# made again. Only then: a failure after the connection opened may have done part of its
+# work, and is the caller's to handle. And only for a call with no input, which a failed
+# attempt may already have consumed.
 VM_SSH_ATTEMPTS="${VM_SSH_ATTEMPTS:-4}"
 VM_SSH_RETRY_PAUSE="${VM_SSH_RETRY_PAUSE:-3}"
 
-# True when gcloud's output says the IAP connection was never established.
+# True when gcloud's output shows the IAP connection failing as it was first opened. A
+# reconnect mid-session raises the same errors after the command has started, so the message
+# alone is not enough: the traceback must place the failure in InitiateConnection.
 vm_iap_never_connected() {
-	grep -q 'Error while connecting' "$1" 2>/dev/null
+	grep -q 'ConnectionCreationError' "$1" 2>/dev/null \
+		&& grep -qE ', in InitiateConnection$' "$1" 2>/dev/null
 }
 
 # Runs one shell command on the VM. stdin and stdout pass straight through and are
