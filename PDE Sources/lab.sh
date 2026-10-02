@@ -11,7 +11,7 @@
 #  Captures are taken by Firewall/simulate-firewall.sh, which
 #  detects a running lab and uses it instead of building its own.
 #
-#    sudo ./lab.sh up --with-ids
+#    sudo ./lab.sh up --with-ids [--forward-alerts]
 #    sudo Firewall/simulate-firewall.sh          # window 1
 #    sudo Firewall/simulate-firewall.sh          # window 2
 #    sudo ./lab.sh down
@@ -28,6 +28,7 @@ source "$PDE_ROOT/lab-config.sh"
 IDS_LIB="$PDE_ROOT/IDS/slips-lib.sh"
 
 WITH_IDS=0
+FORWARD_ALERTS=0
 IDS_READY_TIMEOUT=240
 USERS=10
 
@@ -40,6 +41,8 @@ usage() {
 
 	Commands:
 	  up [--with-ids] [--users N]   build the lab and leave it running
+	     [--forward-alerts]         also send Slips' alerts to the Evidence Repository
+	                                as trigger events (needs --with-ids)
 	  down                          restore the firewall and tear everything down
 	  status                        report what is up, and detect a stale session
 
@@ -72,6 +75,10 @@ lab_up() {
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
 		slips_preflight || die "IDS preflight failed"
+	fi
+	if [[ $FORWARD_ALERTS -eq 1 ]]; then
+		[[ $WITH_IDS -eq 1 ]] || die "--forward-alerts needs --with-ids: there are no alerts without the IDS"
+		[[ -f "$SLIPS_FORWARDER" ]] || die "--forward-alerts needs $SLIPS_FORWARDER"
 	fi
 
 	modprobe xt_LOG 2>/dev/null || true
@@ -150,6 +157,18 @@ lab_up() {
 		slips_start "$VETH_HOST" "$slips_out" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
+
+		# Started once Slips is ready, so its first read finds the file Slips writes.
+		# Recorded straight away for the same reason as the listener: it runs outside the
+		# namespace, and `down` must be able to find it even if setup fails after this.
+		if [[ $FORWARD_ALERTS -eq 1 ]]; then
+			log "forwarding Slips alerts to the Evidence Repository (log: $LAB_DIR/slips-forwarder.log)"
+			local forwarder_pid
+			forwarder_pid=$(slips_forwarder_start "$slips_out" "$LAB_DIR/slips-forwarder.pid" 				"$LAB_DIR/slips-forwarder.log") || die "could not start the Slips forwarder"
+			cat >> "$LAB_STATE" <<-EOF
+			LAB_FORWARDER_PID="$forwarder_pid"
+			EOF
+		fi
 	fi
 
 	# --- firewall -------------------------------------------------------------
@@ -219,6 +238,14 @@ lab_down() {
 	alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
 	rm -f "$LAB_DIR/alert-listener.pid"
 
+	# Before Slips, so it is not left following a file nothing writes to any more.
+	local forwarder_pid; forwarder_pid=$(lab_get LAB_FORWARDER_PID "")
+	if [[ -n "$forwarder_pid" ]]; then
+		log "stopping the Slips forwarder"
+		slips_forwarder_stop "$forwarder_pid"
+		rm -f "$LAB_DIR/slips-forwarder.pid"
+	fi
+
 	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" ]]; then
 		# shellcheck source=IDS/slips-lib.sh
 		source "$IDS_LIB"
@@ -278,6 +305,12 @@ lab_status() {
 		else
 			echo "  listener    not running — guaranteed-alert connections will not complete"
 		fi
+		local fpid; fpid=$(lab_get LAB_FORWARDER_PID "")
+		if [[ -n "$fpid" && -d "/proc/$fpid" ]]; then
+			echo "  forwarder   Slips alerts -> Evidence Repository (pid $fpid)"
+		elif [[ -n "$fpid" ]]; then
+			echo "  forwarder   NOT running — alerts are not reaching the repository; see $LAB_DIR/slips-forwarder.log"
+		fi
 		echo "  restores to ENABLED=$(lab_get LAB_ORIG_ENABLED "?") LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL "?")"
 		return 0
 	fi
@@ -301,6 +334,7 @@ cmd="${1:-}"
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--with-ids) WITH_IDS=1; shift ;;
+		--forward-alerts) FORWARD_ALERTS=1; shift ;;
 		--users) USERS="$2"; shift 2 ;;
 		*) die "unknown option '$1'" ;;
 	esac

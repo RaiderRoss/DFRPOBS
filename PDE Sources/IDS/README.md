@@ -138,3 +138,37 @@ Slips decided to raise them.
 named `slips`/`slips-redis` and binds 6379 with `--net=host`; this uses `pde-slips` /
 `pde-slips-redis`. Preflight refuses to start if the lab console is up, rather than
 fighting over the port.
+
+## Forwarding alerts to the Evidence Repository
+
+`slips_forwarder.py` sends each Slips **alert** (not each piece of evidence) to the
+repository's `evidence-events` topic as a trigger event, where the correlation pass links
+it to every artifact whose coverage window overlaps it. This is the alert half of the
+integration; `submit-evidence.sh` is the evidence half.
+
+```bash
+sudo ./lab.sh up --with-ids --forward-alerts     # starts with the lab, stops on `down`
+```
+
+Or by hand, against any Slips output directory:
+
+```bash
+python3 IDS/slips_forwarder.py --slips-out output/sessions/ids-<lab-ts>            # follow it
+python3 IDS/slips_forwarder.py --slips-out output/sessions/ids-<lab-ts> --once --sink stdout   # preview
+```
+
+- **Sink.** `kafka-python-ng` if it is installed (to `localhost:19092`), otherwise
+  `rpk` inside the repository's `dfraas-redpanda` container, so nothing needs installing
+  when the compose stack runs on the same machine.
+- **sourceSystem must match the IDS's registered source key** (`pde-sim-slips-01` by
+  default, `DFRAAS_IDS_SOURCE_KEY` to change it). The repository finds the work group to
+  correlate within from that source, so an unregistered key leaves every alert `FAILED`.
+- **Correlation stays within one work group.** Register the firewall and the IDS under the
+  same work group, or the firewall's evidence will never be linked to an IDS alert.
+- **Delivery is at-least-once.** The event id is derived from the alert line, so a
+  re-sent alert is dropped by the repository's dedupe. The read position is kept in
+  `<slips-out>/forwarder.offset` and only moves once the broker has acknowledged.
+- **Each trigger event carries its evidence.** The payload keeps the alert line plus the
+  evidence lines Slips logged for that source since its previous alert, which is what
+  added up to the threshold.
+- Progress is logged to `.lab/slips-forwarder.log`; `./lab.sh status` says if it died.

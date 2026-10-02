@@ -121,3 +121,43 @@ alert_listener_stop() {
 	fi
 	pkill -f -- "Firewall/alert_listener.py" 2>/dev/null || true
 }
+
+SLIPS_FORWARDER="$PDE_ROOT/IDS/slips_forwarder.py"
+
+# Starts the forwarder that sends Slips' alerts to the Evidence Repository as trigger
+# events, detached like the alert listener and for the same reason.
+#   slips_forwarder_start <slips-out> <pidfile> <logfile>    echoes the PID
+#
+# It follows alerts.log for the life of the lab, and keeps retrying if the repository's
+# broker is not up yet, so the lab does not depend on the compose stack being started
+# first. KAFKA_BOOTSTRAP_SERVERS, KAFKA_EVIDENCE_TOPIC and DFRAAS_IDS_SOURCE_KEY pass
+# through from the environment.
+slips_forwarder_start() {
+	local slips_out="$1" pidfile="$2" logfile="$3" i
+	rm -f "$pidfile"
+	setsid python3 "$SLIPS_FORWARDER" --slips-out "$slips_out" --pidfile "$pidfile" \
+		</dev/null >"$logfile" 2>&1 &
+	for ((i = 0; i < 50; i++)); do
+		if [[ -s "$pidfile" ]]; then
+			cat "$pidfile"
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "the Slips forwarder did not come up; its output:" >&2
+	sed 's/^/    /' "$logfile" >&2 2>/dev/null || true
+	return 1
+}
+
+# Stops it, checking the PID against the command line first, as alert_listener_stop does.
+# SIGTERM lets it finish the send in hand and record its offset.
+#   slips_forwarder_stop [pid]
+slips_forwarder_stop() {
+	local pid="${1:-}"
+	if [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] \
+		&& [[ "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" == *slips_forwarder.py* ]]; then
+		kill "$pid" 2>/dev/null || true
+		return 0
+	fi
+	pkill -f -- "IDS/slips_forwarder.py" 2>/dev/null || true
+}
