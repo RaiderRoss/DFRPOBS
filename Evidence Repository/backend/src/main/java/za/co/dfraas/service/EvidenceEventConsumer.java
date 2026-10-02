@@ -26,8 +26,8 @@ import za.co.dfraas.dto.TriggerEventIngestResult;
  * <p><strong>The alert no longer drives preservation.</strong> Evidence streams in
  * continuously from registered {@code EvidenceSource}s, so what an alert triggers is
  * <em>correlation</em> — gathering the evidence already preserved whose coverage window
- * overlaps it. This listener's job therefore ends at recording the alert; see TODO 3 for
- * where the rest goes and why it is not inline.
+ * overlaps it. This listener's job therefore ends at recording the alert; correlation is
+ * {@link CorrelationScheduler}'s, for the reasons noted at the end of the listener.
  *
  * <p>The two rules this class exists to enforce are in place. Idempotency lives in
  * {@link TriggerEventService#recordIfAbsent}, which dedupes on the source's own event id
@@ -92,19 +92,11 @@ public class EvidenceEventConsumer {
 				result.triggerEvent().id(), request.sourceSystem(), request.externalEventId(),
 				result.triggerEvent().payloadSha256());
 
-		// TODO 3: hand the recorded alert to correlation — resolve its window from firedAt
-		//         plus the lookback/lookahead frozen onto the row, find evidence whose
-		//         coverage window overlaps it (EvidenceItemRepository.findOverlappingCoverage),
-		//         write an EvidenceLink per match, and move correlationStatus to CORRELATED.
-		//
-		//         Deliberately not done inline here. Correlation is a query over evidence
-		//         that arrived independently of this message, so it does not belong in the
-		//         listener's transaction: a slow or over-broad scope would stall the alert
-		//         partition behind it, and evidence covering the window may not even have
-		//         been preserved yet. It is a separate pass over the work queue
-		//         (TriggerEventRepository.findByCorrelationStatusInOrderByReceivedAtAsc),
-		//         which is also what makes re-correlation for late arrivals the same code
-		//         path rather than a special case.
+		// Correlation is deliberately not done here. The alert is left PENDING and picked up
+		// by CorrelationScheduler's next sweep: correlation is a query over evidence that
+		// arrived independently of this message, so running it in the listener would stall
+		// the alert partition behind a slow or over-broad search, and the evidence covering
+		// the window may not even have been preserved yet.
 	}
 
 	/**
