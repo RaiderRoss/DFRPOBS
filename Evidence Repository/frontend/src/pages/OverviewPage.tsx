@@ -102,7 +102,6 @@ export default function OverviewPage() {
             <p className="metric-footnote">The newest {stats?.events.length ?? 0} trigger events span {sourceSystems} source {sourceSystems === 1 ? 'system' : 'systems'}. Most recent arrival: {formatDate(stats?.events[0]?.receivedAt ?? null)}.</p>
         </article>
 
-        <article className="panel"><p className="panel-label">API surface</p><h2>Available operations</h2><ul className="endpoint-list"><li><code>GET</code> trigger events, filtered and paginated</li><li><code>GET</code> evidence sources, optionally by source key</li><li><code>POST</code> evidence items as verified uploads</li><li><code>GET</code> preserved evidence metadata by id</li></ul></article>
 
         <article className="panel">
             <div className="panel-header"><div><p className="panel-label">Evidence sources</p><h2>Collector readiness</h2></div><span className="chip">{stats?.sources.length ?? 0} registered</span></div>
