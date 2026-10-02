@@ -90,7 +90,7 @@ export default function OverviewPage() {
 
     return <section className="overview-grid">
         <article className="panel spotlight">
-            <div className="panel-header"><div><p className="panel-label">Repository overview</p><h2>Evidence intake at a glance</h2></div><button className="text-button" type="button" onClick={() => { clearCredentials(); window.location.reload() }}>Disconnect</button></div>
+            <div className="panel-header"><div><p className="panel-label">Repository overview</p><h2>Evidence intake at a glance</h2></div><button className="text-button" type="button" onClick={() => { clearCredentials(); window.location.reload() }}>Logout</button></div>
             <p className="panel-copy">A live summary of the append-only records currently available to investigators.</p>
             {error && <p className="error-message">{error}</p>}
             <div className="metric-row quad">
