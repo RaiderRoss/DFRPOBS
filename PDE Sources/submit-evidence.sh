@@ -80,7 +80,8 @@ usage() {
 	                         firewall | ids | banking-events | banking-audit
 	                                                          (default $SOURCE)
 	  --list                 show the windows and what each holds, then exit
-	  --run ID               window to submit from, e.g. 20260906204848 (default: latest)
+	  --run ID               window folder to submit from, e.g. 20260906204848 or
+	                         20260930230812_port-scan (default: latest)
 	  --outdir DIR           where captures live                     (default $OUTDIR)
 	  --url URL              repository base URL                     (default $URL)
 	  --source-key KEY       override the registered source key for --source
@@ -128,11 +129,12 @@ if [[ "$LIST" -eq 1 ]]; then
 	found=0
 	for dir in "$OUTDIR"/*/; do
 		[[ -d "$dir" ]] || continue
-		stamp=$(basename "$dir")
-		[[ "$stamp" == "sessions" ]] && continue
+		name=$(basename "$dir")
+		[[ "$name" == "sessions" ]] && continue
+		stamp="${name%%_*}"
 		[[ -f "$dir/firewall_${stamp}.manifest.json" ]] || continue
 		found=1
-		printf '  %s\n' "$stamp" >&2
+		printf '  %s\n' "$name" >&2
 		if [[ -f "$dir/firewall_${stamp}.log" ]]; then
 			printf '    %-15s %-38s %s bytes\n' firewall "firewall_${stamp}.log" \
 				"$(stat -c %s "$dir/firewall_${stamp}.log")" >&2
@@ -165,8 +167,12 @@ if [[ -z "$RUN" ]]; then
 fi
 
 RUN_DIR="$OUTDIR/$RUN"
-MANIFEST="$RUN_DIR/firewall_${RUN}.manifest.json"
-GROUP="$RUN_DIR/window_${RUN}.group.json"
+# A window's folder is named for its timestamp, and its files carry that timestamp. A folder
+# may also carry a label after it (20260930230812_port-scan, as in evaluation/); the
+# timestamp is the part before the first underscore, and it is what names the files.
+STAMP="${RUN%%_*}"
+MANIFEST="$RUN_DIR/firewall_${STAMP}.manifest.json"
+GROUP="$RUN_DIR/window_${STAMP}.group.json"
 [[ -f "$MANIFEST" ]] || fail "no manifest for window $RUN ($MANIFEST)"
 
 # The coverage window is a property of the capture, not of the source: both sources
@@ -193,10 +199,10 @@ case "$SOURCE" in
 		CONTENT_TYPE="application/x-ndjson" ;;
 esac
 # The dedupe key: <source>_<window>, the artifact's own name without its extension.
-ARTIFACT_ID="${SOURCE}_${RUN}"
+ARTIFACT_ID="${SOURCE}_${STAMP}"
 
 if [[ "$SOURCE" == "firewall" ]]; then
-	LOG_FILE="$RUN_DIR/firewall_${RUN}.log"
+	LOG_FILE="$RUN_DIR/firewall_${STAMP}.log"
 	read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
 import json, sys
 m = json.load(open(sys.argv[1]))

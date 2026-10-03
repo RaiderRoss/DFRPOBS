@@ -1,0 +1,101 @@
+{
+  "source": {
+    "pde_source": "firewall",
+    "product": "ufw",
+    "version": "ufw 0.36.2",
+    "kernel": "7.0.0-1011-gcp",
+    "observed_on": "fineract-slips",
+    "log_facility": "netfilter LOG target -> systemd-journald on fineract-slips, read with journalctl -k, lines matching [UFW",
+    "collection_method": "real packets across the INPUT chain of fineract-slips, arriving on tun7 from this machine's namespace over the tunnel device; log lines are kernel-generated and were not synthesised"
+  },
+  "window": {
+    "start_utc": "2026-10-01T10:57:08Z",
+    "end_utc": "2026-10-01T10:57:43Z",
+    "duration_seconds": 30
+  },
+  "timestamps": {
+    "log_line_format": "RFC 3339: 'YYYY-MM-DDThh:mm:ss.ffffff+00:00', UTC, microseconds",
+    "log_line_timezone": "UTC",
+    "log_line_utc_offset": "+0000",
+    "comparable_with_ids_evidence": "yes \u2014 both are RFC 3339 UTC and can be compared directly",
+    "manifest_and_window_bounds": "UTC (RFC 3339, suffix Z)",
+    "ids_evidence_format": "RFC 3339 with explicit offset, microseconds \u2014 already UTC",
+    "kernel_uptime_field": "The bracketed [12345.678901] on each line is a monotonic clock with microsecond resolution. It orders events within the window far more precisely than the whole-second syslog timestamp, and is immune to wall-clock adjustment. It is NOT convertible to an absolute time on this host: the VM suspends, and printk's clock does not advance while it does."
+  },
+  "configuration": {
+    "users": 10,
+    "malicious_users": 1,
+    "malicious_event_pct": 10,
+    "attack_profile": "db-probe",
+    "events_per_second": 20,
+    "seed": 1002,
+    "subnet": "10.99.0.0/24",
+    "benign_ports": [
+      80,
+      443,
+      8080
+    ],
+    "malicious_ports": [
+      21,
+      22,
+      23,
+      25,
+      53,
+      110,
+      111,
+      135,
+      137,
+      139,
+      143,
+      161,
+      389,
+      445,
+      512,
+      513,
+      514,
+      873,
+      993,
+      995,
+      1080,
+      1433,
+      1521,
+      2049,
+      2375,
+      3306,
+      3389,
+      5060,
+      5432,
+      5900,
+      6379,
+      9200,
+      11211,
+      27017
+    ],
+    "alert_ports": [
+      13337,
+      17171,
+      24242,
+      28282
+    ]
+  },
+  "output": {
+    "log_file": "firewall_20261001105708.log",
+    "ground_truth_file": "firewall_20261001105708.groundtruth.json",
+    "lines": 618,
+    "bytes": 137177,
+    "ufw_block_lines": 60,
+    "ufw_allow_lines": 558,
+    "ufw_audit_lines": 0,
+    "sha256": "206d1d9633d49d11f3b7ff3a345eb33ac1c84314a7d222352c2fae67f8384a0c"
+  },
+  "caveats": [
+    "this log's timestamps are UTC (+0000); every timestamp in this manifest and in the ground truth is UTC. Whether that means a conversion is needed before comparing this log with the IDS evidence is stated in timestamps.comparable_with_ids_evidence. Nothing has been rewritten \u2014 a source's own output is left as the source produced it",
+    "journal timestamps are RFC 3339 in UTC with microseconds and carry the year. The window bounds, window.start_utc/end_utc, are in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them",
+    "lines are filtered to SRC=10.99.0.* on the VM before they leave it: the lab's users' packets only. The VM's own replies (SRC=10.98.0.1) and unrelated host traffic are excluded",
+    "ufw's own logging level on the VM was 'low'. At 'full' it logs every packet the host handles, Docker's internal traffic included, faster than journald drains the kernel's log buffer, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below",
+    "at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line, and one per packet: a connection's later packets are logged as well as its first",
+    "verdict logging ([UFW ALLOW] / [UFW BLOCK]) was installed as unrate-limited LOG rules in ufw's own ufw-user-input chain rather than via ufw's 'log' keyword, which hardcodes --limit 3/min --limit-burst 10 regardless of logging level and would cap a 30s window at roughly 11 verdict lines per rule. Same kernel LOG target, same prefixes, no rate limit",
+    "a blocked SYN is retransmitted by the client kernel, so one blocked attempt can produce several BLOCK lines; count distinct SPT values, not lines, to recover the attempt count",
+    "ALERT_PORTS (13337,17171,24242,28282) are permitted from the subnet and answered by a listener, so guaranteed-alert attempts are logged [UFW ALLOW] although the ground truth labels them malicious. That is the scenario: the firewall let the attack through, and only the IDS can say it was hostile"
+  ]
+}

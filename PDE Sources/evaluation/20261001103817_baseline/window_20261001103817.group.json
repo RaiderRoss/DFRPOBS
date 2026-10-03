@@ -1,0 +1,82 @@
+{
+  "group_id": "20261001103817",
+  "window": {
+    "start_utc": "2026-10-01T10:38:17Z",
+    "end_utc": "2026-10-01T10:38:55Z",
+    "duration_seconds": 30,
+    "bounds": "whole seconds, start rounded down and end rounded up"
+  },
+  "scenario": {
+    "users": 10,
+    "malicious_users": 1,
+    "malicious_event_pct": 0,
+    "attack_profile": "port-scan",
+    "seed": 1002,
+    "subnet": "10.99.0.0/24"
+  },
+  "items": [
+    {
+      "pde_source": "firewall",
+      "product": "ufw",
+      "file": "firewall_20261001103817.log",
+      "sha256": "fd6ee8d873b6c48850b0649b3bef307a53712985aee7d85d02f6930c2d1525e6",
+      "lines": 615,
+      "ufw_block_lines": 0,
+      "ufw_allow_lines": 615,
+      "ufw_audit_lines": 0
+    },
+    {
+      "pde_source": "ids",
+      "product": "slips",
+      "file": "ids_20261001103817.alerts.log",
+      "sha256": "f9642ee4bd56ebd1ab382c8c6bf1d60d3290ec203137551c04a830496bd01140",
+      "evidence_lines": 1237,
+      "evidence_lines_seen_total": 1238,
+      "alerts": 0,
+      "threat_levels": {
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 220,
+        "info": 1017
+      },
+      "analysed": "on fineract-slips, by Slips reading tun7 live, the interface the lab's traffic arrives on"
+    },
+    {
+      "pde_source": "banking-events",
+      "product": "fineract",
+      "file": "banking-events_20261001103817.jsonl",
+      "sha256": "98f365c1ba57bbbf371fd836268aa7c865b518b607bcc2dec0c1bc1288e17f34",
+      "events": 20,
+      "by_type": {
+        "SavingsDepositBusinessEvent": 10,
+        "SavingsWithdrawalBusinessEvent": 10
+      },
+      "completeness": "10 of 10 operations that change something have all their events (20 of 20 events)"
+    },
+    {
+      "pde_source": "banking-audit",
+      "product": "fineract",
+      "file": "banking-audit_20261001103817.jsonl",
+      "sha256": "d75827cfbd7ebe6a76790bae687d081a8115210b6fd7aec1691b50cacee2fcae",
+      "rows": 10,
+      "by_maker": {
+        "ayesha.patel": 1,
+        "johan.vanwyk": 4,
+        "lerato.nkosi": 2,
+        "ravi.naidoo": 2,
+        "zanele.mthembu": 1
+      },
+      "completeness": "10 of 10 operations that change something have their audit row"
+    }
+  ],
+  "correlation": "The firewall and IDS items describe the same packets, and both observed them on fineract-slips: Slips read tun7 live while that host's ufw logged the same traffic crossing its INPUT chain. They are independent accounts of one attack rather than one record split in two. Because the users' own source addresses survive the tunnel, both sources see the individual users rather than a single forwarder, which is what lets the attacker be told apart from them. The banking items record the same users' activity at the bank in this window.",
+  "caveats": [
+    "firewall.log and ids.alerts.log are both RFC 3339 in UTC with microseconds here, because both were written on the VM, so the two can be compared directly with no conversion. window.start_utc/end_utc are UTC and are the common reference",
+    "IDS findings are sliced to the window by the timestamp on each evidence line; a line whose timestamp cannot be parsed is kept rather than dropped",
+    "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on timewindow N'). They carry no threat level, so threat_levels does not include them",
+    "Slips ran continuously on the VM across this and every other window of the lab session, so its per-source profile and alert threshold carry over between windows rather than starting fresh each time, and an alert here may rest partly on evidence it gathered earlier in the session",
+    "banking timestamps are UTC from the bank's clock on the research VM, not this machine's; the banking manifest records the measured offset (bank_minus_lab_seconds) and how to read each field",
+    "the firewall item is ufw on fineract-slips, not on the machine that generated the traffic. The users' packets keep their own source addresses across the tunnel device, so the VM's INPUT chain logged them as distinct sources; this machine only forwarded them and its own firewall was not in the path. One consequence for timing: the firewall, IDS and auth items are all on the VM's clock, and only the ground truth is on this machine's"
+  ]
+}
