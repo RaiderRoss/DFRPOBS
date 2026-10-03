@@ -13,5 +13,7 @@ pde.conf
 # Written by `./vm.sh seed`: the bank's sandbox staff credentials and the database ids
 # of one particular Fineract instance. Meaningless on another, and credentials besides.
 Banking/seed.json
+# Written by Banking/local-bank.sh seed: the same, for a bank on this machine.
+Banking/seed.local.json
 
 __pycache__/

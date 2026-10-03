@@ -202,6 +202,108 @@ alert_listener_stop() {
 	pkill -f -- "Firewall/alert_listener.py" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# Running without the research VM
+#
+# The bank's public web site, and optionally the bank itself, on this machine. These mirror
+# what Remote/vm-net.sh does on the VM, so a window captured offline differs from a cloud one
+# in where it was observed, not in what the simulated users did.
+# ---------------------------------------------------------------------------
+WEB_FRONT="$PDE_ROOT/Firewall/benign_web.py"
+BANK_RELAY="$PDE_ROOT/Remote/bank-relay.py"
+FINERACT_DIR="${FINERACT_DIR:-$(cd "$PDE_ROOT/.." && pwd)/Fineract}"
+# The local bank (Banking/local-bank.sh) publishes Fineract on this machine's loopback only.
+# The relay puts it on the lab's host address, where a user's call crosses INPUT and the
+# firewall logs it — the same arrangement as on the VM, for the same reason.
+LOCAL_BANK_TARGET="${LOCAL_BANK_TARGET:-127.0.0.1:8443}"
+# Its own seed file. A seed holds one Fineract instance's database ids, so the VM's means
+# nothing to a local bank and the other way round; keeping them apart lets one checkout use
+# either.
+LOCAL_BANK_SEED="${LOCAL_BANK_SEED:-$PDE_ROOT/Banking/seed.local.json}"
+
+# Starts the bank's public web site on <host>, detached. Self-signed TLS, made once into
+# <tlsdir>: nothing in the lab verifies it, as nothing here has a CA to verify against.
+#   web_front_start <host> <pidfile> <logfile> <tlsdir>    echoes the PID
+web_front_start() {
+	local host="$1" pidfile="$2" logfile="$3" tlsdir="$4" i
+	if [[ -n "$WEB_HTTPS_PORTS" && ! -s "$tlsdir/cert.pem" ]]; then
+		mkdir -p "$tlsdir" && chmod 700 "$tlsdir"
+		openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=pde-bank.lab" \
+			-keyout "$tlsdir/key.pem" -out "$tlsdir/cert.pem" >/dev/null 2>&1 || {
+			echo "could not create the web site's certificate (is openssl installed?)" >&2
+			return 1
+		}
+	fi
+	rm -f "$pidfile"
+	setsid python3 "$WEB_FRONT" --host "$host" --http-ports "$WEB_HTTP_PORTS" \
+		--https-ports "$WEB_HTTPS_PORTS" --cert "$tlsdir/cert.pem" --key "$tlsdir/key.pem" \
+		--pidfile "$pidfile" </dev/null >"$logfile" 2>&1 &
+	for ((i = 0; i < 50; i++)); do
+		[[ -s "$pidfile" ]] && { cat "$pidfile"; return 0; }
+		sleep 0.1
+	done
+	echo "the bank's web site did not come up; its output:" >&2
+	sed 's/^/    /' "$logfile" >&2 2>/dev/null || true
+	# The usual cause on a developer's machine: a service listening on every interface at one
+	# of these ports — most often the Evidence Repository's backend on 8080.
+	if grep -q 'cannot bind' "$logfile" 2>/dev/null; then
+		echo "    hint: another service holds that port on all of this machine's addresses. Run it on" >&2
+		echo "    127.0.0.1 only (the Evidence Repository: --server.address=127.0.0.1) or stop it" >&2
+		echo "    while the lab runs." >&2
+	fi
+	return 1
+}
+
+# The bank relay, detached: accepts on <listen> (address:port) and passes the bytes to
+# <target>. It parses nothing, so the user's TLS session is still with Fineract.
+#   bank_relay_start <listen> <target> <pidfile> <logfile>    echoes the PID
+bank_relay_start() {
+	local listen="$1" target="$2" pidfile="$3" logfile="$4" i
+	rm -f "$pidfile"
+	setsid python3 "$BANK_RELAY" --listen "$listen" --target "$target" --pidfile "$pidfile" \
+		</dev/null >"$logfile" 2>&1 &
+	for ((i = 0; i < 50; i++)); do
+		[[ -s "$pidfile" ]] && { cat "$pidfile"; return 0; }
+		sleep 0.1
+	done
+	echo "the bank relay did not come up; its output:" >&2
+	sed 's/^/    /' "$logfile" >&2 2>/dev/null || true
+	return 1
+}
+
+# Stops a detached helper by its PID, but only while that PID still belongs to the helper:
+# a PID recycled after a reboot must not take an unrelated process with it. Without a usable
+# PID, falls back to the helper's script path.
+#   _helper_stop <pid> <script path fragment>
+_helper_stop() {
+	local pid="${1:-}" name="$2"
+	if [[ -n "$pid" && -r "/proc/$pid/cmdline" ]] \
+		&& [[ "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" == *"$name"* ]]; then
+		kill "$pid" 2>/dev/null || true
+		return 0
+	fi
+	pkill -f -- "$name" 2>/dev/null || true
+}
+web_front_stop()  { _helper_stop "${1:-}" "Firewall/benign_web.py"; }
+bank_relay_stop() { _helper_stop "${1:-}" "Remote/bank-relay.py"; }
+
+# True while a helper started above is still running under the PID it was given.
+helper_alive() {
+	local pid="${1:-}" name="$2"
+	[[ -n "$pid" && -r "/proc/$pid/cmdline" ]] \
+		&& [[ "$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" == *"$name"* ]]
+}
+
+# The local bank's state as Docker reports it, e.g. "Up 5 minutes (healthy)"; empty when it
+# is not running. Found by the compose labels rather than a container name, so it does not
+# depend on the compose project's name.
+local_bank_state() {
+	docker ps --filter "label=com.docker.compose.service=fineract-manager" \
+		--filter "label=com.docker.compose.project.working_dir=$FINERACT_DIR" \
+		--format '{{.Status}}' 2>/dev/null | head -1
+}
+local_bank_healthy() { [[ "$(local_bank_state)" == *"(healthy)"* ]]; }
+
 # The port lists carry the dataset's labels, and the rules that apply them cannot detect a
 # contradiction between two lists — they just produce a window in which some packet is
 # labelled one thing by the firewall and the opposite by the ground truth. 8443 sat in both

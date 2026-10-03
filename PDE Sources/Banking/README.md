@@ -110,6 +110,25 @@ login can read what it should. It writes `Banking/seed.json` (gitignored — san
 credentials and database ids). A `seed.json` from before customers had logins is refused
 by the generator with a message saying to re-seed.
 
+### Without the research VM
+
+`Banking/local-bank.sh` runs the same bank on this machine: the same images and settings
+(`Fineract/docker-compose-fineract.yml`), with only Fineract's API published, and only on the
+loopback (`Banking/fineract-compose.local.yml`). `sudo ./lab.sh up --local-bank` starts and
+seeds it when it needs to; by hand:
+
+```bash
+Banking/local-bank.sh up        # the first time: about 2 GB to download, then several minutes
+Banking/local-bank.sh seed      # writes Banking/seed.local.json (gitignored)
+Banking/local-bank.sh status
+Banking/local-bank.sh stop      # keeps its data; `reset --yes` deletes it
+```
+
+The simulated users reach it through the same kind of relay as on the VM
+(`Remote/bank-relay.py`), on the lab's host address, so the firewall logs every call to the
+bank. It has a seed file of its own, because a seed holds one bank's database ids. It needs
+about 4–5 GB of free memory, and about 7 GB with the IDS running beside it.
+
 ## Output
 
 In the window's directory, beside the firewall's:

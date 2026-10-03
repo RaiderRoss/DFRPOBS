@@ -17,9 +17,17 @@
 #    sudo ./lab.sh down
 #
 #  IMPORTANT: in the default mode, while the lab is up YOUR
-#  firewall is enabled with test rules and full logging. `down`
-#  puts it back, and `status` detects a session that did not
-#  survive a reboot. --via-tunnel does not touch it at all.
+#  firewall is enabled with test rules. `down` puts it back, and
+#  `status` detects a session that did not survive a reboot.
+#  --via-tunnel does not touch it at all.
+#
+#  The default mode needs no cloud at all: the users, the
+#  firewall (this machine's ufw), the IDS (Slips in Docker) and
+#  the bank's public web site all run here. So can the bank:
+#    --local-bank     Fineract in Docker on this machine
+#                     (Banking/local-bank.sh; started and seeded
+#                     on first use), reached by the users through
+#                     a relay on HOST_IP:BANK_PORT
 #
 #  Two sources can live on the research VM instead (Remote/):
 #    --ids-remote     the IDS is a tcpdump on the veth here; each
@@ -48,6 +56,7 @@ WITH_IDS=0
 IDS_REMOTE=0
 WITH_BANKING=0
 VIA_TUNNEL=0
+LOCAL_BANK=0
 IDS_READY_TIMEOUT=240
 USERS=10
 
@@ -55,11 +64,11 @@ log()  { printf '[%(%H:%M:%S)T] %s\n' -1 "$*"; }
 die()  { echo "error: $*" >&2; exit 1; }
 
 usage() {
-	sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+	sed -n '3,/^# =====/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \?//'
 	cat <<-EOF
 
 	Commands:
-	  up [--with-ids [--ids-remote]] [--with-banking] [--via-tunnel] [--users N]
+	  up [--with-ids [--ids-remote]] [--with-banking | --local-bank] [--via-tunnel] [--users N]
 	                                build the lab and leave it running
 	  down                          restore the firewall and tear everything down
 	  status                        report what is up, and detect a stale session
@@ -90,6 +99,7 @@ lab_up() {
 	if [[ $VIA_TUNNEL -eq 0 ]]; then
 		command -v ufw >/dev/null || die "ufw not installed"
 		pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw lines would not reach $UFW_LOG"
+		command -v openssl >/dev/null || die "openssl not installed (the bank's web site needs a certificate)"
 	fi
 	# Before any rule is written: a contradiction between the port lists cannot be seen in
 	# the finished dataset, only in the labels disagreeing with each other.
@@ -100,6 +110,9 @@ lab_up() {
 	# the two cannot both be true of one lab.
 	if [[ $VIA_TUNNEL -eq 1 && $IDS_REMOTE -eq 1 ]]; then
 		die "--via-tunnel and --ids-remote are different designs; --via-tunnel already puts the IDS on the VM"
+	fi
+	if [[ $VIA_TUNNEL -eq 1 && $LOCAL_BANK -eq 1 ]]; then
+		die "--via-tunnel uses the bank on the VM; --local-bank is for running without it"
 	fi
 
 	if [[ $WITH_IDS -eq 1 ]]; then
@@ -126,13 +139,25 @@ lab_up() {
 		vm_ssh "test -f \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\"" </dev/null 2>/dev/null \
 			|| die "the VM's checkout predates Remote/vm-net.sh — ./vm.sh sync"
 		if [[ $WITH_IDS -eq 1 ]]; then
-			vm_ssh "docker image inspect '${SLIPS_IMG:-stratosphereips/slips:latest}' >/dev/null 2>&1" </dev/null \
-				|| die "the VM has no Slips image — on the VM: docker pull ${SLIPS_IMG:-stratosphereips/slips:latest}"
+			vm_ssh "docker image inspect '${SLIPS_IMG:-stratosphereips/slips:v1.1.23}' >/dev/null 2>&1" </dev/null \
+				|| die "the VM has no Slips image — on the VM: docker pull ${SLIPS_IMG:-stratosphereips/slips:v1.1.23}"
 		fi
 	fi
-	if [[ $WITH_BANKING -eq 1 ]]; then
+	if [[ $LOCAL_BANK -eq 1 ]]; then
+		# The bank on this machine. Started and seeded here when it is not already, so one
+		# command is enough on a fresh machine; once done, both steps are no-ops.
+		BANK_SEED="$LOCAL_BANK_SEED"
+		if ! local_bank_healthy; then
+			log "the local bank is not up; starting it (Banking/local-bank.sh up)"
+			bash "$PDE_ROOT/Banking/local-bank.sh" up || die "could not start the local bank"
+		fi
+		if [[ ! -r "$BANK_SEED" ]]; then
+			log "the local bank has not been seeded; seeding it (Banking/local-bank.sh seed)"
+			bash "$PDE_ROOT/Banking/local-bank.sh" seed || die "could not seed the local bank"
+		fi
+	elif [[ $WITH_BANKING -eq 1 ]]; then
 		[[ -r "$BANK_SEED" ]] || die "--with-banking needs a seeded bank ($BANK_SEED); see Banking/README.md"
-		vm_reachable || die "--with-banking needs the research VM (status: $(vm_status || echo unknown)); ./vm.sh start"
+		vm_reachable || die "--with-banking needs the research VM (status: $(vm_status || echo unknown)); ./vm.sh start, or use --local-bank"
 	fi
 
 	modprobe xt_LOG 2>/dev/null || true
@@ -173,6 +198,8 @@ lab_up() {
 	LAB_IDS_MODE="$([[ $IDS_REMOTE -eq 1 ]] && echo remote || echo local)"
 	LAB_WITH_BANKING="$WITH_BANKING"
 	LAB_VIA_TUNNEL="$VIA_TUNNEL"
+	LAB_BANK_WHERE="$([[ $LOCAL_BANK -eq 1 ]] && echo local || echo vm)"
+	LAB_BANK_SEED="$BANK_SEED"
 	LAB_TUN_DEV="$TUN_DEV"
 	LAB_TUN_VM_IP="$TUN_VM_IP"
 	LAB_TARGET_IP="$([[ $VIA_TUNNEL -eq 1 ]] && echo "$TUN_VM_IP" || echo "$HOST_IP")"
@@ -246,9 +273,19 @@ lab_up() {
 		LAB_LISTENER_PID="$listener_pid"
 		LAB_ALERT_PORTS="$ALERT_PORTS"
 		EOF
+
+		# --- the bank's public web site ---------------------------------------
+		# What the honest customers browse: real pages over HTTP and HTTPS on the benign ports,
+		# so their traffic is ordinary web traffic rather than connections to closed ports,
+		# which a flow-based IDS cannot tell from a scan. The same site the VM serves.
+		log "starting the bank's public web site on $HOST_IP (http $WEB_HTTP_PORTS, https $WEB_HTTPS_PORTS)"
+		local web_pid
+		web_pid=$(web_front_start "$HOST_IP" "$LAB_DIR/web-front.pid" "$LAB_DIR/web-front.log" "$LAB_DIR/web-tls") \
+			|| die "could not start the bank's web site"
+		echo "LAB_WEB_PID=\"$web_pid\"" >> "$LAB_STATE"
 	fi
 
-	# --- IDS, before the firewall so `logging full` is not on during its startup ---
+	# --- IDS, before the firewall --------------------------------------------
 	if [[ $WITH_IDS -eq 1 && $VIA_TUNNEL -eq 1 ]]; then
 		# Live on the device, on the VM. This is the mode the lab had before the IDS was
 		# split, and the better one: Slips watches an interface continuously and its
@@ -300,7 +337,7 @@ lab_up() {
 		mkdir -p "$slips_out"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
-		slips_start "$VETH_HOST" "$slips_out" || die "could not start Slips"
+		slips_start "$VETH_HOST" "$slips_out" "$BANK_PORT" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
 	fi
@@ -312,7 +349,17 @@ lab_up() {
 	# In tunnel mode the bank is already reachable: the relay above listens on the tunnel
 	# address, which is where the users aim, and the port forward this block opens would be
 	# a second, unused path to the same service.
-	if [[ $WITH_BANKING -eq 1 && $VIA_TUNNEL -eq 0 ]]; then
+	#
+	# With --local-bank the bank is on this machine, published on the loopback only, and a relay
+	# bound to HOST_IP does the same job: the user's call ends on this host's INPUT chain, where
+	# ufw logs it, and the relay opens its own connection on to Fineract.
+	if [[ $LOCAL_BANK -eq 1 ]]; then
+		log "starting the bank relay $HOST_IP:$BANK_PORT -> the local bank at $LOCAL_BANK_TARGET"
+		local relay_pid
+		relay_pid=$(bank_relay_start "$HOST_IP:$BANK_PORT" "$LOCAL_BANK_TARGET" \
+			"$LAB_DIR/bank-relay.pid" "$LAB_DIR/bank-relay.log") || die "could not start the bank relay"
+		echo "LAB_BANK_RELAY_PID=\"$relay_pid\"" >> "$LAB_STATE"
+	elif [[ $WITH_BANKING -eq 1 && $VIA_TUNNEL -eq 0 ]]; then
 		log "opening the bank tunnel $HOST_IP:$BANK_PORT -> $VM_NAME:8443"
 		vm_bank_tunnel_start || die "could not open the bank tunnel"
 		echo 'LAB_BANK_TUNNEL="1"' >> "$LAB_STATE"
@@ -328,7 +375,7 @@ lab_up() {
 	# firewall-up arms a watchdog that disables ufw again unless it is confirmed; the
 	# confirmation is an SSH round trip that only succeeds if the rules did not lock us out.
 	if [[ $VIA_TUNNEL -eq 1 ]]; then
-		log "configuring ufw on $VM_NAME (logging low; verdict rules log every lab packet on $TUN_DEV)"
+		log "configuring ufw on $VM_NAME (logging low; verdict rules log every lab connection attempt on $TUN_DEV)"
 		echo 'LAB_VM_FIREWALL="1"' >> "$LAB_STATE"
 		vm_ssh "sudo bash \"\$HOME/$VM_REPO_DIR/PDE Sources/Remote/vm-net.sh\" firewall-up \
 			'$SUBNET' '$ALLOWED_PORTS' '$TUN_NUM'" </dev/null || die "could not configure ufw on the VM"
@@ -355,7 +402,7 @@ lab_up() {
 	# if the preserve rules came first they would match the simulated attacker too and
 	# those attempts would be logged as permitted. Subnet rules are scoped and go
 	# first, so the host-wide rules can only ever match traffic from somewhere else.
-	log "configuring ufw (logging=full, default deny incoming)"
+	log "configuring ufw (logging low; the lab's verdict rules log every connection the users attempt)"
 	local p
 	IFS=',' read -ra _benign <<< "$BENIGN_PORTS"
 	for p in "${_benign[@]}"; do
@@ -375,7 +422,12 @@ lab_up() {
 	for p in "${_preserve[@]}"; do
 		ufw allow "$p/tcp" >/dev/null
 	done
-	ufw logging full >/dev/null
+	# 'low', not 'full'. The evidence is the verdict rules below, which log every connection
+	# attempt from the lab's subnet whatever ufw's own level is. 'full' adds a line for every packet this
+	# machine handles — a local bank's Docker traffic included — and at that volume the
+	# kernel's log buffer overflows and lines are lost; on the research VM it cost windows
+	# thousands of lines before the level was lowered.
+	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
 
 	# Verdict logging installed directly: ufw hardcodes -m limit --limit 3/min
@@ -392,7 +444,8 @@ lab_up() {
 
 	log "lab up"
 	echo
-	echo "  Your firewall is now ENABLED with test rules and LOGLEVEL=full."
+	echo "  Your firewall is now ENABLED with test rules (logging low)."
+	if [[ $LOCAL_BANK -eq 1 ]]; then echo "  The bank runs on this machine: Banking/local-bank.sh status"; fi
 	echo "  Capture windows with:  sudo Firewall/simulate-firewall.sh"
 	echo "  Put it back with:      sudo ./lab.sh down"
 }
@@ -416,6 +469,9 @@ lab_down() {
 	LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
 
 	local LAB_VIA_TUNNEL; LAB_VIA_TUNNEL=$(lab_get LAB_VIA_TUNNEL 0)
+	# Read now: the state file is gone by the time the closing note is printed.
+	local local_bank=0
+	[[ "$(lab_get LAB_BANK_WHERE vm)" == "local" && "$(lab_get LAB_WITH_BANKING 0)" == "1" ]] && local_bank=1
 
 	# --- the VM's side, and the tunnel, first ---------------------------------
 	# Everything here is best effort: the VM may already have been stopped, in which case its
@@ -449,6 +505,14 @@ lab_down() {
 		log "stopping the alert listener"
 		alert_listener_stop "$(lab_get LAB_LISTENER_PID "")"
 		rm -f "$LAB_DIR/alert-listener.pid"
+		log "stopping the bank's web site"
+		web_front_stop "$(lab_get LAB_WEB_PID "")"
+		rm -f "$LAB_DIR/web-front.pid"
+		if [[ $local_bank -eq 1 ]]; then
+			log "stopping the bank relay"
+			bank_relay_stop "$(lab_get LAB_BANK_RELAY_PID "")"
+			rm -f "$LAB_DIR/bank-relay.pid"
+		fi
 	fi
 
 	# The bank tunnel is bound to the veth's address; closed before that address goes.
@@ -503,6 +567,10 @@ lab_down() {
 		log "firewall restored to ENABLED=${LAB_ORIG_ENABLED:-no} LOGLEVEL=${LAB_ORIG_LOGLEVEL:-low}"
 	fi
 	[[ -n "${LAB_SLIPS_OUT:-}" ]] && echo "  Slips session output kept: $LAB_SLIPS_OUT"
+	if [[ $local_bank -eq 1 ]]; then
+		# Left running on purpose: it takes minutes to start, and its database is the seed's.
+		echo "  The local bank is still running; Banking/local-bank.sh stop stops it, keeping its data."
+	fi
 	return 0
 }
 
@@ -537,7 +605,7 @@ lab_status() {
 			fi
 			echo "  firewall    ufw on $VM_NAME, verdict rules on $(lab_get LAB_TUN_DEV "$TUN_DEV")"
 		else
-			echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
+			echo "  firewall    ufw enabled with test rules, logging low"
 		fi
 		if [[ "$(lab_get LAB_WITH_IDS 0)" -ne 1 ]]; then
 			echo "  ids         not running"
@@ -553,11 +621,24 @@ lab_status() {
 		else
 			echo "  ids         slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")"
 		fi
-		if [[ "$(lab_get LAB_WITH_BANKING 0)" -eq 1 ]]; then
+		if [[ "$(lab_get LAB_WITH_BANKING 0)" -eq 1 && "$(lab_get LAB_BANK_WHERE vm)" == "local" ]]; then
+			if helper_alive "$(lab_get LAB_BANK_RELAY_PID "")" "Remote/bank-relay.py"; then
+				echo "  bank        relay $HOST_IP:$BANK_PORT -> the local bank ($(local_bank_state || true))"
+			else
+				echo "  bank        relay NOT running — banking windows will fail; restart the lab"
+			fi
+		elif [[ "$(lab_get LAB_WITH_BANKING 0)" -eq 1 ]]; then
 			if vm_tunnel_running bank; then
 				echo "  bank        tunnel $HOST_IP:$BANK_PORT -> $VM_NAME (Fineract)"
 			else
 				echo "  bank        tunnel DOWN — banking windows will fail; restart the lab"
+			fi
+		fi
+		if [[ "$(lab_get LAB_VIA_TUNNEL 0)" != "1" ]]; then
+			if helper_alive "$(lab_get LAB_WEB_PID "")" "Firewall/benign_web.py"; then
+				echo "  web site    $HOST_IP ports $BENIGN_PORTS (pid $(lab_get LAB_WEB_PID ""))"
+			else
+				echo "  web site    NOT running — the customers' page loads will fail; restart the lab"
 			fi
 		fi
 		local lpid; lpid=$(lab_get LAB_LISTENER_PID "")
@@ -591,6 +672,7 @@ while [[ $# -gt 0 ]]; do
 		--with-ids) WITH_IDS=1; shift ;;
 		--ids-remote) IDS_REMOTE=1; shift ;;
 		--with-banking) WITH_BANKING=1; shift ;;
+		--local-bank) LOCAL_BANK=1; WITH_BANKING=1; shift ;;
 		--via-tunnel) VIA_TUNNEL=1; shift ;;
 		--users) USERS="$2"; shift 2 ;;
 		*) die "unknown option '$1'" ;;

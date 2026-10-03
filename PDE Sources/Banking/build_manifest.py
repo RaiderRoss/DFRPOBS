@@ -38,6 +38,8 @@ def main():
     ap.add_argument("--duration", type=int, required=True)
     ap.add_argument("--rate", type=float, required=True)
     ap.add_argument("--vm", required=True)
+    ap.add_argument("--where", choices=["vm", "local"], default="vm",
+                    help="where the bank and its collectors ran: the research VM, or this machine")
     ap.add_argument("--fineract-image", required=True)
     ap.add_argument("--bank-url", required=True)
     args = ap.parse_args()
@@ -63,15 +65,16 @@ def main():
             "image": args.fineract_image,
             "tenant": truth.get("tenant"),
             "tenant_timezone": truth.get("tenant_tz"),
-            "host": "research VM %s" % args.vm,
+            "host": ("research VM %s" % args.vm) if args.where == "vm"
+                    else "this machine (the lab's local bank, Banking/local-bank.sh)",
             "reached_at": args.bank_url,
             "collection_method": {
-                "banking-events": "Fineract's external-events Kafka topic, read on the VM between broker "
+                "banking-events": "Fineract's external-events Kafka topic, read on the bank's host between broker "
                                   "offsets taken before the window opened and the topic's end after it "
                                   "closed; each message decoded with the pinned Avro schemas and kept if "
                                   "its createdAt falls inside the window",
                 "banking-audit": "m_portfolio_command_source (Fineract's command audit trail) queried on the "
-                                 "VM for rows whose made_on_date_utc falls inside the window, joined to "
+                                 "bank's host for rows whose made_on_date_utc falls inside the window, joined to "
                                  "m_appuser for the maker's and checker's logins",
             },
         },
@@ -134,7 +137,7 @@ def main():
         "caveats": [
             "the bank's audit trail attributes every command to a login (maker_username), not an "
             "address: m_portfolio_command_source.client_ip exists on this build but was empty for all "
-            "%d rows. Even filled, it would show the tunnel's end on the VM rather than the namespace "
+            "%d rows. Even filled, it would show the relay in front of the bank rather than the namespace "
             "address, as a production bank behind a proxy or load balancer would. The actor's network "
             "identity comes from this window's firewall and IDS items, joined by time"
             % au.get("rows", 0),
@@ -164,8 +167,12 @@ def main():
             "the mule is a seeded customer (externalId %s) and applies again in every fraud window, so "
             "earlier windows' loans to the same client exist; this window's is the one with the "
             "resource_id recorded in the ground truth" % mule.get("external_id"),
-            "both artifacts were hashed on the VM before leaving it and verified here after transfer; "
-            "the digests above are those, and are what the EvidenceItems should carry",
+            ("both artifacts were hashed on the VM before leaving it and verified here after transfer; "
+             "the digests above are those, and are what the EvidenceItems should carry")
+            if args.where == "vm" else
+            ("both artifacts were hashed where the collectors wrote them and verified again after they "
+             "were copied into the window; the digests above are those, and are what the EvidenceItems "
+             "should carry"),
         ],
     }
     with open(p("banking_%s.manifest.json"), "w") as fh:

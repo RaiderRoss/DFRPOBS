@@ -46,11 +46,15 @@ OUTDIR="$SCRIPT_DIR/output"
 # it, Slips runs locally in Docker and sniffs the veth live.
 WITH_IDS=0
 IDS_REMOTE=1
-IDS_DRAIN=45
+# Seconds Slips keeps running past the window. Empty means the capture's own default: 45, or
+# 75 when Slips runs on this machine (it reports unanswered connections later there).
+IDS_DRAIN=""
 
-# The banking source: the same users drive the bank (Fineract, on the research VM) during
-# the window, and its audit trail and event stream are collected for it.
+# The banking source: the same users drive the bank (Fineract) during the window, and its
+# audit trail and event stream are collected for it. The bank runs on the research VM, or with
+# BANK_LOCAL=1 on this machine (Banking/local-bank.sh), which needs no cloud account.
 WITH_BANKING=0
+BANK_LOCAL=0
 BANK_RATE=0.5
 BANK_PROFILE=loan-fraud
 
@@ -76,7 +80,16 @@ fi
 
 # shellcheck source=Remote/vm-lib.sh
 source "$SCRIPT_DIR/Remote/vm-lib.sh"
-BANK_SEED="${BANK_SEED:-$SCRIPT_DIR/Banking/seed.json}"
+# A seed holds one bank's database ids, so the local bank has a file of its own. An explicit
+# BANK_SEED wins over both.
+BANK_SEED_SET="${BANK_SEED:-}"
+bank_seed_refresh() {
+	if [ -n "$BANK_SEED_SET" ]; then BANK_SEED="$BANK_SEED_SET"
+	elif [ "$BANK_LOCAL" = "1" ]; then BANK_SEED="$SCRIPT_DIR/Banking/seed.local.json"
+	else BANK_SEED="$SCRIPT_DIR/Banking/seed.json"; fi
+}
+bank_seed_refresh
+BANK_LOCAL_SH="$SCRIPT_DIR/Banking/local-bank.sh"
 VM_SH="$SCRIPT_DIR/vm.sh"
 
 # ---- palette -------------------------------------------------
@@ -180,7 +193,7 @@ banner() {
 		sources="${sources} ${C_DIM}+${R} ${C_KEY}ids${R}$([ "$IDS_REMOTE" = "1" ] && printf '%s' "${C_DIM}(vm)${R}")"
 	fi
 	if [ "$WITH_BANKING" = "1" ]; then
-		sources="${sources} ${C_DIM}+${R} ${C_KEY}banking${R}${C_DIM}(vm)${R}"
+		sources="${sources} ${C_DIM}+${R} ${C_KEY}banking${R}${C_DIM}($([ "$BANK_LOCAL" = "1" ] && echo here || echo vm))${R}"
 	fi
 	[ "$WITH_IDS" != "1" ] && [ "$WITH_BANKING" != "1" ] && sources="${sources} ${C_DIM}only${R}"
 	printf '  %s\n' "${C_DIM}profile${R} ${C_KEY}${ATTACK_PROFILE}${R}   ${C_DIM}seed${R} ${C_KEY}${SEED}${R}   ${C_DIM}sources${R} ${sources}"
@@ -327,7 +340,7 @@ configure_menu() {
 		# two controls and no way to tell which was authoritative. Only the drain stays,
 		# because it describes the capture rather than the source.
 		if [ "$WITH_IDS" = "1" ]; then
-			printf '  %s7%s  IDS drain        %s%-7s%s %sseconds Slips keeps running past the window,%s\n' "$C_NUM" "$R" "$C_KEY" "${IDS_DRAIN}s" "$R" "$C_DIM" "$R"
+			printf '  %s7%s  IDS drain        %s%-7s%s %sseconds Slips keeps running past the window,%s\n' "$C_NUM" "$R" "$C_KEY" "$(ids_drain_effective)s" "$R" "$C_DIM" "$R"
 			printf '  %s                    %s%-7s%s %sso it can raise evidence for it%s\n' "$C_DIM" "" "" "$R" "$C_DIM" "$R"
 		else
 			printf '  %s   %s IDS drain        %s—       the IDS source is off; option 1 turns it on%s\n' "$C_DIM" "$R" "$C_DIM" "$R"
@@ -487,8 +500,8 @@ run_capture() {
 	# untrue, and quoting Slips' start-up time when Slips is running overstates the wait
 	# by about a minute.
 	local state; state="$(lab_state)"
-	# The bank lives on the VM and is reached through the lab's tunnel, so there is no
-	# one-shot path for it. Said here, before sudo is asked for, not after.
+	# The bank is reached through a path the lab holds — the tunnel to the VM, or the relay to
+	# the local bank — so there is no one-shot path for it. Said here, before sudo is asked for.
 	if [ "$WITH_BANKING" = "1" ] && [ "$state" != "up" ]; then
 		echo
 		err "The banking source needs the sources running — its tunnel to the bank belongs to them."
@@ -503,10 +516,10 @@ run_capture() {
 			dim "    about a minute of analysis$([ "$(lab_get LAB_WITH_BANKING 0)" = "1" ] && echo ", with the bank's evidence collected meanwhile")."
 		elif [ "$(lab_get LAB_WITH_IDS 0)" = "1" ]; then
 			dim "    Slips is already reading the veth, so both sources see this window."
-			dim "    Expect about $(( DURATION + IDS_DRAIN ))s: the window, then ${IDS_DRAIN}s for Slips to"
+			dim "    Expect about $(( DURATION + $(ids_drain_effective) ))s: the window, then $(ids_drain_effective)s for Slips to"
 			dim "    raise evidence for it."
 		elif [ "$(lab_get LAB_WITH_BANKING 0)" = "1" ]; then
-			dim "    Expect about $(( DURATION + 30 ))s: the window, then the bank's evidence collected on the VM."
+			dim "    Expect about $(( DURATION + 30 ))s: the window, then the bank's evidence collected."
 		else
 			dim "    Expect about ${DURATION}s."
 		fi
@@ -517,8 +530,8 @@ run_capture() {
 	else
 		if [ "$WITH_IDS" = "1" ]; then
 			dim "    Slips attaches to the veth before the window opens and keeps running"
-			dim "    ${IDS_DRAIN}s past it, so both sources describe the same packets. Expect roughly"
-			dim "    $(( 60 + DURATION + IDS_DRAIN ))s in total — most of it Slips loading its modules."
+			dim "    $(ids_drain_effective)s past it, so both sources describe the same packets. Expect roughly"
+			dim "    $(( 60 + DURATION + $(ids_drain_effective) ))s in total — most of it Slips loading its modules."
 			echo
 		fi
 		warn "This enables ufw and modifies the host firewall for ${DURATION}s."
@@ -556,7 +569,8 @@ run_capture() {
 		--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS"
 		--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR")
 	if [ "$WITH_IDS" = "1" ]; then
-		args+=(--with-ids --ids-drain "$IDS_DRAIN")
+		args+=(--with-ids)
+		[ -n "$IDS_DRAIN" ] && args+=(--ids-drain "$IDS_DRAIN")
 	fi
 	if [ "$WITH_BANKING" = "1" ]; then
 		args+=(--with-banking --bank-rate "$BANK_RATE" --bank-profile "$BANK_PROFILE")
@@ -1012,6 +1026,13 @@ doctor() {
 }
 
 # ---- lab lifecycle -------------------------------------------
+# The drain a capture will actually use: the one set here, or the capture's own default.
+ids_drain_effective() {
+	if [ -n "$IDS_DRAIN" ]; then echo "$IDS_DRAIN"
+	elif [ "$IDS_REMOTE" = "1" ]; then echo 45
+	else echo 75; fi
+}
+
 sudo_run() {
 	if [ "$(id -u)" -ne 0 ]; then sudo "$@"; else "$@"; fi
 }
@@ -1026,7 +1047,9 @@ lab_bring_up() {
 	local args=(up --users "$USERS")
 	[ "$WITH_IDS" = "1" ] && args+=(--with-ids)
 	[ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" = "1" ] && args+=(--ids-remote)
-	[ "$WITH_BANKING" = "1" ] && args+=(--with-banking)
+	if [ "$WITH_BANKING" = "1" ]; then
+		if [ "$BANK_LOCAL" = "1" ]; then args+=(--local-bank); else args+=(--with-banking); fi
+	fi
 	if sudo_run "$LAB_SH" "${args[@]}"; then
 		LAB_OWNED=1
 		return 0
@@ -1071,6 +1094,8 @@ sources_menu() {
 		running_ids="$(lab_get LAB_WITH_IDS 0)"
 		running_mode="$(lab_get LAB_IDS_MODE local)"
 		running_bank="$(lab_get LAB_WITH_BANKING 0)"
+		local running_where; running_where="$(lab_get LAB_BANK_WHERE vm)"
+		local bank_at; bank_at="$([ "$running_where" = "local" ] && echo "this machine" || echo "$VM_NAME")"
 		# Asked once per draw rather than cached: whether the VM is up is exactly the
 		# thing that changes behind this screen's back.
 		local vst; vst="$(vm_status)"
@@ -1086,8 +1111,8 @@ sources_menu() {
 				printf '  %-16s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "disabled" "$R"
 			fi
 			if [ "$running_bank" = "1" ]; then
-				printf '  %-16s %-12s %s%s%s\n' "banking-events" "Fineract" "$C_OK" "running on $VM_NAME" "$R"
-				printf '  %-16s %-12s %s%s%s\n' "banking-audit" "Fineract" "$C_OK" "running on $VM_NAME" "$R"
+				printf '  %-16s %-12s %s%s%s\n' "banking-events" "Fineract" "$C_OK" "running on $bank_at" "$R"
+				printf '  %-16s %-12s %s%s%s\n' "banking-audit" "Fineract" "$C_OK" "running on $bank_at" "$R"
 			else
 				printf '  %-16s %-12s %s%s%s\n' "banking-events" "Fineract" "$C_DIM" "disabled" "$R"
 				printf '  %-16s %-12s %s%s%s\n' "banking-audit" "Fineract" "$C_DIM" "disabled" "$R"
@@ -1106,7 +1131,8 @@ sources_menu() {
 			*)       printf '  %s\n' "${C_DIM}research VM${R}  ${C_WARN}$VM_NAME $vst${R} ${C_DIM}— the bank and a VM-side IDS need it running${R}" ;;
 		esac
 		if [ "$WITH_BANKING" = "1" ] && [ ! -r "$BANK_SEED" ]; then
-			warn "The bank has not been seeded — option s, with the VM running."
+			if [ "$BANK_LOCAL" = "1" ]; then warn "The local bank has not been seeded — option s."
+			else warn "The bank has not been seeded — option s, with the VM running."; fi
 		fi
 
 		echo
@@ -1131,13 +1157,20 @@ sources_menu() {
 		else
 			printf '  %s5%s  Turn the banking source ON   %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		fi
+		if [ "$BANK_LOCAL" = "1" ]; then
+			printf '  %s6%s  Run the bank on the VM       %s(setting: on this machine)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s6%s  Run the bank on this machine %s(setting: on the VM)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 
 		# Setting and reality can disagree, because every source here attaches when the
 		# sources start and cannot join or leave ones that are already running.
 		if [ "$state" = "up" ]; then
 			local want_mode; want_mode="$([ "$IDS_REMOTE" = "1" ] && echo remote || echo local)"
+			local want_where; want_where="$([ "$BANK_LOCAL" = "1" ] && echo local || echo vm)"
 			if [ "$running_ids" != "$WITH_IDS" ] || [ "$running_bank" != "$WITH_BANKING" ] \
-				|| { [ "$WITH_IDS" = "1" ] && [ "$running_mode" != "$want_mode" ]; }; then
+				|| { [ "$WITH_IDS" = "1" ] && [ "$running_mode" != "$want_mode" ]; } \
+				|| { [ "$WITH_BANKING" = "1" ] && [ "$running_where" != "$want_where" ]; }; then
 				echo
 				warn "Changed, but not yet applied."
 				dim "    Sources attach when they start, so the running ones still have the old"
@@ -1177,6 +1210,8 @@ sources_menu() {
 			   persist IDS_REMOTE; [ "$WITH_IDS" = "1" ] && changed=1 ;;
 			5) if [ "$WITH_BANKING" = "1" ]; then WITH_BANKING=0; else WITH_BANKING=1; fi
 			   persist WITH_BANKING; changed=1 ;;
+			6) if [ "$BANK_LOCAL" = "1" ]; then BANK_LOCAL=0; else BANK_LOCAL=1; fi
+			   persist BANK_LOCAL; bank_seed_refresh; [ "$WITH_BANKING" = "1" ] && changed=1 ;;
 			2)
 				case "$state" in
 					up)    echo; lab_take_down && lab_bring_up; pause ;;
@@ -1186,7 +1221,11 @@ sources_menu() {
 			3) [ "$state" = "up" ] && { echo; lab_take_down; pause; } ;;
 			s|S)
 				echo
-				if [ "$vst" != "RUNNING" ]; then
+				if [ "$BANK_LOCAL" = "1" ]; then
+					# Started first if need be; both steps are no-ops once done.
+					sudo_run "$BANK_LOCAL_SH" up && sudo_run "$BANK_LOCAL_SH" seed \
+						&& ok "the local bank is ready for banking windows"
+				elif [ "$vst" != "RUNNING" ]; then
 					err "the research VM is not running — option v first"
 				else
 					# The seeding script is idempotent: everything is found by a stable key
@@ -1198,7 +1237,8 @@ sources_menu() {
 			v|V)
 				echo
 				if [ "$vst" = "RUNNING" ]; then
-					if [ "$state" = "up" ] && { [ "$running_bank" = "1" ] || [ "$running_mode" = "remote" ]; }; then
+					if [ "$state" = "up" ] && { { [ "$running_bank" = "1" ] && [ "$running_where" != "local" ]; } \
+						|| [ "$running_mode" = "remote" ]; }; then
 						err "the running sources use the VM — stop them first (option 3)"
 					else
 						printf '  %sstop %s? [y/N]>%s ' "$C_TITLE" "$VM_NAME" "$R"

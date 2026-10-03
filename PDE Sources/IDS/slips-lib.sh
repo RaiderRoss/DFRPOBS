@@ -11,7 +11,10 @@
 #  beyond the two container names below.
 # ==============================================================
 
-SLIPS_IMG="${SLIPS_IMG:-stratosphereips/slips:latest}"
+# Pinned, not :latest. The evaluation ran Slips 1.1.23 (each window's metadata/info.txt says
+# so), and :latest moved to 1.1.24 the day it began; a run that pulled :latest afresh would
+# be a different IDS. The same pin is in Remote/vm-net.sh and Remote/slips-warm.sh.
+SLIPS_IMG="${SLIPS_IMG:-stratosphereips/slips:v1.1.23}"
 # Deliberately distinct from the names slips-cli.sh uses, so a running lab
 # console is never adopted or torn down by a capture.
 SLIPS_CONTAINER="${SLIPS_CONTAINER:-pde-slips}"
@@ -57,13 +60,47 @@ slips_start_redis() {
 	return 1
 }
 
-# $1 interface to sniff, $2 host directory for Slips output
+# $1 interface to sniff, $2 host directory for Slips output, $3 optional: a TCP port to
+# register as one of this bank's own services (the bank's API).
+#
+# Slips raises "connection to unknown destination port" at threat level HIGH for every
+# established connection to a port missing from its services list, and the bank's API port
+# is missing — so every customer who used the bank was flagged high. A bank's IDS knows the
+# bank's own services. The guaranteed-alert ports stay unregistered on purpose: that profile
+# works by being what Slips has no record of. Same as Remote/vm-net.sh slips-up.
+#
+# The amended list sits beside the output directory, not in it: Slips empties its output
+# directory when it starts.
 slips_start() {
-	local iface="$1" outdir="$2"
+	local iface="$1" outdir="$2" service_port="${3:-}" services config
+	local -a mounts=()
 	mkdir -p "$outdir"
+
+	# Here all ten simulated users share one virtual network card, so Slips sees one MAC address
+	# behind ten IP addresses and raises "a device changing IPs" against every one of them — an
+	# artefact of the simulation, not anything the users did. On the research VM the traffic
+	# arrives on a tunnel device, which carries no MAC addresses, so the check never runs there.
+	# It is switched off here so that both modes run the same effective set of detections.
+	# Slips copies its configuration into each run's metadata/, so the change is on record.
+	config="$outdir.slips.yaml"
+	docker run --rm "$SLIPS_IMG" cat config/slips.yaml > "$config" 2>/dev/null && [[ -s "$config" ]] \
+		|| { echo "could not read Slips' configuration from $SLIPS_IMG" >&2; return 1; }
+	grep -qE '^  disabled_detections: \[\]$' "$config" \
+		|| { echo "Slips' configuration has no empty disabled_detections list to amend ($SLIPS_IMG)" >&2; return 1; }
+	sed -i 's/^  disabled_detections: \[\]$/  disabled_detections: [DEVICE_CHANGING_IP]/' "$config"
+	mounts+=(-v "$config:/StratosphereLinuxIPS/config/slips.yaml:ro")
+	if [[ -n "$service_port" ]]; then
+		services="$outdir.services.csv"
+		docker run --rm "$SLIPS_IMG" cat slips_files/ports_info/services.csv > "$services" 2>/dev/null \
+			&& [[ -s "$services" ]] || { echo "could not read Slips' services list from $SLIPS_IMG" >&2; return 1; }
+		grep -qE "^[^#][^,]*,[[:space:]]*$service_port,[[:space:]]*tcp" "$services" \
+			|| printf 'pde-bank-api,%s,tcp,PDE lab bank API (Apache Fineract over HTTPS)\n' \
+				"$service_port" >> "$services"
+		mounts+=(-v "$services:/StratosphereLinuxIPS/slips_files/ports_info/services.csv:ro")
+	fi
 	docker rm -f "$SLIPS_CONTAINER" >/dev/null 2>&1 || true
 	docker run -d --net=host --cap-add=NET_ADMIN --name "$SLIPS_CONTAINER" \
-		-v "$outdir":/output "$SLIPS_IMG" \
+		-v "$outdir":/output ${mounts[@]+"${mounts[@]}"} "$SLIPS_IMG" \
 		./slips.py -i "$iface" -o /output >/dev/null
 }
 

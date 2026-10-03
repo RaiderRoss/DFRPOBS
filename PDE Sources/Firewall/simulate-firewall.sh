@@ -38,6 +38,7 @@ IDS_READY_TIMEOUT=240
 # instant the window closes reliably collects nothing. This is how long to keep it
 # running past the window before collecting.
 IDS_DRAIN=45
+IDS_DRAIN_SET=0
 
 # Topology, port lists and lab paths live in one place so this script and lab.sh cannot
 # drift apart on them — see the note there about why the port lists interact.
@@ -66,6 +67,12 @@ LAB_VETH_HOST="$VETH_HOST"
 LAB_VIA_TUNNEL=0
 LAB_VM_SLIPS_OUT=""
 TARGET_IP="$HOST_IP"
+# Without the VM: where the bank is (vm, or local with --local-bank) and the helpers the lab
+# started on this machine — the bank relay and the bank's public web site.
+LAB_BANK_WHERE=vm
+LAB_BANK_SEED=""
+LAB_BANK_RELAY_PID=""
+LAB_WEB_PID=""
 if [[ -f "$LAB_STATE" ]]; then
 	# Parsed rather than sourced — see lab_get in lab-config.sh.
 	LAB_NS=$(lab_get LAB_NS "$NS")
@@ -82,12 +89,17 @@ if [[ -f "$LAB_STATE" ]]; then
 		LAB_VIA_TUNNEL=$(lab_get LAB_VIA_TUNNEL 0)
 		LAB_VM_SLIPS_OUT=$(lab_get LAB_VM_SLIPS_OUT "")
 		TARGET_IP=$(lab_get LAB_TARGET_IP "$HOST_IP")
+		LAB_BANK_WHERE=$(lab_get LAB_BANK_WHERE vm)
+		LAB_BANK_SEED=$(lab_get LAB_BANK_SEED "")
+		LAB_BANK_RELAY_PID=$(lab_get LAB_BANK_RELAY_PID "")
+		LAB_WEB_PID=$(lab_get LAB_WEB_PID "")
 	fi
 fi
 
 # The banking source: the bank's audit trail and its event stream over the same window,
-# driven by generate_banking.py alongside the network traffic. Lab-only — the bank lives
-# on the research VM, and only a lab holds the tunnel that reaches it.
+# driven by generate_banking.py alongside the network traffic. Lab-only — the bank is on the
+# research VM or, with `lab.sh up --local-bank`, on this machine, and only a lab holds the
+# path that reaches it.
 WITH_BANKING=0
 BANK_RATE=0.5
 BANK_PROFILE=loan-fraud
@@ -112,7 +124,7 @@ usage() {
 	                         same packets over the same window (adds ~2 min of
 	                         startup before the window, and --ids-drain after)
 	  --ids-drain S          seconds to keep Slips running past the window so it
-	                         can raise evidence for it       (default $IDS_DRAIN)
+	                         can raise evidence for it (default 45; 75 offline)
 	  --with-banking         also drive the bank and collect its audit trail and
 	                         event stream for the window (needs a lab started
 	                         with --with-banking; the bank is on the research VM)
@@ -138,7 +150,7 @@ while [[ $# -gt 0 ]]; do
 		--dry-run) DRY_RUN=1; shift ;;
 		--keep-firewall) KEEP_FIREWALL=1; shift ;;
 		--with-ids) WITH_IDS=1; shift ;;
-		--ids-drain) IDS_DRAIN="$2"; shift 2 ;;
+		--ids-drain) IDS_DRAIN="$2"; IDS_DRAIN_SET=1; shift 2 ;;
 		--with-banking) WITH_BANKING=1; shift ;;
 		--bank-rate) BANK_RATE="$2"; shift 2 ;;
 		--bank-profile) BANK_PROFILE="$2"; shift 2 ;;
@@ -169,6 +181,9 @@ if [[ $DRY_RUN -eq 0 ]]; then
 	[[ $EUID -eq 0 ]] || die "must run as root (firewall rules and network namespaces)"
 	pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw log lines would not \
 reach $UFW_LOG. Start it with: systemctl start rsyslog"
+	# A one-shot capture starts the bank's web site itself, and it serves HTTPS.
+	[[ $LAB_MODE -eq 1 ]] || command -v openssl >/dev/null \
+		|| die "openssl not installed (the bank's web site needs a certificate)"
 fi
 
 IDS_LIB="$SCRIPT_DIR/../IDS/slips-lib.sh"
@@ -217,6 +232,16 @@ if [[ $LAB_MODE -eq 1 && $WITH_IDS -eq 1 && "$LAB_IDS_MODE" == "remote" ]]; then
 	IDS_REMOTE=1
 fi
 
+# Slips reports a connection that never got an answer — the attacker's, to closed ports — only
+# about a minute after it was sent, when its traffic recorder gives up on it. Measured offline:
+# a port scan's connections reached Slips' evidence 25–55 s after the window closed, so with the
+# 45 s that suits the cloud the last third of them was missing from the window. In the cloud,
+# fetching the evidence over the network happens to add those seconds. So when Slips runs on
+# this machine, and unless told otherwise, wait 75 s: the last connection, plus margin.
+if [[ $IDS_DRAIN_SET -eq 0 && $IDS_REMOTE -eq 0 && $LAB_VIA_TUNNEL -eq 0 ]]; then
+	IDS_DRAIN=75
+fi
+
 # Banking, likewise, is whatever the running lab was built with; it cannot be conjured for
 # one capture, because the tunnel to the bank belongs to the lab.
 if [[ $LAB_MODE -eq 1 ]]; then
@@ -228,7 +253,7 @@ elif [[ $WITH_BANKING -eq 1 ]]; then
 	die "--with-banking needs a running lab (the bank tunnel belongs to it): ./lab.sh up --with-banking"
 fi
 
-if [[ $IDS_REMOTE -eq 1 || $WITH_BANKING -eq 1 || $LAB_VIA_TUNNEL -eq 1 ]]; then
+if [[ $IDS_REMOTE -eq 1 || $LAB_VIA_TUNNEL -eq 1 || ( $WITH_BANKING -eq 1 && "$LAB_BANK_WHERE" != "local" ) ]]; then
 	# shellcheck source=../Remote/vm-lib.sh
 	source "$PDE_ROOT/Remote/vm-lib.sh"
 fi
@@ -239,6 +264,9 @@ if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	source "$PDE_ROOT/Remote/remote-source-lib.sh"
 fi
 if [[ $WITH_BANKING -eq 1 ]]; then
+	# Where the bank is, and which seed describes it, are the lab's.
+	BANK_WHERE="$LAB_BANK_WHERE"
+	[[ -n "$LAB_BANK_SEED" ]] && BANK_SEED="$LAB_BANK_SEED"
 	# shellcheck source=../Banking/banking-lib.sh
 	source "$PDE_ROOT/Banking/banking-lib.sh"
 	# The bank is reached at the tunnel's far end in this mode, through the relay that makes
@@ -261,9 +289,20 @@ if [[ $DRY_RUN -eq 0 && $WITH_BANKING -eq 1 ]]; then
 	banking_preflight || die "banking preflight failed"
 	# In tunnel mode the bank is reached through the relay on the tunnel device, not through
 	# a port forward, so it is the tunnel that has to be up.
-	if [[ $LAB_VIA_TUNNEL -eq 0 ]]; then
+	if [[ "$BANK_WHERE" == "local" ]]; then
+		helper_alive "$LAB_BANK_RELAY_PID" "Remote/bank-relay.py" \
+			|| die "the lab's bank relay is not running; restart the lab ('./lab.sh down', then up --local-bank)"
+	elif [[ $LAB_VIA_TUNNEL -eq 0 ]]; then
 		vm_tunnel_running bank || die "the lab's bank tunnel is down; restart the lab"
 	fi
+fi
+
+# The honest customers browse the bank's web site. Without it every benign attempt is a
+# connection to a closed port, which a flow-based IDS cannot tell from a scan — the window
+# would measure the lab's gap, not the IDS.
+if [[ $DRY_RUN -eq 0 && $LAB_MODE -eq 1 && $LAB_VIA_TUNNEL -eq 0 ]]; then
+	helper_alive "$LAB_WEB_PID" "Firewall/benign_web.py" \
+		|| die "the lab's web site is not running (or the lab predates it); restart the lab ('./lab.sh down', then up)"
 fi
 
 if [[ $DRY_RUN -eq 0 && $LAB_VIA_TUNNEL -eq 1 ]]; then
@@ -333,12 +372,12 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	cat <<-EOF
 	Would apply:
 	  ufw --force enable
-	  ufw logging full                       # unrate-limited; see note below
+	  ufw logging low                        # the verdict rules below log every lab connection attempt
 
 	  # Order matters, and these are applied in this order:
 	  ufw allow from $SUBNET to any port <${BENIGN_PORTS}> proto tcp
 	  ufw allow from $SUBNET to any port <${ALERT_PORTS}> proto tcp    # guaranteed-alert target
-	  ufw allow from $SUBNET to any port ${BANK_PORT} proto tcp           # the bank, via the lab's tunnel
+	  ufw allow from $SUBNET to any port ${BANK_PORT} proto tcp           # the bank, via the lab's tunnel or relay
 	  ufw deny  from $SUBNET                                 # everything else = the attacker
 	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp    # keep dev stack reachable
 
@@ -353,24 +392,20 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	           -j LOG --log-prefix "[UFW BLOCK] "
 
 	  ufw's own 'log' keyword hardcodes -m limit --limit 3/min --limit-burst 10 with no
-	  loglevel check, so it caps verdict lines at ~11 per rule per 30s no matter what
-	  'logging full' says. These replace it. They are removed when ufw reloads on restore.
+	  loglevel check, so it caps verdict lines at ~11 per rule per 30s whatever ufw's
+	  logging level. These replace it. They are removed when ufw reloads on restore.
 
 	  ip netns add $NS
 	  veth $VETH_HOST <-> $VETH_NS, host $HOST_IP/24
 	  namespace addresses: ${USER_IPS[*]}
 	  attackers: ${MALICIOUS_IPS[*]:-none}
 	  listener on $HOST_IP ports <${ALERT_PORTS}>, accept-and-close (guaranteed-alert)
+	  the bank's public web site on $HOST_IP: http <${WEB_HTTP_PORTS}>, https <${WEB_HTTPS_PORTS}>
 
-	ufw rate-limits logging in two independent places, and both would gut a ${DURATION}s window:
-
-	  1. the AUDIT chains, limited below loglevel 'high' — lifted by 'logging full'
-	  2. the per-rule 'log' keyword, limited unconditionally with no loglevel check
-	     — not lifted by anything, which is why the LOG rules above are installed
-	     directly instead
-
-	Without both, a run returns roughly 11 verdict lines per rule and looks like a
-	firewall that saw almost no traffic.
+	ufw rate-limits its per-rule 'log' keyword unconditionally, with no loglevel check —
+	which would gut a ${DURATION}s window — so the LOG rules above are installed directly
+	instead. ufw's own level stays 'low': 'full' logs every packet the machine handles,
+	and at that volume the kernel's log buffer overflows and lines are lost.
 	EOF
 	exit 0
 fi
@@ -406,6 +441,7 @@ else
 			slips_stop
 		fi
 		alert_listener_stop "${LISTENER_PID:-}"
+		web_front_stop "${WEB_PID:-}"
 		ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
 		ip netns del "$NS" 2>/dev/null || true
 		ip link del "$VETH_HOST" 2>/dev/null || true
@@ -422,6 +458,7 @@ else
 		return $rc
 	}
 	LISTENER_PID=""
+	WEB_PID=""
 	trap restore EXIT INT TERM
 
 	# ---------------------------------------------------------------------------
@@ -448,6 +485,11 @@ else
 	LISTENER_PID=$(alert_listener_start "$HOST_IP" "$STATE_DIR/alert-listener.pid" "$STATE_DIR/alert-listener.log") \
 		|| die "could not start the alert listener"
 
+	# What the honest customers browse; stopped by the trap. See lab.sh.
+	log "starting the bank's public web site on $HOST_IP (http $WEB_HTTP_PORTS, https $WEB_HTTPS_PORTS)"
+	WEB_PID=$(web_front_start "$HOST_IP" "$STATE_DIR/web-front.pid" "$STATE_DIR/web-front.log" "$LAB_DIR/web-tls") \
+		|| die "could not start the bank's web site"
+
 	# ---------------------------------------------------------------------------
 	# IDS
 	#
@@ -470,7 +512,7 @@ else
 		rm -rf "$SLIPS_OUT"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
-		slips_start "$VETH_HOST" "$SLIPS_OUT" || die "could not start Slips"
+		slips_start "$VETH_HOST" "$SLIPS_OUT" "$BANK_PORT" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
 	fi
@@ -478,7 +520,7 @@ else
 	# ---------------------------------------------------------------------------
 	# Firewall
 	# ---------------------------------------------------------------------------
-	log "configuring ufw (logging=full, default deny incoming)"
+	log "configuring ufw (logging low; the verdict rules log every connection the users attempt)"
 	# Rule ORDER carries the labelling, and ufw evaluates in the order rules are added.
 	# PRESERVE_PORTS deliberately overlaps MALICIOUS_PORTS (22 and 5432 are both a service
 	# this host needs reachable and a port an attacker probes). If the preserve rules came
@@ -511,7 +553,10 @@ else
 	for p in "${_preserve[@]}"; do
 		ufw allow "$p/tcp" >/dev/null
 	done
-	ufw logging full >/dev/null
+	# 'low', not 'full': the verdict rules below log every lab connection attempt whatever the level, and
+	# 'full' logs every packet this machine handles, faster than the kernel's log buffer
+	# drains — lines are lost. See lab.sh.
+	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
 
 	# ---------------------------------------------------------------------------
@@ -762,7 +807,7 @@ if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
 	FW_CAV_TIME="journal timestamps are RFC 3339 in UTC with microseconds and carry the year. The window bounds, window.start_utc/end_utc, are in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
 	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* on the VM before they leave it: the lab's users' packets only. The VM's own replies (SRC=${TUN_VM_IP}) and unrelated host traffic are excluded"
 	FW_CAV_LEVEL="ufw's own logging level on the VM was 'low'. At 'full' it logs every packet the host handles, Docker's internal traffic included, faster than journald drains the kernel's log buffer, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below"
-	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line, and one per packet: a connection's later packets are logged as well as its first"
+	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line: one per connection attempt, from its first packet. The later packets of a connection already let in are accepted earlier in ufw's chains and are not logged again"
 else
 	FW_UFW_VERSION="$(ufw --version 2>/dev/null | head -1)"
 	FW_KERNEL="$(uname -r)"
@@ -773,9 +818,9 @@ else
 	FW_TS_OFFSET="$TZ_OFFSET"
 	FW_TS_SAME_AS_IDS="no — this log is local time and the IDS evidence is UTC; convert using log_line_utc_offset"
 	FW_CAV_TIME="syslog timestamps carry no year and no sub-second precision; the authoritative window bounds are window.start_utc/end_utc, in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
-	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the same window is excluded. Both directions are kept, so the host's RST replies to refused connections appear alongside the inbound attempts"
-	FW_CAV_LEVEL="ufw logging was set to 'full' for the run; at the default 'low' its LOG rules are rate-limited to 3/min and most of the window would be lost"
-	FW_CAV_AUDIT="at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any verdict line, so lines exceeds the event count: a blocked attempt produces both an AUDIT and a BLOCK entry"
+	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* — the lab's users' packets only; unrelated host traffic logged in the same window is excluded"
+	FW_CAV_LEVEL="ufw's own logging level was 'low' for the run. At 'full' it logs every packet this machine handles, faster than the kernel's log buffer drains, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below, which carry no rate limit"
+	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line: one per connection attempt, from its first packet. The later packets of a connection already let in are accepted earlier in ufw's chains and are not logged again"
 fi
 
 python3 - "$MANIFEST" <<PY
@@ -869,8 +914,8 @@ PY
 # ---------------------------------------------------------------------------
 # The other sources' evidence for the same window
 #
-# Banking starts first. Its collectors run on the VM and spend most of their time waiting
-# for the bank's publish job, so they run while the IDS is being analysed, not after it.
+# Banking starts first. Its collectors run where the bank is and spend most of their time
+# waiting for the bank's publish job, so they run while the IDS is analysed, not after it.
 # ---------------------------------------------------------------------------
 IDS_LOG="$RUN_DIR/ids_${STAMP}.alerts.log"
 GROUP_MANIFEST="$RUN_DIR/window_${STAMP}.group.json"
@@ -885,7 +930,7 @@ if [[ $WITH_BANKING -eq 1 ]]; then
 	# The events collector waits until at least this many in-window events have arrived. Not
 	# the operation count: a balance check publishes nothing and a transfer publishes two.
 	BANK_EXPECT=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1])); print(t.get("expected_events_total", t["executed_ok"]))' "$BANK_GT")
-	log "collecting the bank's evidence on $VM_NAME: the audit trail, and waiting for ${BANK_EXPECT} events"
+	log "collecting the bank's evidence on $BANK_HOST_DESC: the audit trail, and waiting for ${BANK_EXPECT} events"
 	banking_collect "$STAMP" "$BANK_OFFSETS" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$BANK_EXPECT" "$RUN_DIR" \
 		> "$RUN_DIR/.banking-collect.log" 2>&1 &
 	BANK_COLLECT_PID=$!
@@ -979,7 +1024,8 @@ if [[ -n "$BANK_COLLECT_PID" ]]; then
 	if wait "$BANK_COLLECT_PID"; then
 		BANK_SUMMARY=$(python3 "$BANK_MANIFEST_BUILDER" --run-dir "$RUN_DIR" --stamp "$STAMP" \
 			--start "$WINDOW_START_ISO" --end "$WINDOW_END_ISO" --duration "$DURATION" --rate "$BANK_RATE" \
-			--vm "$VM_NAME" --fineract-image "$BANK_FINERACT_IMAGE" --bank-url "$BANK_URL") || BANK_SUMMARY=""
+			--where "$BANK_WHERE" --vm "$VM_NAME" --fineract-image "$BANK_FINERACT_IMAGE" \
+			--bank-url "$BANK_URL") || BANK_SUMMARY=""
 	fi
 	if [[ -z "$BANK_SUMMARY" ]]; then
 		echo "error: banking collection failed; the window has no banking evidence. Collector output:" >&2

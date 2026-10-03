@@ -25,8 +25,9 @@ enabled, and `rsyslogd` running with the stock `/etc/rsyslog.d/20-ufw.conf` rule
 1. A network namespace holds one IP per simulated user (`10.99.0.11`–`10.99.0.20`),
    connected to the host by a veth pair. A "user" in a firewall log *is* a source IP, so
    each one needs a genuinely distinct address.
-2. ufw is enabled with `logging full` and rules that permit the benign ports and leave
-   the "sensitive" ports to the default DROP.
+2. ufw is enabled, at `logging low`, with rules that permit the benign ports and deny
+   everything else from the users' subnet. Two logging rules of the lab's own record a
+   verdict line for every connection the users attempt.
 3. `generate_traffic.py` runs inside the namespace and opens real TCP connections on a
    seeded schedule. Benign users touch permitted ports (→ `[UFW ALLOW]`); attackers sweep
    denied ports (→ `[UFW BLOCK]`). That verdict is the only thing that makes an event
@@ -65,10 +66,13 @@ packets are sent, so evaluation never has to infer them back out of the logs.
 
 ## Two things worth knowing
 
-**`ufw logging full` is mandatory, not a preference.** At the default `low` (and at
-`medium`/`high`) ufw rate-limits its own LOG rules to `3/min`. A 30-second window would
-yield a handful of lines no matter how much traffic you generate. This is the single
-easiest way to get a silently near-empty dataset.
+**The verdict lines come from the lab's own rules, not from ufw's logging level.** ufw
+limits the lines its own rules write to 3 a minute, whatever its level, so a 30-second
+window would yield a handful of lines however much traffic crossed — a silently
+near-empty dataset. The lab installs its own logging rules for the users' traffic, with no
+limit, and leaves ufw's level at `low`. `full` is worse than useless here: it logs every
+packet the machine handles, faster than the kernel's log buffer drains, and lines are lost
+(measured on the research VM, where it cost windows thousands of lines).
 
 **It touches the host firewall.** The script snapshots `/etc/ufw/user.rules`, the
 `ENABLED` and `LOGLEVEL` values, and restores them on exit — including on Ctrl-C. Still:

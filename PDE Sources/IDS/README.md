@@ -11,7 +11,7 @@ No separate traffic is generated for it — it watches the firewall run:
 ```
 netns + veth created
   └─ Slips starts on veth-pde-h, loads modules      ~46s on this machine
-       └─ ufw rules applied, logging full
+       └─ ufw rules applied (logging low; the lab's rules log the users' packets)
             └─ alerts.log byte offset recorded
                  └─ WINDOW: traffic generated        30s
                  └─ ufw log read from its offset
@@ -24,8 +24,8 @@ The ordering is not incidental:
 
 - **Slips starts before the window**, because it loads 15 modules and 45+ threat-intel
   feeds before reading a single packet. A window opened during startup is not observed.
-- **ufw is configured after Slips is ready**, so `logging full` is active for the window
-  rather than for the two minutes Slips spends starting.
+- **ufw is configured after Slips is ready**, so this machine's firewall carries the test
+  rules for as short a time as possible.
 - **Slips is drained after the window**, because it raises evidence in batches once it
   has seen the flows. Collecting the instant the window closes reliably gets an empty
   file.

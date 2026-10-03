@@ -22,9 +22,47 @@ it and produce independent evidence; with banking on, the bank records what thos
 did. `group.json` ties them together — the record an `EvidenceGroup` row would be built
 from.
 
-Fineract, the Evidence Repository and Slips run on a GCP VM; the lab itself stays on this
-machine. [Remote/README.md](Remote/README.md) covers the split, the one-time setup and
-`./vm.sh`.
+Fineract, the Evidence Repository and Slips can run on a GCP VM, with the lab itself on this
+machine — [Remote/README.md](Remote/README.md) covers that split, the one-time setup and
+`./vm.sh`. Or everything can run on this machine, with no cloud account at all: see
+[Running without the cloud](#running-without-the-cloud).
+
+## Running without the cloud
+
+The whole lab can run on one Linux or WSL2 machine. This is how to repeat the evaluation
+without access to the research VM.
+
+| part | what it needs |
+|---|---|
+| the simulated users and the firewall | Linux or WSL2, administrator rights (`sudo`), `ufw`, `rsyslog`, `iptables`, Python 3.9 or later |
+| the bank's public web site | `openssl`, to make its certificate |
+| the IDS | Docker, and the Slips image `stratosphereips/slips:v1.1.23` (about 6 GB) |
+| the bank (optional) | Docker Compose 2.24 or later, about 2 GB of images, and about 5 GB of free memory — 7 GB with the IDS |
+
+```bash
+sudo ./lab.sh up --with-ids --local-bank      # the first time also starts and seeds the bank: allow 10 minutes
+sudo Firewall/simulate-firewall.sh --attack-profile port-scan --seed 1001
+sudo ./lab.sh down                            # your firewall goes back to how it was
+Banking/local-bank.sh stop                    # when you have finished with the bank
+```
+
+Leave out `--local-bank` to run the network sources only (the firewall and the IDS).
+
+The same as in the cloud: the simulated users and what they do, the attack profiles, the
+bank (the same images and settings), the firewall rules, the Slips version, and the
+evidence files and their manifests. Different:
+
+- **Where the traffic is observed.** The firewall and the IDS watch it on this machine rather
+  than on the bank's server. The firewall's log is in this machine's local time (its manifest
+  records the offset); in the cloud both logs are in UTC.
+- **One network card for ten people.** All ten simulated users share one virtual network card
+  here, so Slips' check for one hardware address being used by several IP addresses is
+  switched off. It cannot run in the cloud either: the tunnel carries no hardware addresses.
+- **Your firewall.** While the lab is up, this machine's firewall is switched on with test
+  rules. `lab.sh down` puts it back.
+
+The dissertation's results were captured in the cloud; this reproduces the same experiment
+on different equipment.
 
 ## Launch
 
@@ -125,6 +163,8 @@ many *users* attack) are independent knobs — the brief's "10%, 10:1" conflates
 ./lab.sh up --with-ids --ids-remote --with-banking
                            topology, firewall, packet capture, bank tunnel - left running
 ./lab.sh up --with-ids     ...or Slips locally, sniffing the veth live
+./lab.sh up --with-ids --local-bank
+                           ...or everything on this machine, the bank included
 ./lab.sh status            what is up, or whether a session was orphaned
 ./lab.sh down              restore the firewall, tear everything down
 ```
@@ -136,7 +176,8 @@ back to building and restoring its own — the original one-shot path, exit trap
 sudo Firewall/simulate-firewall.sh          # uses the lab if one is up
 ```
 
-**While the sources are up your firewall is enabled with test rules and `LOGLEVEL=full`.**
+**While the sources are up your firewall is enabled with test rules** (at `logging low`; the
+lab's own rules log every connection the simulated users attempt).
 The console restores it when you quit. If the machine reboots first, `ufw.service` is
 enabled and the firewall comes back up still carrying those rules — so the console
 detects the orphaned session on next launch and offers to restore it. `.lab/` holds the
@@ -256,7 +297,8 @@ sudo Firewall/simulate-firewall.sh --with-ids --duration 30 --attack-profile por
 ```
 
 See [Firewall/README.md](Firewall/README.md) for why the logs are real rather than
-synthesised, the Docker interaction, and why `ufw logging full` is mandatory, and
+synthesised, the Docker interaction, and why ufw's own logging level is not what records
+the evidence, and
 [IDS/README.md](IDS/README.md) for how Slips is attached to the same window.
 
 ## Note

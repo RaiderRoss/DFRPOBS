@@ -254,7 +254,7 @@ firewall_up() {
 	# kernel's log buffer. Measured: journald reported "Missed ~7000 kernel messages" every
 	# ~8s and "/dev/kmsg buffer overrun, some messages lost", and ~6% of the lab's own
 	# attempts never reached the evidence. The lab's traffic does not need 'full': the verdict
-	# LOG rules below log every packet from the subnet on the tunnel device at any level.
+	# LOG rules below log every connection attempt from the subnet on the tunnel device, at any level.
 	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
 
@@ -269,7 +269,7 @@ firewall_up() {
 		|| iptables -I ufw-user-input 2 -i "$dev" -s "$subnet" -p tcp -m multiport ! --dports "$allowed_ports" \
 			-j LOG --log-prefix "[UFW BLOCK] " --log-level 4
 
-	log "ufw enabled, logging low, verdict rules logging every $subnet packet on $dev"
+	log "ufw enabled, logging low, verdict rules logging every $subnet connection attempt on $dev"
 	log "CONFIRM ACCESS, then: vm-net.sh firewall-keep"
 }
 
@@ -386,7 +386,7 @@ listener_down() {
 # threat-intel cache rather than downloading ~45 feeds again.
 slips_up() {
 	local dev="$1" user="$2" subdir="$3" service_port="${4:-}"
-	local img="${SLIPS_IMG:-stratosphereips/slips:latest}"
+	local img="${SLIPS_IMG:-stratosphereips/slips:v1.1.23}"   # pinned: see IDS/slips-lib.sh
 	local home outdir services mounts=()
 	home="$(_user_home "$user")" || die "no home for $user"
 	outdir="$home/$subdir"

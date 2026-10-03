@@ -16,7 +16,7 @@
 # ==============================================================
 set -u
 
-IMG="${SLIPS_IMG:-stratosphereips/slips:latest}"
+IMG="${SLIPS_IMG:-stratosphereips/slips:v1.1.23}"   # pinned: see IDS/slips-lib.sh
 REDIS="${SLIPS_REDIS:-pde-slips-redis}"
 DIR="$HOME/pde-slips/.warm"
 
