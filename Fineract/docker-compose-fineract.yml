@@ -76,6 +76,27 @@ services:
       - kafka
     restart: unless-stopped
 
+  # The PDE banking-events collector: reads external-events between two sets of offsets
+  # for one capture window (see Kafka_Listener/collect_window.py). Same image as the
+  # listener, because it decodes with the same pinned schemas. Under a profile so that
+  # `up -d` never starts it — it is run on demand, once per window:
+  #   docker compose -f docker-compose-fineract.yml --profile pde run --rm pde-collector offsets
+  pde-collector:
+    build:
+      context: ./Kafka_Listener
+    profiles: ["pde"]
+    entrypoint: ["python", "collect_window.py"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - AVRO_SCHEMA_DIR=/schemas
+      - AVRO_TEMPLATE_DIR=/schemas/avro-templates
+      - FINERACT_URL=https://fineract-manager:8443/fineract-provider/api/v1
+    volumes:
+      - ${PDE_COLLECT_DIR:-/tmp/pde-collect}:/out
+    depends_on:
+      - kafka
+
 volumes:
   fineract-plugins:
   listener-dead-letter:

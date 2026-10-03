@@ -1,0 +1,28 @@
+# Local bank only. Layered over Fineract/docker-compose-fineract.yml by Banking/local-bank.sh.
+#
+# The same images and the same settings as the bank on the research VM; the one difference is
+# what this machine publishes. Only Fineract's API, and only on the loopback:
+#
+#   - The lab's relay (Remote/bank-relay.py) puts the API on the lab's host address, where a
+#     simulated user's call crosses this machine's INPUT chain and the firewall logs it. A
+#     port Docker published there instead would be reached through nat/PREROUTING and FORWARD,
+#     and the firewall would never see the call — the reason the VM uses a relay too.
+#   - The database, the message broker and the second Fineract node are not published at all.
+#     Nothing outside the compose network needs them — the events collector joins that network
+#     and the audit collector uses `docker exec` — and leaving them unpublished keeps them from
+#     colliding with a PostgreSQL or Kafka a teammate already runs on this machine.
+#   - This build answers with default credentials; publishing it on every interface would
+#     offer the bank to the whole network the machine is on.
+#
+# !override replaces a list and !reset empties it; without them compose appends, and the
+# tracked file's 0.0.0.0 publications would survive. Both need Compose 2.24 or later.
+services:
+  fineract-manager:
+    ports: !override
+      - "127.0.0.1:8443:8443"
+  fineract-worker:
+    ports: !reset []
+  db:
+    ports: !reset []
+  kafka:
+    ports: !reset []

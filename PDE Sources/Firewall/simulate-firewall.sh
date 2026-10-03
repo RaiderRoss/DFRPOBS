@@ -38,6 +38,7 @@ IDS_READY_TIMEOUT=240
 # instant the window closes reliably collects nothing. This is how long to keep it
 # running past the window before collecting.
 IDS_DRAIN=45
+IDS_DRAIN_SET=0
 
 # Topology, port lists and lab paths live in one place so this script and lab.sh cannot
 # drift apart on them — see the note there about why the port lists interact.
@@ -51,23 +52,57 @@ source "$PDE_ROOT/lab-config.sh"
 # keeps the one-shot path — and its exit trap — exactly as it was.
 LAB_MODE=0
 LAB_WITH_IDS=0
+LAB_IDS_MODE=local
+LAB_PCAP=""
+LAB_WITH_BANKING=0
 LAB_SLIPS_OUT=""
 LAB_USERS=0
 LAB_STARTED_UTC=""
 LAB_NS="$NS"
 LAB_VETH_HOST="$VETH_HOST"
+# Tunnel mode: the users stay here but everything that observes them is on the VM, so the
+# firewall log, the IDS and the sessions' own authentication record are all read from there.
+# TARGET_IP is what the generators aim at, and it is the one value that changes the traffic
+# itself rather than only where it is collected from.
+LAB_VIA_TUNNEL=0
+LAB_VM_SLIPS_OUT=""
+TARGET_IP="$HOST_IP"
+# Without the VM: where the bank is (vm, or local with --local-bank) and the helpers the lab
+# started on this machine — the bank relay and the bank's public web site.
+LAB_BANK_WHERE=vm
+LAB_BANK_SEED=""
+LAB_BANK_RELAY_PID=""
+LAB_WEB_PID=""
 if [[ -f "$LAB_STATE" ]]; then
 	# Parsed rather than sourced — see lab_get in lab-config.sh.
 	LAB_NS=$(lab_get LAB_NS "$NS")
 	if ip netns list 2>/dev/null | awk '{print $1}' | grep -qx "$LAB_NS"; then
 		LAB_MODE=1
 		LAB_WITH_IDS=$(lab_get LAB_WITH_IDS 0)
+		LAB_IDS_MODE=$(lab_get LAB_IDS_MODE local)
+		LAB_PCAP=$(lab_get LAB_PCAP "")
+		LAB_WITH_BANKING=$(lab_get LAB_WITH_BANKING 0)
 		LAB_SLIPS_OUT=$(lab_get LAB_SLIPS_OUT "")
 		LAB_USERS=$(lab_get LAB_USERS 0)
 		LAB_STARTED_UTC=$(lab_get LAB_STARTED_UTC "?")
 		LAB_VETH_HOST=$(lab_get LAB_VETH_HOST "$VETH_HOST")
+		LAB_VIA_TUNNEL=$(lab_get LAB_VIA_TUNNEL 0)
+		LAB_VM_SLIPS_OUT=$(lab_get LAB_VM_SLIPS_OUT "")
+		TARGET_IP=$(lab_get LAB_TARGET_IP "$HOST_IP")
+		LAB_BANK_WHERE=$(lab_get LAB_BANK_WHERE vm)
+		LAB_BANK_SEED=$(lab_get LAB_BANK_SEED "")
+		LAB_BANK_RELAY_PID=$(lab_get LAB_BANK_RELAY_PID "")
+		LAB_WEB_PID=$(lab_get LAB_WEB_PID "")
 	fi
 fi
+
+# The banking source: the bank's audit trail and its event stream over the same window,
+# driven by generate_banking.py alongside the network traffic. Lab-only — the bank is on the
+# research VM or, with `lab.sh up --local-bank`, on this machine, and only a lab holds the
+# path that reaches it.
+WITH_BANKING=0
+BANK_RATE=0.5
+BANK_PROFILE=loan-fraud
 
 usage() {
 	sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
@@ -89,7 +124,12 @@ usage() {
 	                         same packets over the same window (adds ~2 min of
 	                         startup before the window, and --ids-drain after)
 	  --ids-drain S          seconds to keep Slips running past the window so it
-	                         can raise evidence for it       (default $IDS_DRAIN)
+	                         can raise evidence for it (default 45; 75 offline)
+	  --with-banking         also drive the bank and collect its audit trail and
+	                         event stream for the window (needs a lab started
+	                         with --with-banking; the bank is on the research VM)
+	  --bank-rate R          benign banking operations per second (default $BANK_RATE)
+	  --bank-profile P       loan-fraud|none                  (default $BANK_PROFILE)
 
 	Note that --malicious-pct and --malicious-users are independent knobs. "10%" of
 	events and a 10:1 user ratio are not the same statement, and a brief should say
@@ -110,7 +150,10 @@ while [[ $# -gt 0 ]]; do
 		--dry-run) DRY_RUN=1; shift ;;
 		--keep-firewall) KEEP_FIREWALL=1; shift ;;
 		--with-ids) WITH_IDS=1; shift ;;
-		--ids-drain) IDS_DRAIN="$2"; shift 2 ;;
+		--ids-drain) IDS_DRAIN="$2"; IDS_DRAIN_SET=1; shift 2 ;;
+		--with-banking) WITH_BANKING=1; shift ;;
+		--bank-rate) BANK_RATE="$2"; shift 2 ;;
+		--bank-profile) BANK_PROFILE="$2"; shift 2 ;;
 		-h|--help) usage; exit 0 ;;
 		*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -128,6 +171,9 @@ command -v ip >/dev/null || die "iproute2 not installed"
 # Used directly for verdict logging; see the note where the LOG rules are installed.
 command -v iptables >/dev/null || die "iptables not installed"
 command -v python3 >/dev/null || die "python3 not installed"
+# Checked here too, not only in lab.sh: a one-shot capture builds its own rules, so it can
+# mislabel a window on its own without a lab ever having existed.
+lab_check_port_lists || die "the port lists contradict each other; fix lab-config.sh"
 
 # --dry-run is what someone runs *before* deciding to let this touch their firewall, so
 # it must not itself demand root.
@@ -135,6 +181,9 @@ if [[ $DRY_RUN -eq 0 ]]; then
 	[[ $EUID -eq 0 ]] || die "must run as root (firewall rules and network namespaces)"
 	pgrep -x rsyslogd >/dev/null || die "rsyslogd is not running; ufw log lines would not \
 reach $UFW_LOG. Start it with: systemctl start rsyslog"
+	# A one-shot capture starts the bank's web site itself, and it serves HTTPS.
+	[[ $LAB_MODE -eq 1 ]] || command -v openssl >/dev/null \
+		|| die "openssl not installed (the bank's web site needs a certificate)"
 fi
 
 IDS_LIB="$SCRIPT_DIR/../IDS/slips-lib.sh"
@@ -176,6 +225,97 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	fi
 fi
 
+# Where the IDS runs is the lab's decision too. Remote: the lab's tcpdump has been writing
+# the veth to LAB_PCAP since it started, and this window's packets go to Slips on the VM.
+IDS_REMOTE=0
+if [[ $LAB_MODE -eq 1 && $WITH_IDS -eq 1 && "$LAB_IDS_MODE" == "remote" ]]; then
+	IDS_REMOTE=1
+fi
+
+# Slips reports a connection that never got an answer — the attacker's, to closed ports — only
+# about a minute after it was sent, when its traffic recorder gives up on it. Measured offline:
+# a port scan's connections reached Slips' evidence 25–55 s after the window closed, so with the
+# 45 s that suits the cloud the last third of them was missing from the window. In the cloud,
+# fetching the evidence over the network happens to add those seconds. So when Slips runs on
+# this machine, and unless told otherwise, wait 75 s: the last connection, plus margin.
+if [[ $IDS_DRAIN_SET -eq 0 && $IDS_REMOTE -eq 0 && $LAB_VIA_TUNNEL -eq 0 ]]; then
+	IDS_DRAIN=75
+fi
+
+# Banking, likewise, is whatever the running lab was built with; it cannot be conjured for
+# one capture, because the tunnel to the bank belongs to the lab.
+if [[ $LAB_MODE -eq 1 ]]; then
+	if [[ $WITH_BANKING -eq 1 && "${LAB_WITH_BANKING:-0}" -ne 1 ]]; then
+		die "the running lab was built without the banking source; './lab.sh down' then './lab.sh up --with-banking'"
+	fi
+	WITH_BANKING="${LAB_WITH_BANKING:-0}"
+elif [[ $WITH_BANKING -eq 1 ]]; then
+	die "--with-banking needs a running lab (the bank tunnel belongs to it): ./lab.sh up --with-banking"
+fi
+
+if [[ $IDS_REMOTE -eq 1 || $LAB_VIA_TUNNEL -eq 1 || ( $WITH_BANKING -eq 1 && "$LAB_BANK_WHERE" != "local" ) ]]; then
+	# shellcheck source=../Remote/vm-lib.sh
+	source "$PDE_ROOT/Remote/vm-lib.sh"
+fi
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	# shellcheck source=../Remote/tun-lib.sh
+	source "$PDE_ROOT/Remote/tun-lib.sh"
+	# shellcheck source=../Remote/remote-source-lib.sh
+	source "$PDE_ROOT/Remote/remote-source-lib.sh"
+fi
+if [[ $WITH_BANKING -eq 1 ]]; then
+	# Where the bank is, and which seed describes it, are the lab's.
+	BANK_WHERE="$LAB_BANK_WHERE"
+	[[ -n "$LAB_BANK_SEED" ]] && BANK_SEED="$LAB_BANK_SEED"
+	# shellcheck source=../Banking/banking-lib.sh
+	source "$PDE_ROOT/Banking/banking-lib.sh"
+	# The bank is reached at the tunnel's far end in this mode, through the relay that makes
+	# the call cross the VM's INPUT chain. banking-lib.sh computes this from HOST_IP, which
+	# is this machine — where nothing is listening.
+	if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+		BANK_URL="https://${TARGET_IP}:${BANK_PORT}/fineract-provider"
+	fi
+fi
+
+if [[ $DRY_RUN -eq 0 && $IDS_REMOTE -eq 1 ]]; then
+	# An empty or stopped capture would not fail anything below: the slice would simply be
+	# empty and Slips would report nothing — a quiet IDS that is really a dead sensor.
+	[[ -n "$LAB_PCAP" && -s "$LAB_PCAP" ]] || die "the lab records a remote IDS but no capture file; restart the lab"
+	_tpid=$(lab_get LAB_TCPDUMP_PID "")
+	[[ -n "$_tpid" && -d "/proc/$_tpid" ]] || die "the lab's packet capture is not running; restart the lab"
+	slips_remote_preflight || die "remote IDS preflight failed"
+fi
+if [[ $DRY_RUN -eq 0 && $WITH_BANKING -eq 1 ]]; then
+	banking_preflight || die "banking preflight failed"
+	# In tunnel mode the bank is reached through the relay on the tunnel device, not through
+	# a port forward, so it is the tunnel that has to be up.
+	if [[ "$BANK_WHERE" == "local" ]]; then
+		helper_alive "$LAB_BANK_RELAY_PID" "Remote/bank-relay.py" \
+			|| die "the lab's bank relay is not running; restart the lab ('./lab.sh down', then up --local-bank)"
+	elif [[ $LAB_VIA_TUNNEL -eq 0 ]]; then
+		vm_tunnel_running bank || die "the lab's bank tunnel is down; restart the lab"
+	fi
+fi
+
+# The honest customers browse the bank's web site. Without it every benign attempt is a
+# connection to a closed port, which a flow-based IDS cannot tell from a scan — the window
+# would measure the lab's gap, not the IDS.
+if [[ $DRY_RUN -eq 0 && $LAB_MODE -eq 1 && $LAB_VIA_TUNNEL -eq 0 ]]; then
+	helper_alive "$LAB_WEB_PID" "Firewall/benign_web.py" \
+		|| die "the lab's web site is not running (or the lab predates it); restart the lab ('./lab.sh down', then up)"
+fi
+
+if [[ $DRY_RUN -eq 0 && $LAB_VIA_TUNNEL -eq 1 ]]; then
+	# Every source in this mode is read from the VM, so a dropped tunnel is not a degraded
+	# window, it is a window with no evidence in it at all.
+	tun_session_running || die "the lab's tunnel device is down; './lab.sh down' then up"
+	ping -c1 -W2 -I "$TUN_DEV" "$TUN_VM_IP" >/dev/null 2>&1 		|| die "the tunnel device is up but $TUN_VM_IP does not answer; restart the lab"
+	remote_source_preflight || die "the VM's logs cannot be read"
+	if [[ $WITH_IDS -eq 1 ]]; then
+		[[ -n "$LAB_VM_SLIPS_OUT" ]] || die "the lab records an IDS on the VM but no output directory; restart the lab"
+	fi
+fi
+
 # guaranteed-alert depends on a listener and permit rules. A lab started before they
 # existed has neither: every attempt would be denied, Slips would rate it MEDIUM at best,
 # and the run would look like the IDS failing to alert. One-shot captures build their own.
@@ -184,9 +324,22 @@ if [[ "$ATTACK_PROFILE" == "guaranteed-alert" && $DRY_RUN -eq 0 ]]; then
 		if [[ -z "$(lab_get LAB_ALERT_PORTS "")" ]]; then
 			die "the running lab predates the guaranteed-alert profile; restart it ('./lab.sh down', then up)"
 		fi
-		LAB_LISTENER_PID=$(lab_get LAB_LISTENER_PID "")
-		if [[ -z "$LAB_LISTENER_PID" || ! -d "/proc/$LAB_LISTENER_PID" ]]; then
-			die "the lab's alert listener is not running; restart the lab ('./lab.sh down', then up)"
+		if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+			# The listener is on the VM in this mode, bound to the tunnel address, so there is
+			# no local pid to look for. Checked by connecting to the port the way a simulated
+			# user will, which covers the listener, the VM's permit rule and the tunnel at
+			# once — a stronger check than a pid, on either path.
+			_alert_port="${ALERT_PORTS%%,*}"
+			# From INSIDE the namespace. The VM permits 10.99.0.0/24 and denies everything
+			# else, so a probe sourced from this host's own tunnel address is correctly
+			# refused, and would report a healthy lab as broken.
+			ip netns exec "$LAB_NS" bash -c "exec 3<>/dev/tcp/$TUN_VM_IP/$_alert_port" 2>/dev/null \
+				|| die "nothing answers $TUN_VM_IP:$_alert_port on $VM_NAME; restart the lab ('./lab.sh down', then up)"
+		else
+			LAB_LISTENER_PID=$(lab_get LAB_LISTENER_PID "")
+			if [[ -z "$LAB_LISTENER_PID" || ! -d "/proc/$LAB_LISTENER_PID" ]]; then
+				die "the lab's alert listener is not running; restart the lab ('./lab.sh down', then up)"
+			fi
 		fi
 	fi
 	# An alert is the IDS's to raise. Without it the traffic is still sent — permitted
@@ -219,11 +372,12 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	cat <<-EOF
 	Would apply:
 	  ufw --force enable
-	  ufw logging full                       # unrate-limited; see note below
+	  ufw logging low                        # the verdict rules below log every lab connection attempt
 
 	  # Order matters, and these are applied in this order:
 	  ufw allow from $SUBNET to any port <${BENIGN_PORTS}> proto tcp
 	  ufw allow from $SUBNET to any port <${ALERT_PORTS}> proto tcp    # guaranteed-alert target
+	  ufw allow from $SUBNET to any port ${BANK_PORT} proto tcp           # the bank, via the lab's tunnel or relay
 	  ufw deny  from $SUBNET                                 # everything else = the attacker
 	  ufw allow to any port <${PRESERVE_PORTS}> proto tcp    # keep dev stack reachable
 
@@ -238,24 +392,20 @@ if [[ $DRY_RUN -eq 1 ]]; then
 	           -j LOG --log-prefix "[UFW BLOCK] "
 
 	  ufw's own 'log' keyword hardcodes -m limit --limit 3/min --limit-burst 10 with no
-	  loglevel check, so it caps verdict lines at ~11 per rule per 30s no matter what
-	  'logging full' says. These replace it. They are removed when ufw reloads on restore.
+	  loglevel check, so it caps verdict lines at ~11 per rule per 30s whatever ufw's
+	  logging level. These replace it. They are removed when ufw reloads on restore.
 
 	  ip netns add $NS
 	  veth $VETH_HOST <-> $VETH_NS, host $HOST_IP/24
 	  namespace addresses: ${USER_IPS[*]}
 	  attackers: ${MALICIOUS_IPS[*]:-none}
 	  listener on $HOST_IP ports <${ALERT_PORTS}>, accept-and-close (guaranteed-alert)
+	  the bank's public web site on $HOST_IP: http <${WEB_HTTP_PORTS}>, https <${WEB_HTTPS_PORTS}>
 
-	ufw rate-limits logging in two independent places, and both would gut a ${DURATION}s window:
-
-	  1. the AUDIT chains, limited below loglevel 'high' — lifted by 'logging full'
-	  2. the per-rule 'log' keyword, limited unconditionally with no loglevel check
-	     — not lifted by anything, which is why the LOG rules above are installed
-	     directly instead
-
-	Without both, a run returns roughly 11 verdict lines per rule and looks like a
-	firewall that saw almost no traffic.
+	ufw rate-limits its per-rule 'log' keyword unconditionally, with no loglevel check —
+	which would gut a ${DURATION}s window — so the LOG rules above are installed directly
+	instead. ufw's own level stays 'low': 'full' logs every packet the machine handles,
+	and at that volume the kernel's log buffer overflows and lines are lost.
 	EOF
 	exit 0
 fi
@@ -291,6 +441,7 @@ else
 			slips_stop
 		fi
 		alert_listener_stop "${LISTENER_PID:-}"
+		web_front_stop "${WEB_PID:-}"
 		ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
 		ip netns del "$NS" 2>/dev/null || true
 		ip link del "$VETH_HOST" 2>/dev/null || true
@@ -307,6 +458,7 @@ else
 		return $rc
 	}
 	LISTENER_PID=""
+	WEB_PID=""
 	trap restore EXIT INT TERM
 
 	# ---------------------------------------------------------------------------
@@ -333,6 +485,11 @@ else
 	LISTENER_PID=$(alert_listener_start "$HOST_IP" "$STATE_DIR/alert-listener.pid" "$STATE_DIR/alert-listener.log") \
 		|| die "could not start the alert listener"
 
+	# What the honest customers browse; stopped by the trap. See lab.sh.
+	log "starting the bank's public web site on $HOST_IP (http $WEB_HTTP_PORTS, https $WEB_HTTPS_PORTS)"
+	WEB_PID=$(web_front_start "$HOST_IP" "$STATE_DIR/web-front.pid" "$STATE_DIR/web-front.log" "$LAB_DIR/web-tls") \
+		|| die "could not start the bank's web site"
+
 	# ---------------------------------------------------------------------------
 	# IDS
 	#
@@ -355,7 +512,7 @@ else
 		rm -rf "$SLIPS_OUT"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
-		slips_start "$VETH_HOST" "$SLIPS_OUT" || die "could not start Slips"
+		slips_start "$VETH_HOST" "$SLIPS_OUT" "$BANK_PORT" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
 	fi
@@ -363,7 +520,7 @@ else
 	# ---------------------------------------------------------------------------
 	# Firewall
 	# ---------------------------------------------------------------------------
-	log "configuring ufw (logging=full, default deny incoming)"
+	log "configuring ufw (logging low; the verdict rules log every connection the users attempt)"
 	# Rule ORDER carries the labelling, and ufw evaluates in the order rules are added.
 	# PRESERVE_PORTS deliberately overlaps MALICIOUS_PORTS (22 and 5432 are both a service
 	# this host needs reachable and a port an attacker probes). If the preserve rules came
@@ -383,6 +540,10 @@ else
 		ufw allow from "$SUBNET" to any port "$p" proto tcp >/dev/null
 	done
 
+	# The bank's port is in ALLOWED_PORTS, so the verdict rules call it ALLOW; permitted
+	# here too, so the rule and the label agree even with no bank behind it.
+	ufw allow from "$SUBNET" to any port "$BANK_PORT" proto tcp >/dev/null
+
 	# Everything else from the test subnet is the attacker. An explicit deny is clearer
 	# than relying on the default policy and, unlike the default, it is unambiguously
 	# attributable to this run.
@@ -392,7 +553,10 @@ else
 	for p in "${_preserve[@]}"; do
 		ufw allow "$p/tcp" >/dev/null
 	done
-	ufw logging full >/dev/null
+	# 'low', not 'full': the verdict rules below log every lab connection attempt whatever the level, and
+	# 'full' logs every packet this machine handles, faster than the kernel's log buffer
+	# drains — lines are lost. See lab.sh.
+	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
 
 	# ---------------------------------------------------------------------------
@@ -425,23 +589,60 @@ fi
 # ---------------------------------------------------------------------------
 # Capture window
 # ---------------------------------------------------------------------------
+
+# The bank's event stream is bounded by broker offsets, which take a few seconds to read
+# over IAP. Taken before the window opens rather than at its first instant: everything
+# published after this point is at or beyond these offsets, so nothing in the window can
+# be missed, and the window start stays the moment traffic actually begins.
+BANK_OFFSETS=""
+if [[ $WITH_BANKING -eq 1 ]]; then
+	log "recording the bank's event-stream offsets"
+	BANK_OFFSETS=$(banking_offsets) || die "could not read the bank's event-stream offsets"
+	[[ -n "$BANK_OFFSETS" ]] || die "the events collector returned no offsets"
+fi
+
 WINDOW_START_EPOCH=$(date -u +%s)
 WINDOW_START_ISO=$(date -u -d "@$WINDOW_START_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 STAMP=$(date -u -d "@$WINDOW_START_EPOCH" +%Y%m%d%H%M%S)
 
 # Byte offset rather than a timestamp filter: syslog's traditional format has neither a
 # year nor sub-second precision, so it cannot reliably bound a 30-second window on its own.
-SRC_LOG="$UFW_LOG"
-[[ -f "$SRC_LOG" ]] || SRC_LOG="$KERN_LOG"
-LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
-log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
+# In tunnel mode the firewall is the VM's, so the log is the VM's: the boundary is a byte
+# offset taken there, and the range is fetched back after the window closes. Same mechanism,
+# one machine further away.
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	SRC_LOG="$VM_UFW_LOG"
+	LOG_OFFSET=$(remote_offset "$VM_UFW_LOG")
+	if [[ "$VM_UFW_LOG" == "journal" ]]; then
+		FW_LOG_DESC="netfilter LOG target -> systemd-journald on $VM_NAME, read with journalctl -k, lines matching [UFW"
+	else
+		FW_LOG_DESC="netfilter LOG target -> rsyslog -> $VM_UFW_LOG on $VM_NAME"
+	fi
+	log "capturing from $SRC_LOG on $VM_NAME at byte offset $LOG_OFFSET"
+else
+	SRC_LOG="$UFW_LOG"
+	[[ -f "$SRC_LOG" ]] || SRC_LOG="$KERN_LOG"
+	LOG_OFFSET=$(stat -c %s "$SRC_LOG" 2>/dev/null || echo 0)
+	FW_LOG_DESC="netfilter LOG target -> rsyslog -> $SRC_LOG"
+	log "capturing from $SRC_LOG at byte offset $LOG_OFFSET"
+fi
 
 # Same mechanism for the IDS, and for the same reason: both sources keep running and
 # writing throughout, and the window is a bounded read against them rather than a pause.
 IDS_ALERTS_OFFSET=0
-if [[ $WITH_IDS -eq 1 ]]; then
+PCAP_OFFSET=0
+if [[ $IDS_REMOTE -eq 1 ]]; then
+	# Remote: the offset is into the lab's packet capture, and the window's packets are what
+	# tcpdump writes after it.
+	PCAP_OFFSET=$(pcap_offset "$LAB_PCAP")
+elif [[ $LAB_VIA_TUNNEL -eq 1 && $WITH_IDS -eq 1 ]]; then
+	# Slips is sniffing the device on the VM and writing there, so its evidence file is read
+	# by an offset taken there, exactly as the firewall's is.
+	IDS_ALERTS_OFFSET=$(remote_offset "$LAB_VM_SLIPS_OUT/alerts/alerts.log")
+elif [[ $WITH_IDS -eq 1 ]]; then
 	IDS_ALERTS_OFFSET=$(slips_alerts_offset "$SLIPS_OUT")
 fi
+
 
 # One directory per captured window. The window is the unit of evidence — an
 # EvidenceGroup is exactly "these files, this window" — so the filesystem says the same
@@ -455,6 +656,21 @@ GT_JSON="$RUN_DIR/firewall_${STAMP}.groundtruth.json"
 OUT_LOG="$RUN_DIR/firewall_${STAMP}.log"
 MANIFEST="$RUN_DIR/firewall_${STAMP}.manifest.json"
 
+BANK_GT="$RUN_DIR/banking_${STAMP}.groundtruth.json"
+BANK_GEN_PID=""
+if [[ $WITH_BANKING -eq 1 ]]; then
+	# Alongside the network traffic, from the same namespace and the same user addresses:
+	# the attacker who scans is the one who logs into the bank. Started first, since its
+	# plan begins at the same t0 as the traffic's.
+	log "driving the bank: benign ${BANK_RATE}/s, profile=${BANK_PROFILE}"
+	ip netns exec "$LAB_NS" python3 "$BANK_GEN" \
+		--seed-file "$BANK_SEED" --url "$BANK_URL" \
+		--users "$USERS_CSV" --malicious-users "$MALICIOUS_CSV" \
+		--duration "$DURATION" --rate "$BANK_RATE" --profile "$BANK_PROFILE" \
+		--seed "$SEED" --out "$BANK_GT" &
+	BANK_GEN_PID=$!
+fi
+
 log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PCT}% malicious, profile=${ATTACK_PROFILE}"
 # $LAB_NS, not $NS: under a lab the namespace is whichever one that session recorded,
 # and defaulting to the compiled-in name would run the traffic somewhere else entirely.
@@ -462,7 +678,7 @@ log "generating traffic: ${USERS} users, ${DURATION}s, ${RATE}/s, ${MALICIOUS_PC
 ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--users "$USERS_CSV" \
 	--malicious-users "$MALICIOUS_CSV" \
-	--target "$HOST_IP" \
+	--target "$TARGET_IP" \
 	--duration "$DURATION" \
 	--rate "$RATE" \
 	--malicious-pct "$MALICIOUS_PCT" \
@@ -473,17 +689,54 @@ ip netns exec "$LAB_NS" python3 "$SCRIPT_DIR/generate_traffic.py" \
 	--seed "$SEED" \
 	--out "$GT_JSON"
 
-WINDOW_END_ISO=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CAPTURE_ERRORS=0
+if [[ -n "$BANK_GEN_PID" ]]; then
+	if ! wait "$BANK_GEN_PID" || [[ ! -s "$BANK_GT" ]]; then
+		echo "error: the banking generator failed; the window has no banking evidence" >&2
+		WITH_BANKING=0
+		CAPTURE_ERRORS=1
+	fi
+fi
+
+# Rounded UP to the whole second. Bounds are recorded in whole seconds, and truncating the
+# end drops whatever happened in the window's last partial second: the start is floored
+# and the end ceilinged, so both err outward and nothing inside the window falls outside
+# its bounds. (Measured: two deposits at hh:mm:11.2 and .9 were lost from a window that
+# closed at 11.95 and was recorded as ending at 11.)
+WINDOW_END_ISO=$(date -u -d "@$(( $(date -u +%s) + 1 ))" +%Y-%m-%dT%H:%M:%SZ)
 
 # rsyslog batches writes; without this the tail of the window is routinely missing.
-log "waiting for rsyslog to flush"
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	log "letting the VM's logging settle"
+else
+	log "waiting for rsyslog to flush"
+fi
 sleep 3
 
 # ---------------------------------------------------------------------------
 # Extract, hash, seal
 # ---------------------------------------------------------------------------
+# In tunnel mode the log is on the VM, so the window's byte range is brought here first and
+# everything below then runs against a local file exactly as it always did. The digest taken
+# on the VM is checked on arrival, so the range is known to have crossed intact; the evidence
+# artifact itself is hashed further down, after the filter.
+FW_RANGE_BYTES=0
+FW_RANGE_SHA=""
+FW_RAW=""
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	FW_RAW="$RUN_DIR/.ufw-range"
+	if read -r FW_RANGE_BYTES FW_RANGE_SHA < <(remote_slice "$VM_UFW_LOG" "$LOG_OFFSET" "$STAMP" "ufw-range.log" "$FW_RAW" "SRC=${USER_IP_BASE}"); then
+		log "fetched ${FW_RANGE_BYTES} bytes of $VM_UFW_LOG from $VM_NAME"
+		SRC_LOG="$FW_RAW"
+		LOG_OFFSET=0
+	else
+		die "could not bring the firewall's window home from $VM_NAME"
+	fi
+fi
+
 tail -c "+$((LOG_OFFSET + 1))" "$SRC_LOG" 2>/dev/null \
 	| grep -F "SRC=${USER_IP_BASE}" > "$OUT_LOG" || true
+[[ -n "$FW_RAW" ]] && rm -f "$FW_RAW"
 
 # NOT named LINES. `LINES` is a bash special variable: with `checkwinsize` on — the
 # default since bash 5.0, and it applies to scripts too whenever the shell has a
@@ -539,18 +792,48 @@ TZ_OFFSET=$(date +%z)
 SHA256=$(sha256sum "$OUT_LOG" | cut -d' ' -f1)
 chmod 444 "$OUT_LOG"
 
+# Which ufw and which kernel actually logged this. In tunnel mode that is the VM's, and a
+# manifest naming this machine's would be describing software that logged nothing.
+if [[ $LAB_VIA_TUNNEL -eq 1 ]]; then
+	IFS='|' read -r FW_UFW_VERSION FW_KERNEL FW_HOST <<< "$(remote_firewall_facts)"
+	FW_METHOD="real packets across the INPUT chain of $VM_NAME, arriving on $TUN_DEV from this machine's namespace over the tunnel device; log lines are kernel-generated and were not synthesised"
+	# The journal renders RFC 3339 in UTC with microseconds, not the RFC 3164 that rsyslog
+	# writes locally. Recording the local machine's zone against these lines would tell an
+	# investigator to shift every one of them by the offset between here and UTC.
+	FW_TS_FORMAT="RFC 3339: 'YYYY-MM-DDThh:mm:ss.ffffff+00:00', UTC, microseconds"
+	FW_TS_ZONE="UTC"
+	FW_TS_OFFSET="+0000"
+	FW_TS_SAME_AS_IDS="yes — both are RFC 3339 UTC and can be compared directly"
+	FW_CAV_TIME="journal timestamps are RFC 3339 in UTC with microseconds and carry the year. The window bounds, window.start_utc/end_utc, are in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
+	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* on the VM before they leave it: the lab's users' packets only. The VM's own replies (SRC=${TUN_VM_IP}) and unrelated host traffic are excluded"
+	FW_CAV_LEVEL="ufw's own logging level on the VM was 'low'. At 'full' it logs every packet the host handles, Docker's internal traffic included, faster than journald drains the kernel's log buffer, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below"
+	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line: one per connection attempt, from its first packet. The later packets of a connection already let in are accepted earlier in ufw's chains and are not logged again"
+else
+	FW_UFW_VERSION="$(ufw --version 2>/dev/null | head -1)"
+	FW_KERNEL="$(uname -r)"
+	FW_HOST="$(hostname)"
+	FW_METHOD="real packets across the host INPUT chain; log lines are kernel-generated and were not synthesised"
+	FW_TS_FORMAT="RFC 3164 syslog: 'Mon DD HH:MM:SS', LOCAL time, no year, no timezone, whole seconds"
+	FW_TS_ZONE="$TZ_NAME"
+	FW_TS_OFFSET="$TZ_OFFSET"
+	FW_TS_SAME_AS_IDS="no — this log is local time and the IDS evidence is UTC; convert using log_line_utc_offset"
+	FW_CAV_TIME="syslog timestamps carry no year and no sub-second precision; the authoritative window bounds are window.start_utc/end_utc, in whole seconds with the start rounded down and the end rounded up, so that nothing inside the window falls outside them"
+	FW_CAV_FILTER="lines are filtered to SRC=${USER_IP_BASE}* — the lab's users' packets only; unrelated host traffic logged in the same window is excluded"
+	FW_CAV_LEVEL="ufw's own logging level was 'low' for the run. At 'full' it logs every packet this machine handles, faster than the kernel's log buffer drains, and lines are lost. The lab's traffic is logged in full regardless, by the verdict rules below, which carry no rate limit"
+	FW_CAV_AUDIT="at 'low' ufw emits no [UFW AUDIT] lines for this traffic, so every line is a verdict line: one per connection attempt, from its first packet. The later packets of a connection already let in are accepted earlier in ufw's chains and are not logged again"
+fi
+
 python3 - "$MANIFEST" <<PY
-import json, subprocess, sys
+import json, sys
 manifest = {
     "source": {
         "pde_source": "firewall",
         "product": "ufw",
-        "version": subprocess.run(["ufw","--version"], capture_output=True, text=True)
-                     .stdout.splitlines()[0].strip(),
-        "kernel": subprocess.run(["uname","-r"], capture_output=True, text=True).stdout.strip(),
-        "log_facility": "netfilter LOG target -> rsyslog -> ${SRC_LOG}",
-        "collection_method": "real packets across the host INPUT chain; log lines are "
-                            "kernel-generated and were not synthesised",
+        "version": "${FW_UFW_VERSION}",
+        "kernel": "${FW_KERNEL}",
+        "observed_on": "${FW_HOST}",
+        "log_facility": "${FW_LOG_DESC}",
+        "collection_method": "${FW_METHOD}",
     },
     "window": {
         "start_utc": "${WINDOW_START_ISO}",
@@ -560,10 +843,10 @@ manifest = {
     # How to read the timestamps in the log file, which the log file cannot tell you
     # itself. Without this a ufw line is genuinely ambiguous: no year, no zone.
     "timestamps": {
-        "log_line_format": "RFC 3164 syslog: 'Mon DD HH:MM:SS', LOCAL time, no year, "
-                           "no timezone, whole seconds",
-        "log_line_timezone": "${TZ_NAME}",
-        "log_line_utc_offset": "${TZ_OFFSET}",
+        "log_line_format": "${FW_TS_FORMAT}",
+        "log_line_timezone": "${FW_TS_ZONE}",
+        "log_line_utc_offset": "${FW_TS_OFFSET}",
+        "comparable_with_ids_evidence": "${FW_TS_SAME_AS_IDS}",
         "manifest_and_window_bounds": "UTC (RFC 3339, suffix Z)",
         "ids_evidence_format": "RFC 3339 with explicit offset, microseconds — already UTC",
         # Useful for ORDERING, not for conversion. Measured on this host, boot time from
@@ -602,21 +885,15 @@ manifest = {
         "sha256": "${SHA256}",
     },
     "caveats": [
-        "the log's own timestamps are LOCAL (${TZ_NAME}, ${TZ_OFFSET}) while every "
-        "timestamp in this manifest, in the ground truth and in the IDS evidence is UTC. "
-        "The same instant therefore reads two hours apart between firewall.log and "
-        "ids.alerts.log; see the timestamps block. Nothing has been rewritten — a "
-        "source's own output is left as the source produced it",
-        "syslog timestamps carry no year and no sub-second precision; the authoritative "
-        "window bounds are window.start_utc/end_utc recorded by the generator",
-        "lines are filtered to SRC=${USER_IP_BASE}* — unrelated host traffic logged in the "
-        "same window is excluded. Both directions are kept, so the host's RST replies to "
-        "refused connections appear alongside the inbound attempts",
-        "ufw logging was set to 'full' for the run; at the default 'low' its LOG rules are "
-        "rate-limited to 3/min and most of the window would be lost",
-        "at 'full' ufw emits an [UFW AUDIT] line for every packet in addition to any "
-        "verdict line, so lines exceeds the event count: a blocked attempt produces both "
-        "an AUDIT and a BLOCK entry",
+        "this log's timestamps are ${FW_TS_ZONE} (${FW_TS_OFFSET}); every timestamp in this "
+        "manifest and in the ground truth is UTC. Whether that means a conversion is needed "
+        "before comparing this log with the IDS evidence is stated in "
+        "timestamps.comparable_with_ids_evidence. Nothing has been rewritten — a source's own "
+        "output is left as the source produced it",
+        "${FW_CAV_TIME}",
+        "${FW_CAV_FILTER}",
+        "${FW_CAV_LEVEL}",
+        "${FW_CAV_AUDIT}",
         "verdict logging ([UFW ALLOW] / [UFW BLOCK]) was installed as unrate-limited LOG "
         "rules in ufw's own ufw-user-input chain rather than via ufw's 'log' keyword, "
         "which hardcodes --limit 3/min --limit-burst 10 regardless of logging level and "
@@ -635,25 +912,80 @@ json.dump(manifest, open(sys.argv[1], "w"), indent=2)
 PY
 
 # ---------------------------------------------------------------------------
-# IDS evidence for the same window
+# The other sources' evidence for the same window
+#
+# Banking starts first. Its collectors run where the bank is and spend most of their time
+# waiting for the bank's publish job, so they run while the IDS is analysed, not after it.
 # ---------------------------------------------------------------------------
 IDS_LOG="$RUN_DIR/ids_${STAMP}.alerts.log"
 GROUP_MANIFEST="$RUN_DIR/window_${STAMP}.group.json"
+BANK_MANIFEST="$RUN_DIR/banking_${STAMP}.manifest.json"
 IDS_TOTAL=0; IDS_KEPT=0; IDS_SHA=""; IDS_SEVERITIES="0 0 0 0 0"; IDS_ALERTS=0
+IDS_OK=0
+IDS_PCAP=""; IDS_PCAP_SHA=""; IDS_PCAP_PACKETS=0
+BANK_COLLECT_PID=""
+BANK_SUMMARY=""
 
-if [[ $WITH_IDS -eq 1 ]]; then
+if [[ $WITH_BANKING -eq 1 ]]; then
+	# The events collector waits until at least this many in-window events have arrived. Not
+	# the operation count: a balance check publishes nothing and a transfer publishes two.
+	BANK_EXPECT=$(python3 -c 'import json,sys; t=json.load(open(sys.argv[1])); print(t.get("expected_events_total", t["executed_ok"]))' "$BANK_GT")
+	log "collecting the bank's evidence on $BANK_HOST_DESC: the audit trail, and waiting for ${BANK_EXPECT} events"
+	banking_collect "$STAMP" "$BANK_OFFSETS" "$WINDOW_START_ISO" "$WINDOW_END_ISO" "$BANK_EXPECT" "$RUN_DIR" \
+		> "$RUN_DIR/.banking-collect.log" 2>&1 &
+	BANK_COLLECT_PID=$!
+fi
+
+if [[ $IDS_REMOTE -eq 1 ]]; then
+	# The sensor's side of it: this window's packets, cut from the lab's capture by the
+	# offset taken as the window opened, and hashed before they leave this machine.
+	IDS_PCAP="$RUN_DIR/ids_${STAMP}.pcap"
+	read -r IDS_PCAP_PACKETS _ _ <<< "$(pcap_slice "$LAB_PCAP" "$PCAP_OFFSET" "$IDS_PCAP" || echo "0 0 0")" || true
+	IDS_PCAP_PACKETS=${IDS_PCAP_PACKETS:-0}
+	IDS_PCAP_SHA=$(sha256sum "$IDS_PCAP" | cut -d' ' -f1)
+	chmod 444 "$IDS_PCAP"
+	# Slips' whole output tree comes home beside the evidence: zeek_files/conn.log is the
+	# flow record behind the findings, and "on what basis" is a question an investigation
+	# will ask.
+	SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
+	log "analysing the window's ${IDS_PCAP_PACKETS} packets with Slips on $VM_NAME (about a minute)"
+	if slips_remote_analyse "$IDS_PCAP" "$STAMP" "$SLIPS_OUT"; then
+		IDS_ALERTS_OFFSET=0
+		IDS_OK=1
+	else
+		echo "error: remote IDS analysis failed; the window has no IDS evidence" >&2
+		CAPTURE_ERRORS=1
+	fi
+elif [[ $WITH_IDS -eq 1 ]]; then
 	# Slips raises evidence in batches once it has seen the flows, so the window's
 	# findings do not exist yet at this point. Draining is not politeness, it is the
 	# difference between collecting the evidence and collecting an empty file.
 	log "draining Slips for ${IDS_DRAIN}s so it can raise evidence for the window"
 	sleep "$IDS_DRAIN"
+	IDS_OK=1
+fi
 
-	# Collected while Slips is still running. An IDS is a continuously running system
-	# that gets *read* against; halting one to gather evidence is not something a bank
-	# would do, and modelling it that way here would carry the wrong assumption into
-	# the Evidence Repository's ingestion design. Consistency comes from the byte
-	# offset and the timestamp slice, exactly as it does for the ufw log while rsyslog
-	# keeps writing underneath it.
+# Tunnel mode: Slips ran on the VM, live on the device. Its tree comes home and the slicer
+# below is pointed at it with the offset taken on the VM — the fetched alerts.log is that
+# same whole file, so the offset still means there what it meant here.
+if [[ $IDS_OK -eq 1 && $LAB_VIA_TUNNEL -eq 1 ]]; then
+	SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
+	log "fetching Slips' output from $VM_NAME"
+	if ! remote_slips_fetch "$LAB_VM_SLIPS_OUT" "$SLIPS_OUT"; then
+		echo "error: could not fetch the IDS evidence; the window has none" >&2
+		IDS_OK=0
+		CAPTURE_ERRORS=1
+	fi
+fi
+
+
+if [[ $IDS_OK -eq 1 ]]; then
+	# Locally, collected while Slips is still running. An IDS is a continuously running
+	# system that gets *read* against; halting one to gather evidence is not something a
+	# bank would do. Consistency comes from the byte offset and the timestamp slice, exactly
+	# as it does for the ufw log while rsyslog keeps writing underneath it. Remotely, Slips
+	# analysed only this window's packets, so the whole file is the window and the offset
+	# is 0; the timestamp slice still applies.
 	#
 	# Defended rather than trusted: `read` returns non-zero on an empty herestring,
 	# which under `set -e` would abort the run at the point where the evidence has been
@@ -662,9 +994,7 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	read -r IDS_TOTAL IDS_KEPT <<< "$IDS_COUNTS" || true
 	IDS_TOTAL=${IDS_TOTAL:-0}
 	IDS_KEPT=${IDS_KEPT:-0}
-	# Must be exactly five numbers: the group manifest unpacks them positionally, and a
-	# short read there is a ValueError that would lose the whole manifest after the
-	# evidence has already been collected.
+	# Must be exactly five numbers: the group manifest unpacks them positionally.
 	IDS_SEVERITIES=$(slips_severity_counts "$IDS_LOG")
 	if [[ $(printf '%s\n' $IDS_SEVERITIES | grep -c .) -ne 5 ]]; then
 		echo "warning: severity counts unreadable ('$IDS_SEVERITIES'); recording zeros" >&2
@@ -676,119 +1006,235 @@ if [[ $WITH_IDS -eq 1 ]]; then
 	chmod 444 "$IDS_LOG"
 	log "IDS evidence: ${IDS_KEPT} of ${IDS_TOTAL} lines fall inside the window, ${IDS_ALERTS} of them alerts"
 
-	# Under a lab, Slips outlives this capture and keeps writing into its session
-	# directory: stopping it or moving that directory would end the lab's IDS on the
-	# first window and break every window after it. The alerts slice above is all this
-	# capture takes; lab.sh down hands over the session tree at the end.
-	if [[ $LAB_MODE -eq 0 ]]; then
-		# One-shot only. Stopped now, and not in order to read it — the veth it is
-		# attached to is about to be torn down with the rest of the run. Teardown,
-		# not a step in collecting evidence.
+	# Under a local lab, Slips outlives this capture and keeps writing into its session
+	# directory; the slice above is all this capture takes. One-shot only: Slips is stopped
+	# because the veth it is attached to is about to be torn down — teardown, not a step in
+	# collecting — and its tree is moved in beside the evidence.
+	if [[ $IDS_REMOTE -eq 0 && $LAB_MODE -eq 0 ]]; then
 		slips_stop
-
-		# Keep Slips' full working tree, not just the alerts: zeek_files/conn.log is
-		# the flow record behind the findings, and an investigator asking "on what
-		# basis" needs it. Moved only after the container has let go of the mount.
 		if [[ -d "$SLIPS_OUT" ]]; then
 			rm -rf "$RUN_DIR/ids_${STAMP}"
 			mv "$SLIPS_OUT" "$RUN_DIR/ids_${STAMP}"
 			SLIPS_OUT="$RUN_DIR/ids_${STAMP}"
 		fi
 	fi
+fi
 
-	# The group is the point of the exercise: one window, one attack, two independent
-	# sources that saw it. This is the record an EvidenceGroup row would be built from.
-	python3 - "$GROUP_MANIFEST" <<PY
-import json, sys
-crit, high, med, low, info = "${IDS_SEVERITIES}".split()
+if [[ -n "$BANK_COLLECT_PID" ]]; then
+	if wait "$BANK_COLLECT_PID"; then
+		BANK_SUMMARY=$(python3 "$BANK_MANIFEST_BUILDER" --run-dir "$RUN_DIR" --stamp "$STAMP" \
+			--start "$WINDOW_START_ISO" --end "$WINDOW_END_ISO" --duration "$DURATION" --rate "$BANK_RATE" \
+			--where "$BANK_WHERE" --vm "$VM_NAME" --fineract-image "$BANK_FINERACT_IMAGE" \
+			--bank-url "$BANK_URL") || BANK_SUMMARY=""
+	fi
+	if [[ -z "$BANK_SUMMARY" ]]; then
+		echo "error: banking collection failed; the window has no banking evidence. Collector output:" >&2
+		sed 's/^/    /' "$RUN_DIR/.banking-collect.log" >&2 2>/dev/null || true
+		WITH_BANKING=0
+		CAPTURE_ERRORS=1
+	else
+		chmod 444 "$RUN_DIR/banking-events_${STAMP}.jsonl" "$RUN_DIR/banking-audit_${STAMP}.jsonl" \
+			"$RUN_DIR/banking-events_${STAMP}.raw.jsonl"
+		log "$BANK_SUMMARY"
+	fi
+	rm -f "$RUN_DIR/.banking-collect.log"
+fi
+
+# The group is the point of the exercise: one window, one attack, independent sources that
+# each saw part of it. This is the record an EvidenceGroup row would be built from. Values
+# go in through the environment rather than being pasted into the Python source.
+if [[ $IDS_OK -eq 1 || $WITH_BANKING -eq 1 ]]; then
+	G_STAMP="$STAMP" G_START="$WINDOW_START_ISO" G_END="$WINDOW_END_ISO" G_DURATION="$DURATION" \
+	G_USERS="$USERS" G_MAL_USERS="$MALICIOUS_USERS" G_MAL_PCT="$MALICIOUS_PCT" G_PROFILE="$ATTACK_PROFILE" \
+	G_SEED="$SEED" G_SUBNET="$SUBNET" G_TZ_NAME="$TZ_NAME" G_TZ_OFFSET="$TZ_OFFSET" G_VETH="$VETH_HOST" \
+	G_VM="${VM_NAME:-}" G_HOST_IP="$HOST_IP" G_BANK_PORT="$BANK_PORT" \
+	G_VIA_TUNNEL="$LAB_VIA_TUNNEL" G_TARGET_IP="$TARGET_IP" G_TUN_DEV="${TUN_DEV:-}" \
+	G_FW_SHA="$SHA256" G_FW_LINES="$LOG_LINES" G_FW_BLOCK="$BLOCKED" G_FW_ALLOW="$ALLOWED" G_FW_AUDIT="$AUDITED" \
+	G_IDS_OK="$IDS_OK" G_IDS_REMOTE="$IDS_REMOTE" G_IDS_SHA="$IDS_SHA" G_IDS_KEPT="$IDS_KEPT" \
+	G_IDS_TOTAL="$IDS_TOTAL" G_IDS_ALERTS="$IDS_ALERTS" G_IDS_SEV="$IDS_SEVERITIES" \
+	G_IDS_PCAP_SHA="$IDS_PCAP_SHA" G_IDS_PCAP_PACKETS="$IDS_PCAP_PACKETS" \
+	G_BANK_MANIFEST="$([[ $WITH_BANKING -eq 1 ]] && echo "$BANK_MANIFEST")" \
+	python3 - "$GROUP_MANIFEST" <<'PY'
+import json, os, sys
+E = os.environ
+n = lambda k: int(E.get(k) or 0)
+stamp = E["G_STAMP"]
+
+items = [{
+    "pde_source": "firewall", "product": "ufw", "file": "firewall_%s.log" % stamp,
+    "sha256": E["G_FW_SHA"], "lines": n("G_FW_LINES"), "ufw_block_lines": n("G_FW_BLOCK"),
+    "ufw_allow_lines": n("G_FW_ALLOW"), "ufw_audit_lines": n("G_FW_AUDIT"),
+}]
+correlation, caveats = [], []
+
+if E["G_IDS_OK"] == "1":
+    crit, high, med, low, info = (E["G_IDS_SEV"].split() + ["0"] * 5)[:5]
+    ids = {
+        "pde_source": "ids", "product": "slips", "file": "ids_%s.alerts.log" % stamp,
+        "sha256": E["G_IDS_SHA"], "evidence_lines": n("G_IDS_KEPT"),
+        "evidence_lines_seen_total": n("G_IDS_TOTAL"), "alerts": n("G_IDS_ALERTS"),
+        "threat_levels": {"critical": int(crit), "high": int(high), "medium": int(med),
+                          "low": int(low), "info": int(info)},
+    }
+    remote = E["G_IDS_REMOTE"] == "1"
+    via_tunnel = E.get("G_VIA_TUNNEL") == "1"
+    if via_tunnel:
+        # Both sources are on the VM in this mode, watching the tunnel device. Naming this
+        # machine's veth here would put the wrong interface, on the wrong host, into the
+        # record an investigation reads.
+        ids["analysed"] = ("on %s, by Slips reading %s live, the interface the lab's traffic "
+                           "arrives on" % (E["G_VM"], E["G_TUN_DEV"]))
+        correlation.append(
+            "The firewall and IDS items describe the same packets, and both observed them on %s: "
+            "Slips read %s live while that host's ufw logged the same traffic crossing its INPUT "
+            "chain. They are independent accounts of one attack rather than one record split in "
+            "two. Because the users' own source addresses survive the tunnel, both sources see the "
+            "individual users rather than a single forwarder, which is what lets the attacker be "
+            "told apart from them." % (E["G_VM"], E["G_TUN_DEV"]))
+    elif remote:
+        ids["analysed"] = "on %s, by Slips in file mode, from this window's packets only" % E["G_VM"]
+        ids["input_pcap"] = {"file": "ids_%s.pcap" % stamp, "sha256": E["G_IDS_PCAP_SHA"],
+                             "packets": n("G_IDS_PCAP_PACKETS")}
+        correlation.append(
+            "The firewall and IDS items describe the same packets: tcpdump captured %s here while ufw "
+            "logged the same traffic crossing the INPUT chain, and Slips analysed that capture — so the "
+            "two are independent accounts of one attack rather than one record split in two." % E["G_VETH"])
+    else:
+        correlation.append(
+            "The firewall and IDS items describe the same packets. Slips sniffed %s live while ufw logged "
+            "the same traffic crossing the INPUT chain, so the two are independent accounts of one attack "
+            "rather than one record split in two." % E["G_VETH"])
+    items.append(ids)
+    caveats += [
+        ("firewall.log and ids.alerts.log are both RFC 3339 in UTC with microseconds here, because "
+         "both were written on the VM, so the two can be compared directly with no conversion. "
+         "window.start_utc/end_utc are UTC and are the common reference"
+         if E.get("G_VIA_TUNNEL") == "1" else
+         "firewall.log is RFC 3164 syslog in LOCAL time (%s, %s, no year, whole seconds) while "
+         "ids.alerts.log is RFC 3339 in UTC with microseconds. The same instant reads differently "
+         "between them, and neither has been rewritten. window.start_utc/end_utc are UTC and are the "
+         "common reference; the firewall manifest carries the conversion facts"
+         % (E["G_TZ_NAME"], E["G_TZ_OFFSET"])),
+        "IDS findings are sliced to the window by the timestamp on each evidence line; a line whose "
+        "timestamp cannot be parsed is kept rather than dropped",
+        "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on timewindow "
+        "N'). They carry no threat level, so threat_levels does not include them",
+    ]
+    if via_tunnel:
+        caveats.append(
+            "Slips ran continuously on the VM across this and every other window of the lab "
+            "session, so its per-source profile and alert threshold carry over between windows "
+            "rather than starting fresh each time, and an alert here may rest partly on evidence "
+            "it gathered earlier in the session")
+    elif remote:
+        caveats.append(
+            "Slips analysed this window on its own, starting fresh: its per-source profile and alert "
+            "threshold do not carry over from earlier windows, as they would for a Slips sniffing "
+            "continuously. An alert here was earned inside this window. The packets keep the timestamps "
+            "this machine's kernel gave them, on the same clock as the window bounds")
+    else:
+        caveats.append(
+            "Slips keeps its own 1-hour timewindows internally and its alert threshold accumulates per "
+            "profile across that hour, not across this %ss window" % E["G_DURATION"])
+
+if E.get("G_BANK_MANIFEST"):
+    bm = json.load(open(E["G_BANK_MANIFEST"]))
+    out, col, comp = bm["output"], bm["collection"], bm["completeness"]
+    events_file, audit_file = "banking-events_%s.jsonl" % stamp, "banking-audit_%s.jsonl" % stamp
+    items.append({
+        "pde_source": "banking-events", "product": "fineract", "file": events_file,
+        "sha256": out[events_file]["sha256"], "events": col["banking-events"]["events_in_window"],
+        "by_type": col["banking-events"]["by_type"], "completeness": comp["banking-events"],
+    })
+    items.append({
+        "pde_source": "banking-audit", "product": "fineract", "file": audit_file,
+        "sha256": out[audit_file]["sha256"], "rows": col["banking-audit"]["rows"],
+        "by_maker": col["banking-audit"]["by_maker"], "completeness": comp["banking-audit"],
+    })
+    sc = bm["scenario"]
+    if sc.get("mule_ip") and sc.get("attacker_used_login"):
+        correlation.append(
+            "The banking items record what the same people did at the bank, each from their own address "
+            "and with their own login, reaching it at %s:%s. The customers appear in the firewall and IDS "
+            "items by address and in the audit trail by login. The mule (%s, login %s) applied for the "
+            "loan; the attacker (%s) then approved and disbursed it with the loan officer's phished login "
+            "(%s). The fraud therefore spans two addresses and two logins: the audit trail joins them by "
+            "the loan's id, and the network items place each at its address at the same moments."
+            % (E["G_TARGET_IP"], E["G_BANK_PORT"], sc["mule_ip"], sc["mule_login"],
+               sc["attacker_ip"], sc["attacker_used_login"]))
+    elif sc.get("attacker_ip") and sc.get("attacker_used_login"):
+        correlation.append(
+            "The banking items record what the same users did at the bank. They reached it from their own "
+            "addresses through the lab's tunnel on %s:%s, so the attacker (%s) appears in the firewall log "
+            "as permitted connections to port %s and in the traffic the IDS analysed, and what those "
+            "connections did appears in the bank's audit trail under the login they used (%s) and in its "
+            "event stream." % (E["G_TARGET_IP"], E["G_BANK_PORT"], sc["attacker_ip"], E["G_BANK_PORT"],
+                              sc["attacker_used_login"]))
+    else:
+        correlation.append("The banking items record the same users' activity at the bank in this window.")
+    caveats.append(
+        "banking timestamps are UTC from the bank's clock on the research VM, not this machine's; the "
+        "banking manifest records the measured offset (bank_minus_lab_seconds) and how to read each field")
+
+if E.get("G_VIA_TUNNEL") == "1":
+    caveats.append(
+        "the firewall item is ufw on %s, not on the machine that generated the traffic. The users' "
+        "packets keep their own source addresses across the tunnel device, so the VM's INPUT chain "
+        "logged them as distinct sources; this machine only forwarded them and its own firewall was "
+        "not in the path. One consequence for timing: the firewall, IDS and auth items are all on "
+        "the VM's clock, and only the ground truth is on this machine's" % E["G_VM"])
+
 group = {
-    "group_id": "${STAMP}",
-    "window": {
-        "start_utc": "${WINDOW_START_ISO}",
-        "end_utc": "${WINDOW_END_ISO}",
-        "duration_seconds": ${DURATION},
-    },
-    "scenario": {
-        "users": ${USERS},
-        "malicious_users": ${MALICIOUS_USERS},
-        "malicious_event_pct": ${MALICIOUS_PCT},
-        "attack_profile": "${ATTACK_PROFILE}",
-        "seed": ${SEED},
-        "subnet": "${SUBNET}",
-    },
-    "items": [
-        {
-            "pde_source": "firewall",
-            "product": "ufw",
-            "file": "firewall_${STAMP}.log",
-            "sha256": "${SHA256}",
-            "lines": ${LOG_LINES},
-            "ufw_block_lines": ${BLOCKED},
-            "ufw_allow_lines": ${ALLOWED},
-            "ufw_audit_lines": ${AUDITED},
-        },
-        {
-            "pde_source": "ids",
-            "product": "slips",
-            "file": "ids_${STAMP}.alerts.log",
-            "sha256": "${IDS_SHA}",
-            "evidence_lines": ${IDS_KEPT},
-            "evidence_lines_seen_total": ${IDS_TOTAL},
-            "alerts": ${IDS_ALERTS},
-            "threat_levels": {
-                "critical": int(crit), "high": int(high),
-                "medium": int(med), "low": int(low), "info": int(info),
-            },
-        },
-    ],
-    "correlation": (
-        "Both items describe the same packets. Slips sniffed ${VETH_HOST} live while "
-        "ufw logged the same traffic crossing the INPUT chain, so the two are "
-        "independent accounts of one attack rather than one record split in two."
-    ),
-    "caveats": [
-        "the two items timestamp differently: firewall.log is RFC 3164 syslog in LOCAL "
-        "time (${TZ_NAME}, ${TZ_OFFSET}, no year, whole seconds) while ids.alerts.log is "
-        "RFC 3339 in UTC with microseconds. The same instant reads differently between "
-        "them, and neither has been rewritten. window.start_utc/end_utc below are UTC "
-        "and are the common reference; firewall.manifest.json carries the conversion "
-        "facts, including kernel boot time for the microsecond-precision uptime field",
-        "IDS findings are sliced to the window by the timestamp on each evidence line; "
-        "Slips keeps its own 1-hour timewindows internally and its alert threshold "
-        "accumulates per profile across that hour, not across this ${DURATION}s window",
-        "a line whose timestamp cannot be parsed is kept rather than dropped",
-        "alerts counts Slips' own verdict lines ('Generated an alert given enough evidence on "
-        "timewindow N'). They are sliced by their own leading timestamp, which is the flow that "
-        "completed the alert, and carry no threat level, so threat_levels does not include them",
-    ],
+    "group_id": stamp,
+    "window": {"start_utc": E["G_START"], "end_utc": E["G_END"], "duration_seconds": n("G_DURATION"),
+               "bounds": "whole seconds, start rounded down and end rounded up"},
+    "scenario": {"users": n("G_USERS"), "malicious_users": n("G_MAL_USERS"),
+                 "malicious_event_pct": n("G_MAL_PCT"), "attack_profile": E["G_PROFILE"],
+                 "seed": n("G_SEED"), "subnet": E["G_SUBNET"]},
+    "items": items,
+    "correlation": " ".join(correlation),
+    "caveats": caveats,
 }
 json.dump(group, open(sys.argv[1], "w"), indent=2)
 PY
 fi
 
-# Files are created by root; hand them back to whoever invoked sudo.
+# Files are created by root; hand them back to whoever invoked sudo. The window's directory
+# too — left root's, it is the one place in output/ its owner cannot add a note to.
 if [[ -n "${SUDO_USER:-}" ]]; then
-	chown "$SUDO_USER" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
-	if [[ $WITH_IDS -eq 1 ]]; then
-		chown "$SUDO_USER" "$IDS_LOG" "$GROUP_MANIFEST" 2>/dev/null || true
-		# Slips writes its working tree as root inside the container. Under a lab that
-		# tree is still in use and is handed over by `lab.sh down` instead.
-		if [[ $LAB_MODE -eq 0 ]]; then
+	chown "$SUDO_USER" "$RUN_DIR" "$OUT_LOG" "$MANIFEST" "$GT_JSON" 2>/dev/null || true
+	[[ -f "$GROUP_MANIFEST" ]] && chown "$SUDO_USER" "$GROUP_MANIFEST" 2>/dev/null || true
+	if [[ $IDS_OK -eq 1 ]]; then
+		chown "$SUDO_USER" "$IDS_LOG" 2>/dev/null || true
+		[[ -n "$IDS_PCAP" ]] && chown "$SUDO_USER" "$IDS_PCAP" 2>/dev/null || true
+		# Slips' tree: under a local lab it is still in use and `lab.sh down` hands it over.
+		if [[ $IDS_REMOTE -eq 1 || $LAB_MODE -eq 0 ]]; then
 			chown -R "$SUDO_USER" "$SLIPS_OUT" 2>/dev/null || true
 		fi
 	fi
+	chown "$SUDO_USER" "$RUN_DIR"/banking* 2>/dev/null || true
 fi
 
 log "captured $LOG_LINES lines ($BLOCKED BLOCK, $ALLOWED ALLOW)"
-if [[ $WITH_IDS -eq 1 ]]; then
-	log "IDS: ${IDS_KEPT} lines in the window, ${IDS_ALERTS} of them alerts"
-fi
+[[ $IDS_OK -eq 1 ]] && log "IDS: ${IDS_KEPT} lines in the window, ${IDS_ALERTS} of them alerts"
+[[ -n "$BANK_SUMMARY" ]] && log "$BANK_SUMMARY"
 log "sha256 $SHA256"
 log "window directory: $RUN_DIR"
 log "  firewall_${STAMP}.log              the evidence"
 log "  firewall_${STAMP}.manifest.json    provenance and digest"
 log "  firewall_${STAMP}.groundtruth.json labels, known before sending"
-if [[ $WITH_IDS -eq 1 ]]; then
+if [[ $IDS_OK -eq 1 ]]; then
 	log "  ids_${STAMP}.alerts.log            IDS evidence for the same window"
-	log "  window_${STAMP}.group.json         both sources, one window"
+	[[ -n "$IDS_PCAP" ]] && log "  ids_${STAMP}.pcap                  the packets Slips analysed"
+fi
+if [[ $WITH_BANKING -eq 1 ]]; then
+	log "  banking-events_${STAMP}.jsonl      the bank's business events"
+	log "  banking-audit_${STAMP}.jsonl       the bank's audit trail"
+	log "  banking_${STAMP}.manifest.json     provenance, completeness, digests"
+fi
+[[ -f "$GROUP_MANIFEST" ]] && log "  window_${STAMP}.group.json         every source, one window"
+
+if [[ $CAPTURE_ERRORS -ne 0 ]]; then
+	echo "the capture completed with errors: a source above produced no evidence for this window" >&2
+	exit 1
 fi

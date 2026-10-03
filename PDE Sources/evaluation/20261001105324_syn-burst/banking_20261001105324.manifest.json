@@ -1,0 +1,221 @@
+{
+  "source": {
+    "pde_sources": [
+      "banking-events",
+      "banking-audit"
+    ],
+    "product": "Apache Fineract",
+    "image": "apache/fineract:fd8fc8929",
+    "tenant": "default",
+    "tenant_timezone": "Asia/Kolkata",
+    "host": "research VM fineract-slips",
+    "reached_at": "https://10.98.0.1:8443/fineract-provider",
+    "collection_method": {
+      "banking-events": "Fineract's external-events Kafka topic, read on the VM between broker offsets taken before the window opened and the topic's end after it closed; each message decoded with the pinned Avro schemas and kept if its createdAt falls inside the window",
+      "banking-audit": "m_portfolio_command_source (Fineract's command audit trail) queried on the VM for rows whose made_on_date_utc falls inside the window, joined to m_appuser for the maker's and checker's logins"
+    }
+  },
+  "window": {
+    "start_utc": "2026-10-01T10:53:24Z",
+    "end_utc": "2026-10-01T10:54:01Z",
+    "duration_seconds": 30
+  },
+  "scenario": {
+    "profile": "loan-fraud",
+    "benign_operations_per_second": 0.5,
+    "seed": 1002,
+    "attacker_ip": "10.99.0.20",
+    "attacker_used_login": "pde_officer",
+    "attacker_credential": "phished before the window; used, not simulated",
+    "mule_ip": "10.99.0.19",
+    "mule_login": "lwazi.ndlovu",
+    "mule_client": {
+      "id": 16,
+      "external_id": "pde-mule",
+      "name": "Lwazi Ndlovu"
+    },
+    "customers": [
+      {
+        "ip": "10.99.0.11",
+        "login": "lerato.nkosi"
+      },
+      {
+        "ip": "10.99.0.12",
+        "login": "johan.vanwyk"
+      },
+      {
+        "ip": "10.99.0.13",
+        "login": "ayesha.patel"
+      },
+      {
+        "ip": "10.99.0.14",
+        "login": "kagiso.molefe"
+      },
+      {
+        "ip": "10.99.0.15",
+        "login": "naledi.khumalo"
+      },
+      {
+        "ip": "10.99.0.16",
+        "login": "pieter.botha"
+      },
+      {
+        "ip": "10.99.0.17",
+        "login": "zanele.mthembu"
+      },
+      {
+        "ip": "10.99.0.18",
+        "login": "ravi.naidoo"
+      }
+    ],
+    "business_date": "01 October 2026"
+  },
+  "timestamps": {
+    "banking-events": "event.createdAt is UTC in ISO_LOCAL_DATE_TIME \u2014 no zone suffix, as Fineract writes it. It agrees with the staging table's created_at and with the audit trail's made_on_date_utc to within milliseconds. kafka.timestamp_ms is when the publish job sent it, which is later and is NOT when the transaction happened",
+    "banking-audit": "made_on_date_utc is a timestamptz rendered with +00:00. made_on_date, the tenant-local column, is empty on this build",
+    "business_date": "a tenant-local calendar date (tenant timezone Asia/Kolkata), so near midnight UTC it can name a different day. It is Fineract's accounting date, not a timestamp",
+    "bank_minus_lab_seconds": {
+      "median": -0.04,
+      "min": -0.705,
+      "max": 0.311,
+      "samples": 13,
+      "note": "made_on_date_utc (bank clock) minus sent_at (lab clock); includes request latency, so it is an upper bound on clock skew"
+    }
+  },
+  "collection": {
+    "banking-events": {
+      "topic": "external-events",
+      "window": {
+        "start_utc": "2026-10-01T10:53:24Z",
+        "end_utc": "2026-10-01T10:54:01Z"
+      },
+      "offsets_from": {
+        "0": 144
+      },
+      "offsets_read_to": {
+        "0": 168
+      },
+      "messages_read": 24,
+      "events_in_window": 24,
+      "events_outside_window": 0,
+      "undecodable": 0,
+      "by_type": {
+        "LoanApprovedBusinessEvent": 1,
+        "LoanCreatedBusinessEvent": 1,
+        "LoanDisbursalBusinessEvent": 1,
+        "LoanDisbursalTransactionBusinessEvent": 1,
+        "SavingsDepositBusinessEvent": 10,
+        "SavingsWithdrawalBusinessEvent": 10
+      },
+      "first_created_at": "2026-10-01T10:53:33.104120",
+      "last_created_at": "2026-10-01T10:53:56.804182",
+      "expected_at_least": 23,
+      "settled": true,
+      "publish_job_triggers": [
+        {
+          "at_utc": "2026-10-01T10:54:19.643780Z",
+          "job_id": 36
+        }
+      ],
+      "collected_utc": "2026-10-01T10:54:26.931466Z"
+    },
+    "banking-audit": {
+      "rows": 13,
+      "by_action": {
+        "APPROVE LOAN": 1,
+        "CREATE ACCOUNTTRANSFER": 10,
+        "CREATE LOAN": 1,
+        "DISBURSE LOAN": 1
+      },
+      "by_maker": {
+        "ayesha.patel": 1,
+        "johan.vanwyk": 4,
+        "lerato.nkosi": 2,
+        "lwazi.ndlovu": 1,
+        "pde_officer": 2,
+        "ravi.naidoo": 2,
+        "zanele.mthembu": 1
+      },
+      "redacted_rows": 0,
+      "client_ip_recorded": 0,
+      "first_made_on_utc": "2026-10-01T10:53:32.861729+00:00",
+      "last_made_on_utc": "2026-10-01T10:53:56.548023+00:00"
+    }
+  },
+  "completeness": {
+    "operations_ok": 18,
+    "writes_ok": 13,
+    "reads_ok": 5,
+    "operations_malicious_ok": 3,
+    "banking-audit": "13 of 13 operations that change something have their audit row",
+    "banking-events": "13 of 13 operations that change something have all their events (23 of 23 events)",
+    "reads": "5 reads (balance checks, statements) change nothing, so the bank records nothing for them; they appear only in the network sources",
+    "detail": {
+      "operations_ok": 18,
+      "writes_ok": 13,
+      "reads_ok": 5,
+      "operations_malicious_ok": 3,
+      "audit": {
+        "present": 13,
+        "of": 13,
+        "missing": [],
+        "unexplained_rows": {}
+      },
+      "events": {
+        "operations_with_all_their_events": 13,
+        "of": 13,
+        "events_found": 23,
+        "events_expected": 23,
+        "missing": [],
+        "unexplained_events": {
+          "LoanDisbursalTransactionBusinessEvent": 1
+        }
+      },
+      "bank_minus_lab_seconds": {
+        "median": -0.04,
+        "min": -0.705,
+        "max": 0.311,
+        "samples": 13,
+        "note": "made_on_date_utc (bank clock) minus sent_at (lab clock); includes request latency, so it is an upper bound on clock skew"
+      }
+    }
+  },
+  "output": {
+    "banking-events_20261001105324.jsonl": {
+      "sha256": "ae8ca3bb440f20806aeaac46b375e99a4813bae6106942a34ba66cbfa39bd6ef",
+      "bytes": 125465,
+      "lines": 24,
+      "role": "evidence (banking-events)"
+    },
+    "banking-audit_20261001105324.jsonl": {
+      "sha256": "ec4af1c3fce01f73a7708c8edfa43fec80aaa646afce1181ddaaf6f5c75568bb",
+      "bytes": 14175,
+      "lines": 13,
+      "role": "evidence (banking-audit)"
+    },
+    "banking-events_20261001105324.raw.jsonl": {
+      "sha256": "e936aa2fe7b8faee7cbf40648594b47b111cebb81bd2623f9f6db2c3c88bb10e",
+      "bytes": 35408,
+      "lines": 24,
+      "role": "the broker's own bytes for every message read; not submitted \u2014 kept so the decode can be checked"
+    },
+    "banking_20261001105324.groundtruth.json": {
+      "sha256": "eadea953f38cf4294e8837ffa910144429254d8059e1e4818256fc50d5d1625b",
+      "bytes": 16204,
+      "lines": 687,
+      "role": "labels, known before sending; never submitted"
+    }
+  },
+  "caveats": [
+    "the bank's audit trail attributes every command to a login (maker_username), not an address: m_portfolio_command_source.client_ip exists on this build but was empty for all 13 rows. Even filled, it would show the tunnel's end on the VM rather than the namespace address, as a production bank behind a proxy or load balancer would. The actor's network identity comes from this window's firewall and IDS items, joined by time",
+    "the loan officer holds Fineract's stock 'Super user' role, so one phished login could both approve and disburse. A bank would split those between people; the missing second approver (checker_username null) is the finding. Customers hold a restricted 'PDE Customer' role: they can apply for a loan but are refused approving one (HTTP 403, checked when seeding), which is why the fraud needs the officer's credential at all",
+    "customers bank through Fineract's standard API with their own logins, not a self-service API: this build (1.16.0-SNAPSHOT) has none. Nothing in the standard API stops a customer's login from reading or moving another customer's money; a real bank's online-banking layer would enforce that. Every customer action is still attributed to that customer's own login",
+    "the attacker's use of the officer's credential is simulated; the phishing that obtained it is not, and happened before the window",
+    "the publish job ('Send Asynchronous Events') was triggered at collection time rather than waited for on its one-minute tick. That moves when events were sent, never their createdAt",
+    "a transfer publishes two events \u2014 a withdrawal on the payer's account and a deposit on the payee's \u2014 neither carrying the transfer's id, so both are matched by account and amount. A disbursal also raises its transaction event, which appears in completeness.detail as unexplained \u2014 expected, and listed so the counts reconcile",
+    "any audit row or event inside the window that the scenario did not cause is listed under unexplained, not removed: the publish job writes its own EXECUTEJOB row, and anyone else using the bank in the window would appear too",
+    "the collector redacts credential-bearing fields in command_as_json (a user-creation command stores the new password) and marks the row collector_redacted; 0 row(s) this window",
+    "the mule is a seeded customer (externalId pde-mule) and applies again in every fraud window, so earlier windows' loans to the same client exist; this window's is the one with the resource_id recorded in the ground truth",
+    "both artifacts were hashed on the VM before leaving it and verified here after transfer; the digests above are those, and are what the EvidenceItems should carry"
+  ]
+}

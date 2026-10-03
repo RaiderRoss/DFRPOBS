@@ -17,6 +17,7 @@ import json
 import math
 import random
 import socket
+import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -224,10 +225,42 @@ def build_plan(users, malicious_ips, duration, rate, malicious_pct,
     return events
 
 
-def attempt(src_ip, dst_ip, dport, timeout):
+# Ports on which a benign request is sent over TLS; the rest are plain HTTP.
+TLS_PORTS = {443}
+_CLIENT_TLS = ssl.create_default_context()
+_CLIENT_TLS.check_hostname = False
+_CLIENT_TLS.verify_mode = ssl.CERT_NONE      # the lab's web front is self-signed
+
+
+def web_request(sock, dst_ip, dport):
+    """Loads a page over an open connection and returns the HTTP status, or None.
+
+    Benign users used to connect and close at once, sending nothing — zero-byte flows that a
+    flow-based IDS reads as a scan. A customer loads a page, so these do: a GET, the reply
+    read to the end. Only benign attempts do this; the attacker's sweep stays a bare connect,
+    because that is what a sweep is."""
+    try:
+        if dport in TLS_PORTS:
+            sock = _CLIENT_TLS.wrap_socket(sock, server_hostname=None)
+        sock.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0 (PDE lab customer)\r\n"
+                      "Accept: text/html\r\nConnection: close\r\n\r\n" % dst_ip).encode())
+        data = b""
+        while len(data) < 65536:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        first = data.split(b"\r\n", 1)[0].split()
+        return int(first[1]) if len(first) > 1 and first[1].isdigit() else None
+    except (OSError, ValueError):
+        return None
+
+
+def attempt(src_ip, dst_ip, dport, timeout, request=False):
     """
     One TCP connection attempt. The outcome is incidental — a blocked SYN times out and
     that is fine. What matters is that the packet crossed the firewall and was logged.
+    With request=True a connection that opens is used to load a page (web_request).
 
     Returns the moment the SYN actually went out as well, on both clocks: wall time for
     the record, monotonic for measuring drift against the plan.
@@ -239,9 +272,12 @@ def attempt(src_ip, dst_ip, dport, timeout):
         s.settimeout(timeout)
         s.bind((src_ip, 0))
         sport = s.getsockname()[1]
+        http_status = None
         try:
             s.connect((dst_ip, dport))
             outcome = "connected"
+            if request:
+                http_status = web_request(s, dst_ip, dport)
         except socket.timeout:
             outcome = "timeout"
         except ConnectionRefusedError:
@@ -249,7 +285,7 @@ def attempt(src_ip, dst_ip, dport, timeout):
             outcome = "refused"
         except OSError as exc:
             outcome = "error:%s" % (exc.errno,)
-        return sport, outcome, sent_at, sent_mono
+        return sport, outcome, sent_at, sent_mono, http_status
     finally:
         s.close()
 
@@ -306,8 +342,15 @@ def main():
     ap.add_argument("--alert-ports",
                     help="comma-separated, firewall-permitted and answered by a listener; "
                          "the guaranteed-alert profile's targets")
-    ap.add_argument("--connect-timeout", type=float, default=0.25)
-    ap.add_argument("--max-inflight", type=int, default=64,
+    ap.add_argument("--connect-timeout", type=float, default=0.25,
+                    help="for attempts to denied ports, where nothing will ever answer")
+    ap.add_argument("--answer-timeout", type=float, default=5.0,
+                    help="for attempts to ports something answers (the web front, the alert "
+                         "listener): the time to connect and load the page, as a client "
+                         "would wait for it. Over the tunnel a round trip plus a TLS "
+                         "handshake does not fit in --connect-timeout, and a customer "
+                         "whose page load is cut off leaves a half-finished flow behind")
+    ap.add_argument("--max-inflight", type=int, default=128,
                     help="concurrent connection attempts; must exceed rate * "
                          "connect-timeout or blocked attempts will queue and drift")
     ap.add_argument("--seed", type=int, help="makes a run reproducible")
@@ -378,8 +421,11 @@ def main():
                 time.sleep(delay)
             else:
                 late += 1
-            pending.append((e, pool.submit(attempt, e["src"], args.target,
-                                           e["dport"], args.connect_timeout)))
+            answered = e["label"] == "benign" or e["dport"] in alert_ports
+            pending.append((e, pool.submit(attempt, e["src"], args.target, e["dport"],
+                                           args.answer_timeout if answered
+                                           else args.connect_timeout,
+                                           e["label"] == "benign")))
 
     finished = utc_now()
 
@@ -387,7 +433,7 @@ def main():
     drift_total = 0.0
     drift_max = 0.0
     for e, future in pending:
-        sport, outcome, sent_at, sent_mono = future.result()
+        sport, outcome, sent_at, sent_mono, http_status = future.result()
         # How far the SYN actually went out from where the plan wanted it. Measured
         # rather than assumed: a saturated pool queues silently, and a queued attempt
         # is late in a way the scheduling loop above cannot see.
@@ -405,6 +451,7 @@ def main():
             "dport": e["dport"],
             "label": e["label"],
             "outcome": outcome,
+            "http_status": http_status,
         })
     executed.sort(key=lambda x: x["seq"])
 
@@ -420,6 +467,8 @@ def main():
         "benign_events": sum(1 for e in executed if e["label"] == "benign"),
         # Attempts the scheduling loop reached after their slot had already passed.
         "events_behind_schedule": late,
+        "connect_timeout_s": args.connect_timeout,
+        "answer_timeout_s": args.answer_timeout,
         # What the packets actually did, which is the number that matters: if mean
         # drift approaches the inter-arrival gap, the realised traffic no longer has
         # the temporal shape the profile specified and the run should be rated down.

@@ -2,12 +2,12 @@
 #
 # Submits one source's evidence from a captured window to the DFRaaS Evidence Repository.
 #
-# One EvidenceItem references one artifact, so a window that captured both the firewall
-# and the IDS is two items from two registered sources — not one upload carrying two
-# files. --source picks which one goes; the window supplies the rest.
+# One EvidenceItem references one artifact, so a window that captured the firewall, the
+# IDS and the bank is four items from four registered sources — not one upload carrying
+# four files. --source picks which one goes; the window supplies the rest.
 #
-# The coverage window is the same for both, because both observed the same packets over
-# the same period. Only the artifact, the digest and the registered source differ.
+# The coverage window is the same for all of them, because they observed one scenario over
+# one period. Only the artifact, the digest and the registered source differ.
 #
 # The digest is sent as a *claim*. The repository recomputes it from the bytes that
 # arrive, compares the two, and stores only its own value; a mismatch is a 422 and
@@ -23,6 +23,7 @@
 #   ./submit-evidence.sh --dry-run                    # show exactly what would be sent
 #   ./submit-evidence.sh                              # firewall log of the latest window
 #   ./submit-evidence.sh --source ids                 # the IDS evidence for that window
+#   ./submit-evidence.sh --source banking-audit       # the bank's audit trail for it
 #   ./submit-evidence.sh --run 20260906204848 --source ids
 #   ./submit-evidence.sh --list                       # what is available to send
 #
@@ -49,6 +50,18 @@ IDS_SOURCE_KEY="${DFRAAS_IDS_SOURCE_KEY:-pde-sim-slips-01}"
 IDS_DISPLAY_NAME="${DFRAAS_IDS_DISPLAY_NAME:-PDE testbed IDS (Slips)}"
 IDS_SOURCE_TYPE="${DFRAAS_IDS_SOURCE_TYPE:-IDS}"
 
+# The bank is two collectors, so two sources: its event stream says what happened, its
+# audit trail says who did it. DB_AUDIT is the type EvidenceSource's own documentation
+# uses as its example; the repository takes any SCREAMING_SNAKE_CASE type without a
+# migration.
+BANK_EVENTS_SOURCE_KEY="${DFRAAS_BANK_EVENTS_SOURCE_KEY:-pde-sim-fineract-events-01}"
+BANK_EVENTS_DISPLAY_NAME="${DFRAAS_BANK_EVENTS_DISPLAY_NAME:-PDE testbed bank event stream (Fineract)}"
+BANK_EVENTS_SOURCE_TYPE="${DFRAAS_BANK_EVENTS_SOURCE_TYPE:-BANKING_EVENTS}"
+
+BANK_AUDIT_SOURCE_KEY="${DFRAAS_BANK_AUDIT_SOURCE_KEY:-pde-sim-fineract-audit-01}"
+BANK_AUDIT_DISPLAY_NAME="${DFRAAS_BANK_AUDIT_DISPLAY_NAME:-PDE testbed bank audit trail (Fineract)}"
+BANK_AUDIT_SOURCE_TYPE="${DFRAAS_BANK_AUDIT_SOURCE_TYPE:-DB_AUDIT}"
+
 RUN=""
 SOURCE="firewall"
 DRY_RUN=0
@@ -63,10 +76,12 @@ usage() {
 	cat <<-EOF
 
 	Options:
-	  --source NAME          which source's evidence to send: firewall | ids
+	  --source NAME          which source's evidence to send:
+	                         firewall | ids | banking-events | banking-audit
 	                                                          (default $SOURCE)
 	  --list                 show the windows and what each holds, then exit
-	  --run ID               window to submit from, e.g. 20260906204848 (default: latest)
+	  --run ID               window folder to submit from, e.g. 20260906204848 or
+	                         20260930230812_port-scan (default: latest)
 	  --outdir DIR           where captures live                     (default $OUTDIR)
 	  --url URL              repository base URL                     (default $URL)
 	  --source-key KEY       override the registered source key for --source
@@ -103,8 +118,8 @@ command -v curl    >/dev/null 2>&1 || fail "curl not found on PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 not found on PATH"
 
 case "$SOURCE" in
-	firewall|ids) ;;
-	*) fail "unknown --source '$SOURCE' (firewall | ids)" ;;
+	firewall|ids|banking-events|banking-audit) ;;
+	*) fail "unknown --source '$SOURCE' (firewall | ids | banking-events | banking-audit)" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -114,21 +129,25 @@ if [[ "$LIST" -eq 1 ]]; then
 	found=0
 	for dir in "$OUTDIR"/*/; do
 		[[ -d "$dir" ]] || continue
-		stamp=$(basename "$dir")
-		[[ "$stamp" == "sessions" ]] && continue
+		name=$(basename "$dir")
+		[[ "$name" == "sessions" ]] && continue
+		stamp="${name%%_*}"
 		[[ -f "$dir/firewall_${stamp}.manifest.json" ]] || continue
 		found=1
-		printf '  %s\n' "$stamp" >&2
+		printf '  %s\n' "$name" >&2
 		if [[ -f "$dir/firewall_${stamp}.log" ]]; then
-			printf '    %-10s %-34s %s bytes\n' firewall "firewall_${stamp}.log" \
+			printf '    %-15s %-38s %s bytes\n' firewall "firewall_${stamp}.log" \
 				"$(stat -c %s "$dir/firewall_${stamp}.log")" >&2
 		fi
-		if [[ -f "$dir/ids_${stamp}.alerts.log" ]]; then
-			printf '    %-10s %-34s %s bytes\n' ids "ids_${stamp}.alerts.log" \
-				"$(stat -c %s "$dir/ids_${stamp}.alerts.log")" >&2
-		else
-			printf '    %-10s %s\n' ids "not captured for this window" >&2
-		fi
+		for pair in "ids:ids_${stamp}.alerts.log" "banking-events:banking-events_${stamp}.jsonl" \
+		            "banking-audit:banking-audit_${stamp}.jsonl"; do
+			src="${pair%%:*}" file="${pair#*:}"
+			if [[ -f "$dir/$file" ]]; then
+				printf '    %-15s %-38s %s bytes\n' "$src" "$file" "$(stat -c %s "$dir/$file")" >&2
+			else
+				printf '    %-15s %s\n' "$src" "not captured for this window" >&2
+			fi
+		done
 	done
 	[[ "$found" -eq 1 ]] || log "no captures found in $OUTDIR"
 	exit 0
@@ -148,42 +167,59 @@ if [[ -z "$RUN" ]]; then
 fi
 
 RUN_DIR="$OUTDIR/$RUN"
-MANIFEST="$RUN_DIR/firewall_${RUN}.manifest.json"
-GROUP="$RUN_DIR/window_${RUN}.group.json"
+# A window's folder is named for its timestamp, and its files carry that timestamp. A folder
+# may also carry a label after it (20260930230812_port-scan, as in evaluation/); the
+# timestamp is the part before the first underscore, and it is what names the files.
+STAMP="${RUN%%_*}"
+MANIFEST="$RUN_DIR/firewall_${STAMP}.manifest.json"
+GROUP="$RUN_DIR/window_${STAMP}.group.json"
 [[ -f "$MANIFEST" ]] || fail "no manifest for window $RUN ($MANIFEST)"
 
 # The coverage window is a property of the capture, not of the source: both sources
 # observed the same packets over the same period, so both items carry the same window
 # and correlation can line them up along it. Only the artifact and its digest differ.
 #
-# The firewall's digest lives in its own manifest; the IDS's lives in the group
-# manifest, which is the record that says the two describe one window.
+# The firewall's digest lives in its own manifest; every other source's lives in the group
+# manifest, which is the record that says they all describe one window.
+CONTENT_TYPE="text/plain"
+case "$SOURCE" in
+	firewall)
+		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$FW_SOURCE_KEY}"
+		DISPLAY_NAME="$FW_DISPLAY_NAME"; SOURCE_TYPE="$FW_SOURCE_TYPE" ;;
+	ids)
+		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$IDS_SOURCE_KEY}"
+		DISPLAY_NAME="$IDS_DISPLAY_NAME"; SOURCE_TYPE="$IDS_SOURCE_TYPE" ;;
+	banking-events)
+		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$BANK_EVENTS_SOURCE_KEY}"
+		DISPLAY_NAME="$BANK_EVENTS_DISPLAY_NAME"; SOURCE_TYPE="$BANK_EVENTS_SOURCE_TYPE"
+		CONTENT_TYPE="application/x-ndjson" ;;
+	banking-audit)
+		SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$BANK_AUDIT_SOURCE_KEY}"
+		DISPLAY_NAME="$BANK_AUDIT_DISPLAY_NAME"; SOURCE_TYPE="$BANK_AUDIT_SOURCE_TYPE"
+		CONTENT_TYPE="application/x-ndjson" ;;
+esac
+# The dedupe key: <source>_<window>, the artifact's own name without its extension.
+ARTIFACT_ID="${SOURCE}_${STAMP}"
+
 if [[ "$SOURCE" == "firewall" ]]; then
-	LOG_FILE="$RUN_DIR/firewall_${RUN}.log"
-	ARTIFACT_ID="firewall_${RUN}"
-	SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$FW_SOURCE_KEY}"
-	DISPLAY_NAME="$FW_DISPLAY_NAME"
-	SOURCE_TYPE="$FW_SOURCE_TYPE"
+	LOG_FILE="$RUN_DIR/firewall_${STAMP}.log"
 	read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
 import json, sys
 m = json.load(open(sys.argv[1]))
 print(m["window"]["start_utc"], m["window"]["end_utc"], m["output"]["sha256"])
 ' "$MANIFEST") || true
 else
-	LOG_FILE="$RUN_DIR/ids_${RUN}.alerts.log"
-	ARTIFACT_ID="ids_${RUN}"
-	SOURCE_KEY="${SOURCE_KEY_OVERRIDE:-$IDS_SOURCE_KEY}"
-	DISPLAY_NAME="$IDS_DISPLAY_NAME"
-	SOURCE_TYPE="$IDS_SOURCE_TYPE"
-	[[ -f "$GROUP" ]] || fail "window $RUN has no IDS evidence (no $GROUP) — it was captured without --with-ids"
-	read -r EVENT_START EVENT_END MANIFEST_SHA256 < <(python3 -c '
+	[[ -f "$GROUP" ]] || fail "window $RUN has no $SOURCE evidence (no $GROUP) — only the firewall was captured"
+	read -r EVENT_START EVENT_END MANIFEST_SHA256 ITEM_FILE < <(python3 -c '
 import json, sys
 g = json.load(open(sys.argv[1]))
-ids = next((i for i in g["items"] if i["pde_source"] == "ids"), None)
-if ids is None:
-    raise SystemExit("group manifest lists no ids item")
-print(g["window"]["start_utc"], g["window"]["end_utc"], ids["sha256"])
-' "$GROUP") || true
+item = next((i for i in g["items"] if i["pde_source"] == sys.argv[2]), None)
+if item is None:
+    raise SystemExit("group manifest lists no %s item" % sys.argv[2])
+print(g["window"]["start_utc"], g["window"]["end_utc"], item["sha256"], item["file"])
+' "$GROUP" "$SOURCE") || true
+	[[ -n "${ITEM_FILE:-}" ]] || fail "window $RUN has no $SOURCE evidence — it was captured without that source"
+	LOG_FILE="$RUN_DIR/$ITEM_FILE"
 fi
 
 [[ -f "$LOG_FILE" ]] || fail "window $RUN has no $SOURCE evidence ($LOG_FILE)"
@@ -277,7 +313,7 @@ log "submitting the $SOURCE artifact from window $RUN as $ARTIFACT_ID (${BYTES} 
 CODE=$(curl -sS -u "$AUTH" -o "$TMP_DIR/response.json" -w '%{http_code}' \
 	-X POST "$URL/api/evidence-items" \
 	-F "metadata=<$TMP_DIR/metadata.json;type=application/json" \
-	-F "file=@$LOG_FILE;type=text/plain" || true)
+	-F "file=@$LOG_FILE;type=$CONTENT_TYPE" || true)
 CODE="${CODE:-000}"
 
 response_field() {
@@ -338,6 +374,8 @@ case "$CODE" in
 		;;
 	000)
 		log "could not reach $URL"
+		log "If the repository runs on the research VM, open the admin tunnel and point at it:"
+		log "  ./vm.sh tunnel up    then    DFRAAS_URL=http://localhost:18080 $0"
 		log "If the backend runs on Windows and this is WSL, localhost may not route"
 		log "there. Try the host address:"
 		log "  DFRAAS_URL=http://\$(ip route show default | awk '{print \$3}'):8080 $0"

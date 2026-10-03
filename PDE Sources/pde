@@ -41,23 +41,56 @@ ATTACK_PROFILE=port-scan
 SEED=1337
 OUTDIR="$SCRIPT_DIR/output"
 
-# IDS correlation: run Slips on the veth during the window so the firewall and the
-# IDS produce independent evidence for the same packets.
+# IDS correlation: Slips observes the same packets the firewall logs. With IDS_REMOTE the
+# lab captures the veth here and Slips analyses each window on the research VM; without
+# it, Slips runs locally in Docker and sniffs the veth live.
 WITH_IDS=0
-IDS_DRAIN=45
+IDS_REMOTE=1
+# Seconds Slips keeps running past the window. Empty means the capture's own default: 45, or
+# 75 when Slips runs on this machine (it reports unanswered connections later there).
+IDS_DRAIN=""
+
+# The banking source: the same users drive the bank (Fineract) during the window, and its
+# audit trail and event stream are collected for it. The bank runs on the research VM, or with
+# BANK_LOCAL=1 on this machine (Banking/local-bank.sh), which needs no cloud account.
+WITH_BANKING=0
+BANK_LOCAL=0
+BANK_RATE=0.5
+BANK_PROFILE=loan-fraud
 
 # ---- evidence repository -------------------------------------
-# Where a captured window goes once it is evidence. Overridable in pde.conf like
-# everything else, because the backend runs on the host in some setups and inside
-# WSL in others, and localhost does not always mean the same machine.
-DFRAAS_URL="${DFRAAS_URL:-http://localhost:8080}"
+# Where a captured window goes once it is evidence. On the research VM by default, reached
+# through the admin tunnel; REPO_ON_VM=0 in pde.conf for a repository run locally.
+REPO_ON_VM=1
 DFRAAS_AUTH="${DFRAAS_AUTH:-admin:admin}"
 # One registered source per PDE source: they are different collectors observing
 # different things, and the repository classifies and retains per source.
 DFRAAS_SOURCE_KEY="${DFRAAS_SOURCE_KEY:-pde-sim-ufw-01}"
 DFRAAS_IDS_SOURCE_KEY="${DFRAAS_IDS_SOURCE_KEY:-pde-sim-slips-01}"
+DFRAAS_BANK_EVENTS_SOURCE_KEY="${DFRAAS_BANK_EVENTS_SOURCE_KEY:-pde-sim-fineract-events-01}"
+DFRAAS_BANK_AUDIT_SOURCE_KEY="${DFRAAS_BANK_AUDIT_SOURCE_KEY:-pde-sim-fineract-audit-01}"
 
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+# Decided after pde.conf, since REPO_ON_VM may be set there. An explicit DFRAAS_URL wins.
+if [ -z "${DFRAAS_URL:-}" ]; then
+	if [ "$REPO_ON_VM" = "1" ]; then DFRAAS_URL="http://localhost:${VM_LOCAL_REPO_PORT}"
+	else DFRAAS_URL="http://localhost:8080"; fi
+fi
+
+# shellcheck source=Remote/vm-lib.sh
+source "$SCRIPT_DIR/Remote/vm-lib.sh"
+# A seed holds one bank's database ids, so the local bank has a file of its own. An explicit
+# BANK_SEED wins over both.
+BANK_SEED_SET="${BANK_SEED:-}"
+bank_seed_refresh() {
+	if [ -n "$BANK_SEED_SET" ]; then BANK_SEED="$BANK_SEED_SET"
+	elif [ "$BANK_LOCAL" = "1" ]; then BANK_SEED="$SCRIPT_DIR/Banking/seed.local.json"
+	else BANK_SEED="$SCRIPT_DIR/Banking/seed.json"; fi
+}
+bank_seed_refresh
+BANK_LOCAL_SH="$SCRIPT_DIR/Banking/local-bank.sh"
+VM_SH="$SCRIPT_DIR/vm.sh"
 
 # ---- palette -------------------------------------------------
 # Matches Anomaly Detection/Scripts/slips-cli.sh so the two consoles read as
@@ -155,12 +188,14 @@ banner() {
 	# Assembled as single strings then printed with one %s each, so an argument
 	# count can never drift out of step with the format.
 	printf '  %s\n' "${C_DIM}users${R} ${C_KEY}${USERS}${R} ${C_DIM}(${MALICIOUS_USERS} attacking)${R}   ${C_DIM}window${R} ${C_KEY}${DURATION}s${R}   ${C_DIM}rate${R} ${C_KEY}${RATE}/s${R}   ${C_DIM}malicious${R} ${C_KEY}${MALICIOUS_PCT}%${R}"
-	local sources
+	local sources="${C_KEY}firewall${R}"
 	if [ "$WITH_IDS" = "1" ]; then
-		sources="${C_KEY}firewall${R} ${C_DIM}+${R} ${C_KEY}ids${R}"
-	else
-		sources="${C_KEY}firewall${R} ${C_DIM}only${R}"
+		sources="${sources} ${C_DIM}+${R} ${C_KEY}ids${R}$([ "$IDS_REMOTE" = "1" ] && printf '%s' "${C_DIM}(vm)${R}")"
 	fi
+	if [ "$WITH_BANKING" = "1" ]; then
+		sources="${sources} ${C_DIM}+${R} ${C_KEY}banking${R}${C_DIM}($([ "$BANK_LOCAL" = "1" ] && echo here || echo vm))${R}"
+	fi
+	[ "$WITH_IDS" != "1" ] && [ "$WITH_BANKING" != "1" ] && sources="${sources} ${C_DIM}only${R}"
 	printf '  %s\n' "${C_DIM}profile${R} ${C_KEY}${ATTACK_PROFILE}${R}   ${C_DIM}seed${R} ${C_KEY}${SEED}${R}   ${C_DIM}sources${R} ${sources}"
 
 	local n; n="$(run_count)"
@@ -305,7 +340,7 @@ configure_menu() {
 		# two controls and no way to tell which was authoritative. Only the drain stays,
 		# because it describes the capture rather than the source.
 		if [ "$WITH_IDS" = "1" ]; then
-			printf '  %s7%s  IDS drain        %s%-7s%s %sseconds Slips keeps running past the window,%s\n' "$C_NUM" "$R" "$C_KEY" "${IDS_DRAIN}s" "$R" "$C_DIM" "$R"
+			printf '  %s7%s  IDS drain        %s%-7s%s %sseconds Slips keeps running past the window,%s\n' "$C_NUM" "$R" "$C_KEY" "$(ids_drain_effective)s" "$R" "$C_DIM" "$R"
 			printf '  %s                    %s%-7s%s %sso it can raise evidence for it%s\n' "$C_DIM" "" "" "$R" "$C_DIM" "$R"
 		else
 			printf '  %s   %s IDS drain        %s—       the IDS source is off; option 1 turns it on%s\n' "$C_DIM" "$R" "$C_DIM" "$R"
@@ -397,6 +432,29 @@ if h:
             print("      %-7s %-4s %s" % (p, n, "#" * max(1, int(n * 30 / top))))
         if len(h) > 12:
             print("      ... and %d more ports at %d or fewer" % (len(h) - 12, low))'
+	if [ "$WITH_BANKING" = "1" ]; then
+		head_ "At the bank — '$BANK_PROFILE'"
+		if [ -r "$BANK_SEED" ]; then
+			python3 "$SCRIPT_DIR/Banking/generate_banking.py" --plan-only --seed-file "$BANK_SEED" \
+				--users "$ips" --malicious-users "$mal" --duration "$DURATION" --rate "$BANK_RATE" \
+				--profile "$BANK_PROFILE" --seed "$SEED" 2>&1 \
+			| python3 -c 'import json,sys
+d = json.load(sys.stdin)
+cust = d["customers"]
+octets = sorted(int(ip.rsplit(".", 1)[1]) for ip in cust)
+print("    %-20s %d, at .%d-.%d, each with their own login" % ("customers", len(cust), octets[0], octets[-1]))
+print("    %-20s %s  %s" % ("customer actions", d["customer_actions"],
+      ", ".join("%s %s" % kv for kv in sorted(d["customer_actions_by_kind"].items()))))
+print("    %-20s %s as %s" % ("mule", d["mule"]["ip"], d["mule"]["login"]))
+c = d.get("fraud_chain")
+if c:
+    print("    %-20s %s as %s (phished), loan of %s" % ("attacker", d["attacker"]["ip"], d["attacker"]["login"], c["principal"]))
+    for s in c["steps"]:
+        print("      %5.1fs  %-14s by %-8s from %s" % (s["at_s"], s["kind"], s["by"], s["from"]))'
+		else
+			dim "    the bank has not been seeded — sources screen, option s"
+		fi
+	fi
 	echo
 	dim "  This shape is all detection has to work with. Worth comparing profiles"
 	dim "  before committing to one for the dataset."
@@ -421,16 +479,16 @@ run_capture() {
 	dim "  Real packets cross the real INPUT chain, and the log lines are written by"
 	dim "  the kernel rather than by us. Only the scenario is synthetic."
 	echo
-	if [ "$WITH_IDS" = "1" ]; then
-		kv "sources" "firewall (ufw) + ids (Slips)"
-	else
-		kv "sources" "firewall (ufw)"
-	fi
+	local srcs="firewall (ufw)"
+	[ "$WITH_IDS" = "1" ] && srcs="$srcs + ids (Slips$([ "$IDS_REMOTE" = "1" ] && echo ' on the VM'))"
+	[ "$WITH_BANKING" = "1" ] && srcs="$srcs + banking (Fineract events + audit)"
+	kv "sources" "$srcs"
 	kv "users"     "$USERS ($MALICIOUS_USERS attacking)"
 	kv "window"    "${DURATION}s at ${RATE}/s"
 	kv "profile"   "$ATTACK_PROFILE"
 	kv ""          "$(profile_signature "$ATTACK_PROFILE")"
 	kv "malicious" "${MALICIOUS_PCT}% of events"
+	[ "$WITH_BANKING" = "1" ] && kv "bank" "${BANK_PROFILE}, benign ${BANK_RATE}/s"
 	if [ "$ATTACK_PROFILE" = "guaranteed-alert" ] && [ "$WITH_IDS" != "1" ]; then
 		echo
 		warn "guaranteed-alert with the IDS off: the traffic is sent, but nothing can raise the alert."
@@ -442,11 +500,26 @@ run_capture() {
 	# untrue, and quoting Slips' start-up time when Slips is running overstates the wait
 	# by about a minute.
 	local state; state="$(lab_state)"
+	# The bank is reached through a path the lab holds — the tunnel to the VM, or the relay to
+	# the local bank — so there is no one-shot path for it. Said here, before sudo is asked for.
+	if [ "$WITH_BANKING" = "1" ] && [ "$state" != "up" ]; then
+		echo
+		err "The banking source needs the sources running — its tunnel to the bank belongs to them."
+		dim "    Start them under option 1 first."
+		pause
+		return
+	fi
 	if [ "$state" = "up" ]; then
-		if [ "$(lab_get LAB_WITH_IDS 0)" = "1" ]; then
+		if [ "$(lab_get LAB_WITH_IDS 0)" = "1" ] && [ "$(lab_get LAB_IDS_MODE local)" = "remote" ]; then
+			dim "    The veth has been captured since the sources started. After the window its"
+			dim "    packets go to Slips on the VM. Expect about $(( DURATION + 75 ))s: the window, then"
+			dim "    about a minute of analysis$([ "$(lab_get LAB_WITH_BANKING 0)" = "1" ] && echo ", with the bank's evidence collected meanwhile")."
+		elif [ "$(lab_get LAB_WITH_IDS 0)" = "1" ]; then
 			dim "    Slips is already reading the veth, so both sources see this window."
-			dim "    Expect about $(( DURATION + IDS_DRAIN ))s: the window, then ${IDS_DRAIN}s for Slips to"
+			dim "    Expect about $(( DURATION + $(ids_drain_effective) ))s: the window, then $(ids_drain_effective)s for Slips to"
 			dim "    raise evidence for it."
+		elif [ "$(lab_get LAB_WITH_BANKING 0)" = "1" ]; then
+			dim "    Expect about $(( DURATION + 30 ))s: the window, then the bank's evidence collected."
 		else
 			dim "    Expect about ${DURATION}s."
 		fi
@@ -457,8 +530,8 @@ run_capture() {
 	else
 		if [ "$WITH_IDS" = "1" ]; then
 			dim "    Slips attaches to the veth before the window opens and keeps running"
-			dim "    ${IDS_DRAIN}s past it, so both sources describe the same packets. Expect roughly"
-			dim "    $(( 60 + DURATION + IDS_DRAIN ))s in total — most of it Slips loading its modules."
+			dim "    $(ids_drain_effective)s past it, so both sources describe the same packets. Expect roughly"
+			dim "    $(( 60 + DURATION + $(ids_drain_effective) ))s in total — most of it Slips loading its modules."
 			echo
 		fi
 		warn "This enables ufw and modifies the host firewall for ${DURATION}s."
@@ -496,7 +569,11 @@ run_capture() {
 		--malicious-pct "$MALICIOUS_PCT" --malicious-users "$MALICIOUS_USERS"
 		--attack-profile "$ATTACK_PROFILE" --seed "$SEED" --outdir "$OUTDIR")
 	if [ "$WITH_IDS" = "1" ]; then
-		args+=(--with-ids --ids-drain "$IDS_DRAIN")
+		args+=(--with-ids)
+		[ -n "$IDS_DRAIN" ] && args+=(--ids-drain "$IDS_DRAIN")
+	fi
+	if [ "$WITH_BANKING" = "1" ]; then
+		args+=(--with-banking --bank-rate "$BANK_RATE" --bank-profile "$BANK_PROFILE")
 	fi
 
 	local rc=0
@@ -599,7 +676,7 @@ kv("sha256", o["sha256"][:40] + "...")' "$OUTDIR/$run/firewall_${run}.manifest.j
 	# When the window was captured with --with-ids there is a second, independent
 	# account of the same packets. Showing them together is the whole point.
 	local group="$OUTDIR/$run/window_${run}.group.json"
-	if [ -f "$group" ]; then
+	if [ -f "$group" ] && grep -q '"pde_source": "ids"' "$group"; then
 		head_ "IDS — same window, independent source"
 		python3 -c 'import json,sys
 g = json.load(open(sys.argv[1]))
@@ -627,6 +704,34 @@ if ids:
 		fi
 	fi
 
+	# The bank's two accounts of the same window: what happened (events) and who did it
+	# (audit). The attacker's commands are shown as the audit trail recorded them.
+	local bank_manifest="$OUTDIR/$run/banking_${run}.manifest.json"
+	if [ -f "$bank_manifest" ]; then
+		head_ "Bank — same window, same users"
+		python3 -c 'import json,sys
+m = json.load(open(sys.argv[1]))
+def kv(k, v): print("    %-22s %s" % (k, v))
+sc, comp, col = m["scenario"], m["completeness"], m["collection"]
+kv("product", "%s (%s)" % (m["source"]["product"], m["source"]["image"]))
+kv("scenario", "%s — attacker %s as %s" % (sc["profile"], sc.get("attacker_ip") or "-", sc.get("attacker_used_login") or "-"))
+kv("events", "%s in window  %s" % (col["banking-events"]["events_in_window"], comp["banking-events"]))
+kv("audit rows", "%s in window  %s" % (col["banking-audit"]["rows"], comp["banking-audit"]))
+clk = m["timestamps"].get("bank_minus_lab_seconds")
+if clk:
+    kv("bank clock", "%+.3fs vs this machine (median, incl. latency)" % clk["median"])
+login = sc.get("attacker_used_login")
+if login:
+    print()
+    print("    what %s did, as the bank recorded it:" % login)
+    for line in open(sys.argv[2]):
+        r = json.loads(line)
+        if r.get("maker_username") == login:
+            print("      %s  %-8s %-14s id %s" % (r["made_on_date_utc"][11:23], r["action_name"], r["entity_name"], r["resource_id"]))' \
+			"$bank_manifest" "$OUTDIR/$run/banking-audit_${run}.jsonl" 2>/dev/null \
+			|| dim "    could not read the banking manifest"
+	fi
+
 	head_ "Evidence — first 12 lines"
 	sed -e "s/\[UFW BLOCK\]/${C_ERR}[UFW BLOCK]${R}/g" \
 		-e "s/\[UFW ALLOW\]/${C_OK}[UFW ALLOW]${R}/g" \
@@ -636,7 +741,7 @@ if ids:
 		"$OUTDIR/$run/firewall_${run}.log" 2>/dev/null | head -12 | sed 's/^/    /'
 	echo
 	dim "  window:  $OUTDIR/$run/"
-	dim "  files:   firewall_${run}.log, .manifest.json, .groundtruth.json"
+	dim "  files:   $(cd "$OUTDIR/$run" && ls -1 | grep -v '^ids_[0-9]*$' | tr '\n' ' ')"
 	pause
 }
 
@@ -649,16 +754,34 @@ verify_evidence() {
 	dim "  The manifest digest was taken before anything else touched the file, which"
 	dim "  is the SecureRS rule the Evidence Repository follows on ingest."
 	echo
-	local recorded actual
-	recorded="$(manifest_field "$run" 'm["output"]["sha256"]')"
-	actual="$(sha256sum "$OUTDIR/$run/firewall_${run}.log" 2>/dev/null | cut -d' ' -f1)"
-	kv "recorded"   "${recorded:-missing}"
-	kv "recomputed" "${actual:-missing}"
+	# Every artifact the window holds, each against the digest recorded when it was taken:
+	# the firewall's in its own manifest, the others' in the group manifest.
+	local rows
+	rows=$(python3 -c 'import json,os,sys
+run_dir, run = sys.argv[1], sys.argv[2]
+fw = json.load(open(os.path.join(run_dir, "firewall_%s.manifest.json" % run)))
+print("firewall", "firewall_%s.log" % run, fw["output"]["sha256"])
+g = os.path.join(run_dir, "window_%s.group.json" % run)
+if os.path.exists(g):
+    for i in json.load(open(g))["items"]:
+        if i["pde_source"] != "firewall":
+            print(i["pde_source"], i["file"], i["sha256"] or "-")' "$OUTDIR/$run" "$run" 2>/dev/null)
+	local src file recorded actual bad=0
+	while read -r src file recorded; do
+		[ -n "$src" ] || continue
+		actual="$(sha256sum "$OUTDIR/$run/$file" 2>/dev/null | cut -d' ' -f1)"
+		if [ -n "$actual" ] && [ "$recorded" = "$actual" ]; then
+			printf '  %s✓%s %-15s %-40s %s\n' "$C_OK" "$R" "$src" "$file" "${C_DIM}${actual:0:16}…${R}"
+		else
+			printf '  %s✗%s %-15s %-40s %s\n' "$C_ERR" "$R" "$src" "$file" "recorded ${recorded:0:16}… now ${actual:-missing}"
+			bad=1
+		fi
+	done <<< "$rows"
 	echo
-	if [ -n "$actual" ] && [ "$recorded" = "$actual" ]; then
-		ok "match — unmodified since capture"
+	if [ "$bad" = "0" ]; then
+		ok "every artifact matches — unmodified since capture"
 	else
-		err "MISMATCH — the log has changed since it was captured"
+		err "MISMATCH — an artifact has changed since it was captured"
 	fi
 	pause
 }
@@ -671,63 +794,68 @@ submit_evidence() {
 	# One EvidenceItem references one artifact, so a window holding both a firewall log
 	# and an IDS log is two items from two sources — chosen here one at a time rather
 	# than uploaded together, which would misrepresent what an item is.
-	local fw_log="$OUTDIR/$run/firewall_${run}.log"
-	local ids_log="$OUTDIR/$run/ids_${run}.alerts.log"
 	local group="$OUTDIR/$run/window_${run}.group.json"
+	# Row number, source name, artifact file, registered key. Every source's evidence is
+	# one file and one item; none is bundled with another.
+	local rows=(
+		"1 firewall firewall_${run}.log $DFRAAS_SOURCE_KEY"
+		"2 ids ids_${run}.alerts.log $DFRAAS_IDS_SOURCE_KEY"
+		"3 banking-events banking-events_${run}.jsonl $DFRAAS_BANK_EVENTS_SOURCE_KEY"
+		"4 banking-audit banking-audit_${run}.jsonl $DFRAAS_BANK_AUDIT_SOURCE_KEY"
+	)
 
-	local source="" key="" artifact="" file="" digest=""
+	local source="" key="" file="" digest="" row n s f k
 	while true; do
 		banner
 		head_ "Submit from window $run"
-		dim "  One EvidenceItem references one artifact. A window captured from two"
-		dim "  sources is therefore two items, filed under two registered sources — sent"
-		dim "  one at a time, not bundled. Both carry the same coverage window, which is"
-		dim "  what lets correlation line them up afterwards."
+		dim "  One EvidenceItem references one artifact. A window captured from several"
+		dim "  sources is therefore several items, each filed under its own registered"
+		dim "  source — sent one at a time, not bundled. All carry the same coverage"
+		dim "  window, which is what lets correlation line them up afterwards."
 		echo
 		kv "window" "$(manifest_field "$run" 'm["window"]["start_utc"] + "  ->  " + m["window"]["end_utc"]')"
+		kv "repository" "$DFRAAS_URL$([ "$REPO_ON_VM" = "1" ] && echo '  (on the research VM, via the admin tunnel)')"
 		echo
-		printf '  %s%-3s %-10s %-32s %10s  %s%s\n' "$C_DIM" "" "SOURCE" "ARTIFACT" "BYTES" "FILED UNDER" "$R"
-		if [ -f "$fw_log" ]; then
-			printf '  %s1%s   %-10s %-32s %10s  %s\n' "$C_NUM" "$R" "firewall" \
-				"firewall_${run}.log" "$(stat -c %s "$fw_log")" "$DFRAAS_SOURCE_KEY"
-		else
-			printf '  %s    %-10s %s%s\n' "$C_DIM" "firewall" "missing" "$R"
-		fi
-		if [ -f "$ids_log" ]; then
-			printf '  %s2%s   %-10s %-32s %10s  %s\n' "$C_NUM" "$R" "ids" \
-				"ids_${run}.alerts.log" "$(stat -c %s "$ids_log")" "$DFRAAS_IDS_SOURCE_KEY"
-		else
-			printf '  %s    %-10s %s%s\n' "$C_DIM" "ids" "not captured for this window" "$R"
-		fi
-		printf '  %s    %-10s %s%s\n' "$C_DIM" "auth" "not built yet" "$R"
+		printf '  %s%-3s %-15s %-38s %10s  %s%s\n' "$C_DIM" "" "SOURCE" "ARTIFACT" "BYTES" "FILED UNDER" "$R"
+		for row in "${rows[@]}"; do
+			read -r n s f k <<< "$row"
+			if [ -f "$OUTDIR/$run/$f" ]; then
+				printf '  %s%s%s   %-15s %-38s %10s  %s\n' "$C_NUM" "$n" "$R" "$s" "$f" \
+					"$(stat -c %s "$OUTDIR/$run/$f")" "$k"
+			else
+				printf '  %s    %-15s %s%s\n' "$C_DIM" "$s" "not captured for this window" "$R"
+			fi
+		done
+		printf '  %s    %-15s %s%s\n' "$C_DIM" "auth" "not built yet" "$R"
 		echo
-		dim "  groundtruth.json is never sent: labels known before the packets left are"
+		dim "  Ground truth is never sent: labels known before the traffic left are"
 		dim "  research metadata, and the repository has nowhere truthful to put them."
 		echo
 		printf '  %s0%s  back\n' "$C_NUM" "$R"
 		echo
 		printf '  %sselect>%s ' "$C_TITLE" "$R"
 		local pick; read -r pick || return
-		case "$pick" in
-			1) [ -f "$fw_log" ] || continue
-			   source=firewall; key="$DFRAAS_SOURCE_KEY"; artifact="firewall_${run}"
-			   file="$fw_log"
-			   digest="$(manifest_field "$run" 'm["output"]["sha256"]')"
-			   break ;;
-			2) [ -f "$ids_log" ] || continue
-			   source=ids; key="$DFRAAS_IDS_SOURCE_KEY"; artifact="ids_${run}"
-			   file="$ids_log"
-			   # The IDS digest lives in the group manifest — the record that says the
-			   # two items describe one window.
-			   digest="$(python3 -c 'import json,sys
-g = json.load(open(sys.argv[1]))
-i = next((x for x in g["items"] if x["pde_source"] == "ids"), None)
-print(i["sha256"] if i else "")' "$group" 2>/dev/null)"
-			   break ;;
-			0|q) return ;;
-			*) ;;
-		esac
+		case "$pick" in 0|q) return ;; esac
+		source=""
+		for row in "${rows[@]}"; do
+			read -r n s f k <<< "$row"
+			if [ "$pick" = "$n" ] && [ -f "$OUTDIR/$run/$f" ]; then
+				source="$s"; file="$OUTDIR/$run/$f"; key="$k"
+			fi
+		done
+		[ -n "$source" ] && break
 	done
+	local artifact="${source}_${run}"
+	# The firewall's digest lives in its own manifest; every other source's in the group
+	# manifest — the record that says they all describe one window.
+	if [ "$source" = "firewall" ]; then
+		digest="$(manifest_field "$run" 'm["output"]["sha256"]')"
+	else
+		digest="$(python3 -c 'import json,sys
+g = json.load(open(sys.argv[1]))
+i = next((x for x in g["items"] if x["pde_source"] == sys.argv[2]), None)
+print(i["sha256"] if i else "")' "$group" "$source" 2>/dev/null)"
+	fi
 
 	banner
 	head_ "Submit the $source artifact from window $run"
@@ -755,8 +883,15 @@ print(i["sha256"] if i else "")' "$group" 2>/dev/null)"
 		*) dim "  cancelled"; pause; return ;;
 	esac
 	echo
+	if [ "$REPO_ON_VM" = "1" ] && ! vm_tunnel_running admin; then
+		dim "  opening the admin tunnel to the repository on $VM_NAME..."
+		vm_admin_tunnel_start || { err "could not open the admin tunnel — is the VM up? ($VM_SH status)"; pause; return; }
+		ADMIN_TUNNEL_OWNED=1
+	fi
 	DFRAAS_URL="$DFRAAS_URL" DFRAAS_AUTH="$DFRAAS_AUTH" \
 	DFRAAS_SOURCE_KEY="$DFRAAS_SOURCE_KEY" DFRAAS_IDS_SOURCE_KEY="$DFRAAS_IDS_SOURCE_KEY" \
+	DFRAAS_BANK_EVENTS_SOURCE_KEY="$DFRAAS_BANK_EVENTS_SOURCE_KEY" \
+	DFRAAS_BANK_AUDIT_SOURCE_KEY="$DFRAAS_BANK_AUDIT_SOURCE_KEY" \
 		"$SUBMIT_SCRIPT" --run "$run" --source "$source" --outdir "$OUTDIR" 2>&1 | sed 's/^/  /'
 	pause
 }
@@ -829,8 +964,29 @@ doctor() {
 		[ "${c:-0}" -gt 0 ] && dim "    ${c} container(s) running; ufw sets FORWARD to DROP while active"
 	fi
 
+	head_ "The research VM"
+	local gbin vst
+	if gbin="$(vm_gcloud_bin 2>/dev/null)"; then ok "Linux gcloud at $gbin"
+	else err "no Linux gcloud — Remote/install-gcloud.sh (the Windows one on PATH will not do)"; fi
+	vst="$(vm_status)"
+	case "$vst" in
+		RUNNING)
+			ok "$VM_NAME is running"
+			if vm_ssh true </dev/null >/dev/null 2>&1; then ok "reachable over IAP as $VM_USER"
+			else err "SSH over IAP failed — try: $VM_SH ssh"; fi ;;
+		"") err "cannot query $VM_NAME — not logged in, or no access (Remote/install-gcloud.sh)" ;;
+		*)  warn "$VM_NAME is $vst — $VM_SH start (the IDS on the VM, the bank and the repository all live there)" ;;
+	esac
+	if [ -r "$BANK_SEED" ]; then ok "the bank has been seeded"
+	else warn "the bank has not been seeded — sources screen, option s"; fi
+	command -v tcpdump >/dev/null 2>&1 && ok "tcpdump available (IDS capture)" || err "tcpdump missing — apt install tcpdump"
+
 	head_ "Can this machine reach the Evidence Repository?"
 	if command -v curl >/dev/null 2>&1; then ok "curl available"; else err "curl missing — submitting needs it"; fi
+	if [ "$REPO_ON_VM" = "1" ] && [ "$vst" = "RUNNING" ] && ! vm_tunnel_running admin; then
+		dim "    opening the admin tunnel to reach it..."
+		vm_admin_tunnel_start >/dev/null 2>&1 && ADMIN_TUNNEL_OWNED=1
+	fi
 
 	local health source_code
 	# `|| true` rather than `|| echo "000"`: curl already prints 000 from -w when the
@@ -850,15 +1006,17 @@ doctor() {
 	if [ "$health" = "200" ]; then
 		# Each PDE source registers separately, so each is checked separately: the
 		# firewall being registered says nothing about whether the IDS is.
-		local sk
-		for sk in "$DFRAAS_SOURCE_KEY" "$DFRAAS_IDS_SOURCE_KEY"; do
+		local pair sk src
+		for pair in "firewall:$DFRAAS_SOURCE_KEY" "ids:$DFRAAS_IDS_SOURCE_KEY" \
+		            "banking-events:$DFRAAS_BANK_EVENTS_SOURCE_KEY" "banking-audit:$DFRAAS_BANK_AUDIT_SOURCE_KEY"; do
+			src="${pair%%:*}" sk="${pair#*:}"
 			source_code=$(curl -sS -u "$DFRAAS_AUTH" -o /dev/null -w '%{http_code}' --max-time 3 \
 				"$DFRAAS_URL/api/evidence-sources?sourceKey=$sk" 2>/dev/null || true)
 			source_code="${source_code:-000}"
 			case "$source_code" in
 				200) ok "source '$sk' is registered" ;;
 				404) warn "source '$sk' is not registered yet"
-				     dim "    ./submit-evidence.sh --source $([ "$sk" = "$DFRAAS_IDS_SOURCE_KEY" ] && echo ids || echo firewall) --register-with <workGroupId>" ;;
+				     dim "    DFRAAS_URL=$DFRAAS_URL ./submit-evidence.sh --source $src --register-with <workGroupId>" ;;
 				401) err "credentials rejected — set DFRAAS_AUTH in pde.conf" ;;
 				*)   warn "lookup for '$sk' answered HTTP $source_code" ;;
 			esac
@@ -868,6 +1026,13 @@ doctor() {
 }
 
 # ---- lab lifecycle -------------------------------------------
+# The drain a capture will actually use: the one set here, or the capture's own default.
+ids_drain_effective() {
+	if [ -n "$IDS_DRAIN" ]; then echo "$IDS_DRAIN"
+	elif [ "$IDS_REMOTE" = "1" ]; then echo 45
+	else echo 75; fi
+}
+
 sudo_run() {
 	if [ "$(id -u)" -ne 0 ]; then sudo "$@"; else "$@"; fi
 }
@@ -875,10 +1040,16 @@ sudo_run() {
 # Set when this console started the sources, so it only tears down what it owns. A lab
 # someone else left running is reported and left alone.
 LAB_OWNED=0
+# Likewise for the admin tunnel to the VM, opened on demand by submit, doctor and seeding.
+ADMIN_TUNNEL_OWNED=0
 
 lab_bring_up() {
 	local args=(up --users "$USERS")
 	[ "$WITH_IDS" = "1" ] && args+=(--with-ids)
+	[ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" = "1" ] && args+=(--ids-remote)
+	if [ "$WITH_BANKING" = "1" ]; then
+		if [ "$BANK_LOCAL" = "1" ]; then args+=(--local-bank); else args+=(--with-banking); fi
+	fi
 	if sudo_run "$LAB_SH" "${args[@]}"; then
 		LAB_OWNED=1
 		return 0
@@ -892,6 +1063,9 @@ lab_take_down() {
 
 # Runs on quit and on Ctrl-C. Sources are started for you, so they are stopped for you.
 on_exit() {
+	if [ "$ADMIN_TUNNEL_OWNED" = "1" ]; then
+		vm_tunnel_stop admin 2>/dev/null || true
+	fi
 	if [ "$LAB_OWNED" = "1" ] && [ "$(lab_state)" = "up" ]; then
 		printf '\n'
 		dim "stopping sources and restoring the firewall..."
@@ -916,83 +1090,128 @@ sources_menu() {
 		dim "  a capture is a window read against them."
 		echo
 		local state; state="$(lab_state)"
-		local running_ids; running_ids="$(lab_get LAB_WITH_IDS)"
+		local running_ids running_mode running_bank
+		running_ids="$(lab_get LAB_WITH_IDS 0)"
+		running_mode="$(lab_get LAB_IDS_MODE local)"
+		running_bank="$(lab_get LAB_WITH_BANKING 0)"
+		local running_where; running_where="$(lab_get LAB_BANK_WHERE vm)"
+		local bank_at; bank_at="$([ "$running_where" = "local" ] && echo "this machine" || echo "$VM_NAME")"
+		# Asked once per draw rather than cached: whether the VM is up is exactly the
+		# thing that changes behind this screen's back.
+		local vst; vst="$(vm_status)"
 
-		printf '  %s%-12s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
+		printf '  %s%-16s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
 		if [ "$state" = "up" ]; then
-			printf '  %-12s %-12s %s%s%s\n' "firewall" "ufw" "$C_OK" "running" "$R"
-			if [ "$running_ids" = "1" ]; then
-				printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_OK" "running" "$R"
+			printf '  %-16s %-12s %s%s%s\n' "firewall" "ufw" "$C_OK" "running" "$R"
+			if [ "$running_ids" = "1" ] && [ "$running_mode" = "remote" ]; then
+				printf '  %-16s %-12s %s%s%s\n' "ids" "Slips" "$C_OK" "capturing here, analysed on $VM_NAME" "$R"
+			elif [ "$running_ids" = "1" ]; then
+				printf '  %-16s %-12s %s%s%s\n' "ids" "Slips" "$C_OK" "running locally" "$R"
 			else
-				printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "disabled" "$R"
+				printf '  %-16s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "disabled" "$R"
+			fi
+			if [ "$running_bank" = "1" ]; then
+				printf '  %-16s %-12s %s%s%s\n' "banking-events" "Fineract" "$C_OK" "running on $bank_at" "$R"
+				printf '  %-16s %-12s %s%s%s\n' "banking-audit" "Fineract" "$C_OK" "running on $bank_at" "$R"
+			else
+				printf '  %-16s %-12s %s%s%s\n' "banking-events" "Fineract" "$C_DIM" "disabled" "$R"
+				printf '  %-16s %-12s %s%s%s\n' "banking-audit" "Fineract" "$C_DIM" "disabled" "$R"
 			fi
 		else
-			printf '  %-12s %-12s %s%s%s\n' "firewall" "ufw" "$C_DIM" "stopped" "$R"
-			printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "stopped" "$R"
+			local s
+			for s in "firewall ufw" "ids Slips" "banking-events Fineract" "banking-audit Fineract"; do
+				printf '  %-16s %-12s %s%s%s\n' "${s%% *}" "${s#* }" "$C_DIM" "stopped" "$R"
+			done
 		fi
-		printf '  %-12s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
+		printf '  %-16s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
+		echo
+		case "$vst" in
+			RUNNING) printf '  %s\n' "${C_DIM}research VM${R}  ${C_OK}$VM_NAME running${R}" ;;
+			"")      printf '  %s\n' "${C_DIM}research VM${R}  ${C_ERR}cannot be queried${R} ${C_DIM}— Remote/install-gcloud.sh${R}" ;;
+			*)       printf '  %s\n' "${C_DIM}research VM${R}  ${C_WARN}$VM_NAME $vst${R} ${C_DIM}— the bank and a VM-side IDS need it running${R}" ;;
+		esac
+		if [ "$WITH_BANKING" = "1" ] && [ ! -r "$BANK_SEED" ]; then
+			if [ "$BANK_LOCAL" = "1" ]; then warn "The local bank has not been seeded — option s."
+			else warn "The bank has not been seeded — option s, with the VM running."; fi
+		fi
 
 		echo
 		dim "  The firewall is the base source — it owns the topology the traffic runs"
 		dim "  on, so it cannot be turned off on its own."
 		echo
-		# The label names what pressing it does, rather than showing a state and leaving
-		# the reader to work out which way it will move.
-		# "setting", not "it": the table above reports what is *running*, and with the
-		# sources stopped the two are different things. Saying "it is on" next to a row
-		# reading "stopped" invites exactly that confusion.
+		# The labels name what pressing them does, rather than showing a state and leaving
+		# the reader to work out which way it will move. "setting", not "it": the table
+		# above reports what is *running*, and with the sources stopped the two differ.
 		if [ "$WITH_IDS" = "1" ]; then
-			printf '  %s1%s  Turn the IDS source OFF  %s(setting: on)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+			printf '  %s1%s  Turn the IDS source OFF      %s(setting: on)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		else
-			printf '  %s1%s  Turn the IDS source ON   %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+			printf '  %s1%s  Turn the IDS source ON       %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
+		if [ "$IDS_REMOTE" = "1" ]; then
+			printf '  %s4%s  Run the IDS locally instead  %s(setting: analysed on the VM)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s4%s  Run the IDS on the VM        %s(setting: local Slips in Docker)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
+		if [ "$WITH_BANKING" = "1" ]; then
+			printf '  %s5%s  Turn the banking source OFF  %s(setting: on)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s5%s  Turn the banking source ON   %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
+		if [ "$BANK_LOCAL" = "1" ]; then
+			printf '  %s6%s  Run the bank on the VM       %s(setting: on this machine)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %s6%s  Run the bank on this machine %s(setting: on the VM)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		fi
 
-		# Setting and reality can disagree, because Slips attaches at start-up and
-		# cannot join or leave sources that are already running.
-		if [ "$state" = "up" ] && [ "$running_ids" != "$WITH_IDS" ]; then
-			echo
-			warn "Changed, but not yet applied."
-			dim "    Slips attaches when the sources start, so the running ones still have"
-			dim "    it $([ "$running_ids" = "1" ] && echo "ON" || echo "OFF"). Option 2 restarts them, which is what applies it."
+		# Setting and reality can disagree, because every source here attaches when the
+		# sources start and cannot join or leave ones that are already running.
+		if [ "$state" = "up" ]; then
+			local want_mode; want_mode="$([ "$IDS_REMOTE" = "1" ] && echo remote || echo local)"
+			local want_where; want_where="$([ "$BANK_LOCAL" = "1" ] && echo local || echo vm)"
+			if [ "$running_ids" != "$WITH_IDS" ] || [ "$running_bank" != "$WITH_BANKING" ] \
+				|| { [ "$WITH_IDS" = "1" ] && [ "$running_mode" != "$want_mode" ]; } \
+				|| { [ "$WITH_BANKING" = "1" ] && [ "$running_where" != "$want_where" ]; }; then
+				echo
+				warn "Changed, but not yet applied."
+				dim "    Sources attach when they start, so the running ones still have the old"
+				dim "    settings. Option 2 restarts them, which is what applies the change."
+			fi
 		fi
 
 		echo
 		case "$state" in
 			up)
-				printf '  %s2%s  Restart sources          %s(what applies a change made above)%s\n' \
+				printf '  %s2%s  Restart sources              %s(what applies a change made above)%s\n' \
 					"$C_NUM" "$R" "$C_DIM" "$R"
-				# Naming the values it returns to, rather than saying "restores your
-				# firewall" and leaving the reader to wonder what that means.
-				printf '  %s3%s  Stop sources             %s(ufw back to ENABLED=%s LOGLEVEL=%s)%s\n' \
+				# Naming the values it returns to, rather than "restores your firewall".
+				printf '  %s3%s  Stop sources                 %s(ufw back to ENABLED=%s LOGLEVEL=%s)%s\n' \
 					"$C_NUM" "$R" "$C_DIM" "$(lab_get LAB_ORIG_ENABLED)" "$(lab_get LAB_ORIG_LOGLEVEL)" "$R"
 				;;
-			stale) printf '  %s2%s  %sRecover stale session%s %s(put the firewall back)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
+			stale) printf '  %s2%s  %sRecover stale session%s     %s(put the firewall back)%s\n' "$C_NUM" "$R" "$C_ERR" "$R" "$C_DIM" "$R" ;;
 			*)     printf '  %s2%s  Start sources\n' "$C_NUM" "$R" ;;
 		esac
+		echo
+		printf '  %ss%s  Seed the bank                %s(first time, or after its database is wiped)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		if [ "$vst" = "RUNNING" ]; then
+			printf '  %sv%s  Stop the research VM         %s(only its disk is billed while stopped)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %sv%s  Start the research VM        %s(~4 min: VM, then Fineract and the repository)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 		echo
 		printf '  %s0%s  back\n' "$C_NUM" "$R"
 		echo
 		printf '  %sselect>%s ' "$C_TITLE" "$R"; read -r go
 
+		local changed=0
 		case "$go" in
-			1)
-				if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi
-				persist WITH_IDS
-				# Offer the restart here instead of leaving a warning to act on
-				# separately: the toggle alone does nothing to running sources, and
-				# making someone find that out from a notice is a poor way to say it.
-				if [ "$state" = "up" ]; then
-					echo
-					printf '  %sapply it now? this restarts the sources [y/N]>%s ' "$C_TITLE" "$R"
-					# EOF is not consent — see the stale-recovery prompt.
-					if read -r apply; then
-						case "$apply" in
-							y|Y) echo; lab_take_down && lab_bring_up; pause ;;
-							*)   dim "  left for option 2"; sleep 1 ;;
-						esac
-					fi
-				fi
-				;;
+			1) if [ "$WITH_IDS" = "1" ]; then WITH_IDS=0; else WITH_IDS=1; fi
+			   persist WITH_IDS; changed=1 ;;
+			4) if [ "$IDS_REMOTE" = "1" ]; then IDS_REMOTE=0; else IDS_REMOTE=1; fi
+			   persist IDS_REMOTE; [ "$WITH_IDS" = "1" ] && changed=1 ;;
+			5) if [ "$WITH_BANKING" = "1" ]; then WITH_BANKING=0; else WITH_BANKING=1; fi
+			   persist WITH_BANKING; changed=1 ;;
+			6) if [ "$BANK_LOCAL" = "1" ]; then BANK_LOCAL=0; else BANK_LOCAL=1; fi
+			   persist BANK_LOCAL; bank_seed_refresh; [ "$WITH_BANKING" = "1" ] && changed=1 ;;
 			2)
 				case "$state" in
 					up)    echo; lab_take_down && lab_bring_up; pause ;;
@@ -1000,9 +1219,56 @@ sources_menu() {
 					*)     echo; lab_bring_up; pause ;;
 				esac ;;
 			3) [ "$state" = "up" ] && { echo; lab_take_down; pause; } ;;
+			s|S)
+				echo
+				if [ "$BANK_LOCAL" = "1" ]; then
+					# Started first if need be; both steps are no-ops once done.
+					sudo_run "$BANK_LOCAL_SH" up && sudo_run "$BANK_LOCAL_SH" seed \
+						&& ok "the local bank is ready for banking windows"
+				elif [ "$vst" != "RUNNING" ]; then
+					err "the research VM is not running — option v first"
+				else
+					# The seeding script is idempotent: everything is found by a stable key
+					# before it is created, so running it again is always safe.
+					"$VM_SH" seed 2>&1 | sed 's/^/  /' && ok "the bank is ready for banking windows"
+					ADMIN_TUNNEL_OWNED=1
+				fi
+				pause ;;
+			v|V)
+				echo
+				if [ "$vst" = "RUNNING" ]; then
+					if [ "$state" = "up" ] && { { [ "$running_bank" = "1" ] && [ "$running_where" != "local" ]; } \
+						|| [ "$running_mode" = "remote" ]; }; then
+						err "the running sources use the VM — stop them first (option 3)"
+					else
+						printf '  %sstop %s? [y/N]>%s ' "$C_TITLE" "$VM_NAME" "$R"
+						local yn; if read -r yn && [ "$yn" = "y" -o "$yn" = "Y" ]; then
+							"$VM_SH" stop 2>&1 | sed 's/^/  /'
+							ADMIN_TUNNEL_OWNED=0
+						fi
+					fi
+				else
+					"$VM_SH" start 2>&1 | sed 's/^/  /'
+				fi
+				pause ;;
 			0|q) return ;;
 			*) ;;
 		esac
+
+		# Offer the restart here instead of leaving a warning to act on separately: a
+		# toggle alone does nothing to running sources.
+		if [ "$changed" = "1" ] && [ "$state" = "up" ]; then
+			echo
+			printf '  %sapply it now? this restarts the sources [y/N]>%s ' "$C_TITLE" "$R"
+			# EOF is not consent — see the stale-recovery prompt.
+			local apply
+			if read -r apply; then
+				case "$apply" in
+					y|Y) echo; lab_take_down && lab_bring_up; pause ;;
+					*)   dim "  left for option 2"; sleep 1 ;;
+				esac
+			fi
+		fi
 	done
 }
 
@@ -1155,10 +1421,17 @@ if [ "$AUTO_LAB" = "1" ] && [ "$(lab_state)" = "down" ]; then
 	dim "  quit. Your firewall is restored at that point."
 	echo
 	kv "firewall" "ufw — topology, rules and full logging"
-	if [ "$WITH_IDS" = "1" ]; then
+	if [ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" = "1" ]; then
+		kv "ids" "tcpdump on the veth; Slips analyses each window on $VM_NAME"
+	elif [ "$WITH_IDS" = "1" ]; then
 		kv "ids" "Slips on the veth (~50s of startup)"
 	else
 		kv "ids" "disabled — option 1 enables it"
+	fi
+	if [ "$WITH_BANKING" = "1" ]; then
+		kv "banking" "tunnel $HOST_IP:$BANK_PORT to Fineract on $VM_NAME"
+	else
+		kv "banking" "disabled — option 1 enables it"
 	fi
 	echo
 	if ! lab_bring_up; then

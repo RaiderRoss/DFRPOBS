@@ -1,0 +1,688 @@
+{
+  "started_utc": "2026-10-01T10:53:31.601813Z",
+  "finished_utc": "2026-10-01T10:53:58.390939Z",
+  "elapsed_seconds": 28.169,
+  "seed": 1002,
+  "profile": "loan-fraud",
+  "bank_url": "https://10.98.0.1:8443/fineract-provider",
+  "tenant": "default",
+  "tenant_tz": "Asia/Kolkata",
+  "business_date": "01 October 2026",
+  "planned_operations": 18,
+  "executed_ok": 18,
+  "expected_audit_rows": 13,
+  "expected_events_total": 23,
+  "reads_ok": 5,
+  "failed": 0,
+  "skipped": 0,
+  "malicious_ok": 3,
+  "users": [
+    {
+      "ip": "10.99.0.11",
+      "role": "customer",
+      "login": "lerato.nkosi"
+    },
+    {
+      "ip": "10.99.0.12",
+      "role": "customer",
+      "login": "johan.vanwyk"
+    },
+    {
+      "ip": "10.99.0.13",
+      "role": "customer",
+      "login": "ayesha.patel"
+    },
+    {
+      "ip": "10.99.0.14",
+      "role": "customer",
+      "login": "kagiso.molefe"
+    },
+    {
+      "ip": "10.99.0.15",
+      "role": "customer",
+      "login": "naledi.khumalo"
+    },
+    {
+      "ip": "10.99.0.16",
+      "role": "customer",
+      "login": "pieter.botha"
+    },
+    {
+      "ip": "10.99.0.17",
+      "role": "customer",
+      "login": "zanele.mthembu"
+    },
+    {
+      "ip": "10.99.0.18",
+      "role": "customer",
+      "login": "ravi.naidoo"
+    },
+    {
+      "ip": "10.99.0.19",
+      "role": "mule",
+      "login": "lwazi.ndlovu"
+    },
+    {
+      "ip": "10.99.0.20",
+      "role": "attacker",
+      "login": "pde_officer"
+    }
+  ],
+  "attacker": {
+    "ip": "10.99.0.20",
+    "login": "pde_officer",
+    "credential": "phished before the window; used, not simulated"
+  },
+  "mule": {
+    "ip": "10.99.0.19",
+    "login": "lwazi.ndlovu",
+    "name": "Lwazi Ndlovu",
+    "client_id": 16,
+    "external_id": "pde-mule"
+  },
+  "staff": {
+    "officer": {
+      "username": "pde_officer",
+      "user_id": 5
+    }
+  },
+  "operations": [
+    {
+      "sent_at": "2026-10-01T10:53:32.618058Z",
+      "actual_offset": 2.396,
+      "elapsed_s": 0.651,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": "pde-benign-05",
+      "amount": 87,
+      "reference": "Airtime",
+      "resource_id": 275,
+      "scheduled_offset": 2.394,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 1,
+            "amount": 87
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 5,
+            "amount": 87
+          }
+        }
+      ],
+      "seq": 0
+    },
+    {
+      "sent_at": "2026-10-01T10:53:32.650083Z",
+      "actual_offset": 2.428,
+      "elapsed_s": 0.763,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.12",
+      "username": "johan.vanwyk",
+      "customer": "pde-benign-02",
+      "payee": "pde-benign-08",
+      "amount": 582,
+      "reference": "Lunch",
+      "resource_id": 276,
+      "scheduled_offset": 2.426,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 2,
+            "amount": 582
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 8,
+            "amount": 582
+          }
+        }
+      ],
+      "seq": 1
+    },
+    {
+      "sent_at": "2026-10-01T10:53:33.017477Z",
+      "actual_offset": 1.416,
+      "elapsed_s": 0.324,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "check-balance",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": null,
+      "amount": null,
+      "reference": null,
+      "resource_id": null,
+      "scheduled_offset": 1.413,
+      "expected_audit": null,
+      "expected_events": [],
+      "seq": 2
+    },
+    {
+      "sent_at": "2026-10-01T10:53:34.332374Z",
+      "actual_offset": 4.11,
+      "elapsed_s": 0.494,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.17",
+      "username": "zanele.mthembu",
+      "customer": "pde-benign-07",
+      "payee": "pde-benign-03",
+      "amount": 515,
+      "reference": "Lunch",
+      "resource_id": 277,
+      "scheduled_offset": 4.098,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 7,
+            "amount": 515
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 3,
+            "amount": 515
+          }
+        }
+      ],
+      "seq": 3
+    },
+    {
+      "sent_at": "2026-10-01T10:53:34.504178Z",
+      "actual_offset": 4.282,
+      "elapsed_s": 0.842,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": "pde-benign-02",
+      "amount": 301,
+      "reference": "Electricity",
+      "resource_id": 278,
+      "scheduled_offset": 4.274,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 1,
+            "amount": 301
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 2,
+            "amount": 301
+          }
+        }
+      ],
+      "seq": 4
+    },
+    {
+      "sent_at": "2026-10-01T10:53:34.864396Z",
+      "actual_offset": 4.642,
+      "elapsed_s": 0.689,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.13",
+      "username": "ayesha.patel",
+      "customer": "pde-benign-03",
+      "payee": "pde-benign-05",
+      "amount": 307,
+      "reference": "Groceries",
+      "resource_id": 279,
+      "scheduled_offset": 4.632,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 3,
+            "amount": 307
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 5,
+            "amount": 307
+          }
+        }
+      ],
+      "seq": 5
+    },
+    {
+      "kind": "apply-loan",
+      "label": "malicious",
+      "actor": "mule",
+      "src": "10.99.0.19",
+      "username": "lwazi.ndlovu",
+      "scheduled_offset": 6.985,
+      "expected_events": [
+        {
+          "type": "LoanCreatedBusinessEvent",
+          "match": {
+            "id": 43
+          }
+        }
+      ],
+      "sent_at": "2026-10-01T10:53:37.207628Z",
+      "actual_offset": 6.985,
+      "elapsed_s": 0.462,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "resource_id": 43,
+      "amount": 180000,
+      "expected_audit": [
+        "CREATE",
+        "LOAN"
+      ],
+      "seq": 6
+    },
+    {
+      "kind": "approve-loan",
+      "label": "malicious",
+      "actor": "officer",
+      "src": "10.99.0.20",
+      "username": "pde_officer",
+      "scheduled_offset": 10.381,
+      "expected_events": [
+        {
+          "type": "LoanApprovedBusinessEvent",
+          "match": {
+            "id": 43
+          }
+        }
+      ],
+      "sent_at": "2026-10-01T10:53:40.606877Z",
+      "actual_offset": 10.385,
+      "elapsed_s": 0.521,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "resource_id": 43,
+      "amount": null,
+      "expected_audit": [
+        "APPROVE",
+        "LOAN"
+      ],
+      "seq": 7
+    },
+    {
+      "sent_at": "2026-10-01T10:53:41.384000Z",
+      "actual_offset": 11.162,
+      "elapsed_s": 0.635,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.12",
+      "username": "johan.vanwyk",
+      "customer": "pde-benign-02",
+      "payee": "pde-benign-08",
+      "amount": 178,
+      "reference": "School fees",
+      "resource_id": 280,
+      "scheduled_offset": 11.151,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 2,
+            "amount": 178
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 8,
+            "amount": 178
+          }
+        }
+      ],
+      "seq": 8
+    },
+    {
+      "sent_at": "2026-10-01T10:53:42.633061Z",
+      "actual_offset": 12.411,
+      "elapsed_s": 0.661,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.12",
+      "username": "johan.vanwyk",
+      "customer": "pde-benign-02",
+      "payee": "pde-benign-01",
+      "amount": 267,
+      "reference": "Taxi fare",
+      "resource_id": 281,
+      "scheduled_offset": 12.409,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 2,
+            "amount": 267
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 1,
+            "amount": 267
+          }
+        }
+      ],
+      "seq": 9
+    },
+    {
+      "kind": "disburse-loan",
+      "label": "malicious",
+      "actor": "officer",
+      "src": "10.99.0.20",
+      "username": "pde_officer",
+      "scheduled_offset": 13.38,
+      "expected_events": [
+        {
+          "type": "LoanDisbursalBusinessEvent",
+          "match": {
+            "id": 43
+          }
+        }
+      ],
+      "sent_at": "2026-10-01T10:53:43.608349Z",
+      "actual_offset": 13.386,
+      "elapsed_s": 0.679,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "resource_id": 43,
+      "amount": 180000,
+      "expected_audit": [
+        "DISBURSE",
+        "LOAN"
+      ],
+      "seq": 10
+    },
+    {
+      "sent_at": "2026-10-01T10:53:46.331442Z",
+      "actual_offset": 16.109,
+      "elapsed_s": 1.458,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "view-statement",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": null,
+      "amount": null,
+      "reference": null,
+      "resource_id": null,
+      "scheduled_offset": 16.108,
+      "expected_audit": null,
+      "expected_events": [],
+      "seq": 11
+    },
+    {
+      "sent_at": "2026-10-01T10:53:48.295162Z",
+      "actual_offset": 18.073,
+      "elapsed_s": 0.504,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.18",
+      "username": "ravi.naidoo",
+      "customer": "pde-benign-08",
+      "payee": "pde-benign-04",
+      "amount": 180,
+      "reference": "Birthday gift",
+      "resource_id": 282,
+      "scheduled_offset": 18.062,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 8,
+            "amount": 180
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 4,
+            "amount": 180
+          }
+        }
+      ],
+      "seq": 12
+    },
+    {
+      "sent_at": "2026-10-01T10:53:50.191290Z",
+      "actual_offset": 19.969,
+      "elapsed_s": 0.597,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.18",
+      "username": "ravi.naidoo",
+      "customer": "pde-benign-08",
+      "payee": "pde-benign-01",
+      "amount": 123,
+      "reference": "School fees",
+      "resource_id": 283,
+      "scheduled_offset": 19.955,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 8,
+            "amount": 123
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 1,
+            "amount": 123
+          }
+        }
+      ],
+      "seq": 13
+    },
+    {
+      "sent_at": "2026-10-01T10:53:50.519771Z",
+      "actual_offset": 20.297,
+      "elapsed_s": 0.399,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "check-balance",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": null,
+      "amount": null,
+      "reference": null,
+      "resource_id": null,
+      "scheduled_offset": 20.292,
+      "expected_audit": null,
+      "expected_events": [],
+      "seq": 14
+    },
+    {
+      "sent_at": "2026-10-01T10:53:54.114420Z",
+      "actual_offset": 23.892,
+      "elapsed_s": 1.716,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "view-statement",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.11",
+      "username": "lerato.nkosi",
+      "customer": "pde-benign-01",
+      "payee": null,
+      "amount": null,
+      "reference": null,
+      "resource_id": null,
+      "scheduled_offset": 23.886,
+      "expected_audit": null,
+      "expected_events": [],
+      "seq": 15
+    },
+    {
+      "sent_at": "2026-10-01T10:53:57.119336Z",
+      "actual_offset": 26.897,
+      "elapsed_s": 1.271,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "view-statement",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.14",
+      "username": "kagiso.molefe",
+      "customer": "pde-benign-04",
+      "payee": null,
+      "amount": null,
+      "reference": null,
+      "resource_id": null,
+      "scheduled_offset": 26.897,
+      "expected_audit": null,
+      "expected_events": [],
+      "seq": 16
+    },
+    {
+      "sent_at": "2026-10-01T10:53:57.252787Z",
+      "actual_offset": 27.03,
+      "elapsed_s": 0.828,
+      "http_status": 200,
+      "outcome": "ok",
+      "error": null,
+      "kind": "transfer",
+      "label": "benign",
+      "actor": "customer",
+      "src": "10.99.0.12",
+      "username": "johan.vanwyk",
+      "customer": "pde-benign-02",
+      "payee": "pde-benign-01",
+      "amount": 105,
+      "reference": "Taxi fare",
+      "resource_id": 284,
+      "scheduled_offset": 27.024,
+      "expected_audit": [
+        "CREATE",
+        "ACCOUNTTRANSFER"
+      ],
+      "expected_events": [
+        {
+          "type": "SavingsWithdrawalBusinessEvent",
+          "match": {
+            "accountId": 2,
+            "amount": 105
+          }
+        },
+        {
+          "type": "SavingsDepositBusinessEvent",
+          "match": {
+            "accountId": 1,
+            "amount": 105
+          }
+        }
+      ],
+      "seq": 17
+    }
+  ]
+}

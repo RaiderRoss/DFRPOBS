@@ -1,0 +1,39 @@
+# VM only. Layered over Fineract/docker-compose-fineract.yml by Remote/stack-up.sh.
+#
+# The tracked file publishes these ports on 0.0.0.0. On this host that means Docker also
+# owns the tunnel address, with two consequences:
+#
+#   1. bank-relay.py cannot bind 10.98.0.1:8443 — "Address already in use".
+#   2. A packet sent there is DNATed in nat/PREROUTING and crosses FORWARD, never INPUT, so
+#      the VM's ufw cannot log it. The one connection an investigator most wants — the
+#      attacker logging into the bank — would be the one missing from the firewall evidence.
+#
+# Measured: docker-proxy holding 0.0.0.0:8443 is what made the first tunnel run reach
+# Fineract directly and bypass the relay entirely, while looking like it had worked.
+#
+# Binding each publication to the loopback leaves the tunnel address free for the relay,
+# which terminates the call on INPUT and then forwards it here. Nothing inside the compose
+# network changes: services reach each other by name on the compose network rather than
+# through a published port, the collector included, and collect-audit.sh goes through
+# `docker exec`. The admin tunnel is unaffected too — its far end connects to localhost.
+#
+# It also closes a hole this build has on its own: it answers with default credentials, and
+# Docker publication bypasses the host firewall, so 0.0.0.0 exposed it on every interface
+# the VM has. The GCP firewall was the only thing in front of it.
+#
+# !override REPLACES the list. Without it compose appends, the 0.0.0.0 publication survives,
+# and the result looks fixed while being exactly as open as before. Needs Compose >= 2.24;
+# this VM has v5.5.1.
+services:
+  fineract-manager:
+    ports: !override
+      - "127.0.0.1:8443:8443"
+  fineract-worker:
+    ports: !override
+      - "127.0.0.1:8444-8445:8443"
+  db:
+    ports: !override
+      - "127.0.0.1:5432:5432"
+  kafka:
+    ports: !override
+      - "127.0.0.1:9092:9092"
