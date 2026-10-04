@@ -41,18 +41,21 @@ public class EvidenceItemService {
 	private final EvidenceItemMapper mapper;
 	private final HashingService hashingService;
 	private final EvidenceStorageService storageService;
+	private final CustodyChainService custodyChainService;
 
 	public EvidenceItemService(
 			EvidenceItemRepository repository,
 			EvidenceSourceRepository sourceRepository,
 			EvidenceItemMapper mapper,
 			HashingService hashingService,
-			EvidenceStorageService storageService) {
+			EvidenceStorageService storageService,
+			CustodyChainService custodyChainService) {
 		this.repository = repository;
 		this.sourceRepository = sourceRepository;
 		this.mapper = mapper;
 		this.hashingService = hashingService;
 		this.storageService = storageService;
+		this.custodyChainService = custodyChainService;
 	}
 
 	public EvidenceItemDto findById(UUID id) {
@@ -128,15 +131,30 @@ public class EvidenceItemService {
 	 * translated to the same 409. A re-sent artifact therefore cannot become a second exhibit
 	 * for one collection event, no matter how the two attempts interleave.
 	 *
+	 * <p><strong>The opening custody entry is written last, and inside this transaction.</strong>
+	 * It has to be inside it: an item without an entry at sequence 0 has no provenance and does
+	 * not verify, and an entry whose item was rolled back is a ledger describing a preservation
+	 * that never happened. Either is worse than the whole upload failing, so the two commit
+	 * together — see {@link CustodyChainService#append} on why that is {@code REQUIRED} and
+	 * never {@code REQUIRES_NEW}. Last rather than first because the entry carries the item's
+	 * database-stamped {@code createdAt}, which does not exist until the row has been flushed.
+	 *
 	 * <p><strong>One acknowledged compromise.</strong> The object write happens inside this
 	 * transaction, so a database connection is held for the duration of an upload to MinIO.
 	 * At testbed volumes over a local network that is milliseconds and buys atomicity between
 	 * the dedupe check and the insert, which matters more. If artifacts grow to where it does
 	 * not, the split is to do the storage work outside the transaction and keep only the
 	 * insert inside it.
+	 *
+	 * @param performedBy the authenticated principal, recorded as the custody entry's
+	 *                    attribution. Passed in rather than read from the security context
+	 *                    here, so that the one thing a custody record must not get wrong is
+	 *                    visible in this method's signature instead of being picked up
+	 *                    ambiently from a thread-local
 	 */
 	@Transactional
-	public EvidenceItemDto preserve(EvidenceIngestRequest request, byte[] content, String contentType) {
+	public EvidenceItemDto preserve(
+			EvidenceIngestRequest request, byte[] content, String contentType, String performedBy) {
 		String currentHash = hashingService.sha256Hex(content);
 		if (!currentHash.equals(request.sourceSha256())) {
 			// Both digests are logged here and named in neither the exception nor the
@@ -177,22 +195,46 @@ public class EvidenceItemService {
 		}
 
 		EvidenceItem entity = mapper.toEntity(request, source, storageRef, currentHash);
-		EvidenceItemDto preserved;
+		EvidenceItem stored;
 		try {
 			// saveAndFlush, so the INSERT is issued inside this try rather than at commit —
 			// a deferred flush would throw past the catch and surface as a 500.
-			preserved = mapper.toDto(repository.saveAndFlush(entity));
+			stored = repository.saveAndFlush(entity);
 		} catch (DataIntegrityViolationException ex) {
 			throw DuplicateResourceException.of(RESOURCE, "sourceArtifactId", request.sourceArtifactId());
 		}
+
+		// The chain's first link. The detail names the checks this artifact actually passed
+		// rather than restating the digest, which the entry already carries in
+		// artifactHashAfter — and once written, neither can be edited without the chain
+		// showing it.
+		custodyChainService.recordCreation(stored, performedBy, openingCustodyDetail(request, content.length));
 
 		// Last, and only on success: a source is "alive" because it delivered something that
 		// was preserved, not because something addressed to it arrived and was rejected.
 		sourceRepository.touchLastEvidenceAt(source.getId());
 
+		EvidenceItemDto preserved = mapper.toDto(stored);
 		log.info("Preserved artifact: id={} sourceKey={} artifactId={} bytes={} sha256={}",
 				preserved.id(), request.sourceKey(), request.sourceArtifactId(), content.length, currentHash);
 		return preserved;
+	}
+
+	/**
+	 * The human-readable half of the opening custody entry: how this artifact entered the
+	 * system, and what was verified on the way in.
+	 *
+	 * <p>Deliberately not a digest and not the storage key. The digest is a column on the
+	 * entry, and the object key is the one pointer this system does not publish; what a person
+	 * reading the ledger in a year needs from this field is which path the artifact arrived
+	 * by, because manual preservation and streamed ingestion make different claims about
+	 * provenance.
+	 */
+	private static String openingCustodyDetail(EvidenceIngestRequest request, int bytes) {
+		return "Preserved by streamed ingestion from source " + request.sourceKey()
+				+ " as artifact " + request.sourceArtifactId()
+				+ " (" + bytes + " bytes); digest asserted by the source was verified against the received bytes "
+				+ "and against the stored object read back.";
 	}
 
 	/**

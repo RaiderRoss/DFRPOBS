@@ -44,6 +44,40 @@ export type EvidenceItem = {
   createdAt: string
 }
 
+export type CustodyEvent = {
+  id: string
+  evidenceItemId: string
+  sequence: number
+  action: string
+  performedBy: string | null
+  occurredAt: string
+  recordedAt: string
+  artifactHashBefore: string | null
+  artifactHashAfter: string
+  prevEntryHash: string
+  entryHash: string
+  canonicalVersion: number
+  detail: string
+}
+
+export type CustodyChainVerification = {
+  evidenceItemId: string
+  intact: boolean
+  missingOrigin: boolean
+  firstDivergentSequence: number | null
+  length: number
+  headEntryHash: string | null
+}
+
+export type IntegrityCheckResult = {
+  evidenceItemId: string
+  intact: boolean
+  expectedHash: string
+  observedHash: string
+  status: string
+  custodyEvent: CustodyEvent
+}
+
 /** Spring's PagedModel wire shape — `content` plus a page descriptor. */
 export type Page<T> = {
   content: T[]
@@ -123,6 +157,9 @@ export const repositoryApi = {
     return request<EvidenceItemPage>(`/api/evidence-items?${params}`)
   },
   getEvidenceItem: (id: string) => request<EvidenceItem>(`/api/evidence-items/${encodeURIComponent(id)}`),
+  getCustodyChain: (id: string) => request<CustodyEvent[]>(`/api/evidence-items/${encodeURIComponent(id)}/custody`),
+  verifyCustodyChain: (id: string) => request<CustodyChainVerification>(`/api/evidence-items/${encodeURIComponent(id)}/custody/verification`),
+  checkEvidenceIntegrity: (id: string) => request<IntegrityCheckResult>(`/api/evidence-items/${encodeURIComponent(id)}/integrity-checks`, { method: 'POST' }),
   preserveEvidenceItem: (metadata: {
     sourceKey: string
     sourceArtifactId: string

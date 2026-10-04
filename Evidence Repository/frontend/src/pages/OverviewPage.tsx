@@ -90,7 +90,7 @@ export default function OverviewPage() {
 
     return <section className="overview-grid">
         <article className="panel spotlight">
-            <div className="panel-header"><div><p className="panel-label">Repository overview</p><h2>Evidence intake at a glance</h2></div><button className="text-button" type="button" onClick={() => { clearCredentials(); window.location.reload() }}>Disconnect</button></div>
+            <div className="panel-header"><div><p className="panel-label">Repository overview</p><h2>Evidence intake at a glance</h2></div><button className="text-button" type="button" onClick={() => { clearCredentials(); window.location.reload() }}>Logout</button></div>
             <p className="panel-copy">A live summary of the append-only records currently available to investigators.</p>
             {error && <p className="error-message">{error}</p>}
             <div className="metric-row quad">
@@ -102,7 +102,6 @@ export default function OverviewPage() {
             <p className="metric-footnote">The newest {stats?.events.length ?? 0} trigger events span {sourceSystems} source {sourceSystems === 1 ? 'system' : 'systems'}. Most recent arrival: {formatDate(stats?.events[0]?.receivedAt ?? null)}.</p>
         </article>
 
-        <article className="panel"><p className="panel-label">API surface</p><h2>Available operations</h2><ul className="endpoint-list"><li><code>GET</code> trigger events, filtered and paginated</li><li><code>GET</code> evidence sources, optionally by source key</li><li><code>POST</code> evidence items as verified uploads</li><li><code>GET</code> preserved evidence metadata by id</li></ul></article>
 
         <article className="panel">
             <div className="panel-header"><div><p className="panel-label">Evidence sources</p><h2>Collector readiness</h2></div><span className="chip">{stats?.sources.length ?? 0} registered</span></div>

@@ -15,6 +15,7 @@ import org.springframework.data.web.PagedModel;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -33,7 +34,9 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import za.co.dfraas.dto.EvidenceIngestRequest;
 import za.co.dfraas.dto.EvidenceItemDto;
+import za.co.dfraas.dto.IntegrityCheckResult;
 import za.co.dfraas.service.EvidenceItemService;
+import za.co.dfraas.service.IntegrityCheckService;
 
 /**
  * HTTP API for preserved artifacts — the ingestion half of README open question 4.
@@ -57,6 +60,12 @@ import za.co.dfraas.service.EvidenceItemService;
  * adding a retrieval route before that exists would put evidence bytes behind nothing but a
  * password. Responses carry the digest instead, which is enough to verify a copy obtained
  * through whatever gated route lands later.
+ *
+ * <p><strong>The integrity check lives here, the custody ledger does not.</strong>
+ * {@code POST /{id}/integrity-checks} is an operation <em>on the artifact</em> — it reads
+ * the stored bytes — and it happens to append a custody entry, the same way preservation
+ * does. Reading the chain is a different concern with its own resource,
+ * {@code CustodyResource}, nested under the same item.
  */
 @RestController
 @RequestMapping("/api/evidence-items")
@@ -73,9 +82,11 @@ public class EvidenceItemResource {
 	private static final String DEFAULT_CONTENT_TYPE = MediaType.APPLICATION_OCTET_STREAM_VALUE;
 
 	private final EvidenceItemService service;
+	private final IntegrityCheckService integrityCheckService;
 
-	public EvidenceItemResource(EvidenceItemService service) {
+	public EvidenceItemResource(EvidenceItemService service, IntegrityCheckService integrityCheckService) {
 		this.service = service;
+		this.integrityCheckService = integrityCheckService;
 	}
 
 	/**
@@ -190,13 +201,76 @@ public class EvidenceItemResource {
 			@Parameter(description = "The artifact itself. Sent as bytes; never interpreted here.")
 			@RequestPart("file") MultipartFile file,
 
-			// Injected by Spring MVC to build the Location header; hidden so springdoc does not
-			// advertise it as something the caller supplies.
-			@Parameter(hidden = true) UriComponentsBuilder uriBuilder) throws IOException {
+			// Both injected by Spring MVC and hidden so springdoc does not advertise them as
+			// something the caller supplies: one builds the Location header, the other is who
+			// the request authenticated as.
+			@Parameter(hidden = true) UriComponentsBuilder uriBuilder,
+			@Parameter(hidden = true) Authentication authentication) throws IOException {
 
-		EvidenceItemDto preserved = service.preserve(metadata, file.getBytes(), contentTypeOf(file));
+		EvidenceItemDto preserved = service.preserve(
+				metadata, file.getBytes(), contentTypeOf(file), principalOf(authentication));
 		URI location = uriBuilder.path("/api/evidence-items/{id}").buildAndExpand(preserved.id()).toUri();
 		return ResponseEntity.created(location).body(preserved);
+	}
+
+	/**
+	 * Re-verifies one artifact against the digest recorded for it.
+	 *
+	 * <p>A {@code POST} with no body, because it is not idempotent in the way that matters:
+	 * every call appends a custody entry, and two calls are two entries — which is correct,
+	 * since "checked twice" is a different history from "checked once". The verb also keeps
+	 * an idle {@code GET} from a browser tab or a link preview from writing to the ledger.
+	 *
+	 * <p><strong>200 on a mismatch, not 422.</strong> The ingest path returns 422 when bytes
+	 * fail their digest because the artifact is <em>rejected</em> — nothing is stored and the
+	 * caller should resend. Here the opposite happens: the finding is recorded, the item is
+	 * marked, and the caller needs the body. A 4xx would tell an HTTP client that the
+	 * <em>request</em> failed, when the request did exactly what was asked and the evidence
+	 * is what failed. {@code intact} and {@code status} in the body carry the finding.
+	 */
+	@Operation(
+			summary = "Re-verify a preserved artifact's integrity",
+			description = """
+					Reads the stored object back, recomputes its SHA-256 and compares it with \
+					currentHash. Appends a HASH_VERIFIED or HASH_MISMATCH entry to the artifact's chain \
+					of custody attributed to the caller, and on a mismatch moves the item to \
+					COMPROMISED (currentHash is never overwritten — it is the expectation, and the \
+					entry records what was observed). Always 200 when the check ran; the finding is \
+					in the body. 503 means the store could not be read and nothing was recorded.
+					""")
+	@ApiResponse(responseCode = "200", description = "The check ran; intact says what it found")
+	@ApiResponse(responseCode = "401", description = "Missing or invalid credentials", content = @Content)
+	@ApiResponse(responseCode = "404", description = "No evidence item with that id",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "503",
+			description = "The evidence store is unreachable; nothing was verified and nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@PostMapping("/{id}/integrity-checks")
+	public ResponseEntity<IntegrityCheckResult> checkIntegrity(
+			@Parameter(description = "Evidence item id", example = "c4d1f7a2-33b8-4e19-9a06-5f2b8e4c1d73")
+			@PathVariable("id") UUID id,
+			@Parameter(hidden = true) Authentication authentication) {
+		return ResponseEntity.ok(integrityCheckService.check(id, principalOf(authentication)));
+	}
+
+	/**
+	 * Who this request is attributed to in the custody chain — the preserver on an upload,
+	 * the checker on an integrity check.
+	 *
+	 * <p>Null-tolerant rather than asserted, matching a column that is nullable on purpose:
+	 * {@code custody_event.performed_by} is null when the honest answer is "the ingestion
+	 * pipeline". No route here can currently be reached unauthenticated —
+	 * {@code SecurityConfiguration} ends in {@code anyRequest().authenticated()} — so this
+	 * returns a principal in practice; what it refuses to do is invent one if that ever
+	 * changes.
+	 *
+	 * <p>A username rather than a user id, because {@code AppUser} does not exist yet. It
+	 * becomes a foreign key with that entity, alongside {@code EvidenceLink.linkedBy}.
+	 */
+	private static String principalOf(Authentication authentication) {
+		return authentication == null ? null : authentication.getName();
 	}
 
 	/**

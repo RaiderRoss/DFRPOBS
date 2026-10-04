@@ -4,9 +4,12 @@ import java.time.OffsetDateTime;
 import java.util.Optional;
 import java.util.UUID;
 
+import jakarta.persistence.LockModeType;
+
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
@@ -39,6 +42,37 @@ public interface EvidenceItemRepository extends JpaRepository<EvidenceItem, UUID
 	 * stored object; this is the lookup that guarantee makes possible.
 	 */
 	Optional<EvidenceItem> findByStorageRef(String storageRef);
+
+	/**
+	 * The item, with its row locked until the transaction ends — the serialisation point for
+	 * appending to its custody chain.
+	 *
+	 * <p><strong>Why a lock and not optimistic retry.</strong> Appending is a check-then-act:
+	 * read the chain's head, add one to its sequence, insert. Two concurrent appends against
+	 * one artifact both read the same head and both try to write the same position.
+	 * {@code uq_custody_event_item_sequence} is what guarantees only one of them lands, and
+	 * that guarantee is not negotiable — but on its own it turns an ordinary concurrent
+	 * handling of one exhibit into a failed request, and the losing caller's action has
+	 * already happened by the time its ledger entry is rejected. Holding this lock for the
+	 * length of the append makes the second appender wait and then succeed at the next
+	 * position instead.
+	 *
+	 * <p>The lock is taken on {@code evidence_item} rather than on the chain's head entry,
+	 * because the head is what is being contended: locking a row that a concurrent appender
+	 * may be about to supersede protects nothing. The parent row exists for the life of the
+	 * chain, so it is the one thing every appender can agree to queue on.
+	 *
+	 * <p>An explicit {@code @Query} because {@code @Lock} on a derived {@code findById} is
+	 * fragile — Spring Data resolves that name against {@code CrudRepository.findById} and
+	 * the annotation is silently ignored, leaving a method that looks like it locks and does
+	 * not. Naming the query makes the {@code SELECT ... FOR UPDATE} the method's own.
+	 *
+	 * <p>Callers must already be in a transaction; a pessimistic lock outside one is either
+	 * an exception or, worse, a lock released before the work it was taken for.
+	 */
+	@Lock(LockModeType.PESSIMISTIC_WRITE)
+	@Query("SELECT ei FROM EvidenceItem ei WHERE ei.id = :id")
+	Optional<EvidenceItem> findByIdForUpdate(@Param("id") UUID id);
 
 	boolean existsByStorageRef(String storageRef);
 

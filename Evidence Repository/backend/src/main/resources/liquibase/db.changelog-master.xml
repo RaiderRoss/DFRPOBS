@@ -28,4 +28,12 @@
          0004 — it migrates that column's contents into evidence_link and then drops it. -->
     <include file="changes/0005-create-evidence-link-and-correlation-state.xml" relativeToChangelogFile="true"/>
 
+    <!-- Chain of custody: the append-only, hash-chained ledger of everything done to a
+         preserved artifact. Must follow 0003 — every chain hangs off an evidence_item. -->
+    <include file="changes/0006-create-custody-event.xml" relativeToChangelogFile="true"/>
+
+    <!-- Integrity re-verification: widens the custody action list to hold the two outcomes
+         of re-hashing a stored artifact against its recorded digest. Must follow 0006. -->
+    <include file="changes/0007-widen-custody-actions-for-integrity-checks.xml" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        The first widening of the custody action list, and it arrives with the code that
+        emits the new values — which is the rule 0006 set when it defined only CREATED: an
+        action list is read as exhaustive, so a value nothing writes turns "never recorded"
+        into a false claim of "never happened". IntegrityCheckService now exists and
+        re-verifies a preserved artifact against the digest recorded for it, so the two
+        outcomes of that check are now something the ledger can honestly hold.
+
+        Two actions rather than one with a boolean in the detail, because the detail is
+        free text hashed into the digest and not something a query can filter on. "Every
+        artifact that has ever failed re-verification" is the question this system exists
+        to answer, and it should be one WHERE clause on an indexed column, not a full-text
+        search over prose.
+
+        How the artifact hash pair reads on these entries, stated here because it departs
+        from the "before and after the action" reading 0006 documents for CREATED: a
+        verification does not change the bytes, so on HASH_VERIFIED and HASH_MISMATCH the
+        pair is the digest *expected* (evidence_item.current_hash at the time of the check)
+        and the digest *observed* (recomputed from the object read back out of storage).
+        On HASH_VERIFIED the two are equal; on HASH_MISMATCH they are not, and the entry is
+        the durable record of exactly what was found — which is why no separate
+        integrity_check table is created here. README open question 10 argues that two
+        records of the same event drift and that one ordered ledger is easier to defend than
+        two that must be reconciled; the same argument applies to re-verification results,
+        and it applies more strongly, because a mismatch is the single most consequential
+        finding this system can make and it should sit in the chain that cannot be edited
+        rather than in a table that can.
+
+        What a HASH_MISMATCH entry does NOT do is change evidence_item.current_hash. That
+        column holds the digest the artifact is supposed to have; a mismatch means the
+        stored object no longer produces it, and overwriting the expectation with the
+        observation would erase the very discrepancy being recorded. The item's status
+        moves to COMPROMISED instead, in the same transaction as the entry.
+
+        No backfill and no data migration: widening a CHECK touches no rows, and every
+        existing entry is CREATED, which remains valid.
+    -->
+
+    <changeSet id="0007-1" author="dfraas-team">
+        <comment>Widen ck_custody_event_action to admit the two outcomes of an integrity re-verification</comment>
+        <!--
+            DROP then ADD rather than ALTER, because Postgres cannot alter a CHECK expression
+            in place. Postgres validates the new constraint against every existing row when
+            it is added, which is the point: this is a superset of the old list, so it must
+            pass, and if it did not the migration should fail rather than leave a row the
+            constraint disagrees with.
+
+            The list must stay in step with the CustodyAction enum.
+        -->
+        <sql>
+            ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_action;
+        </sql>
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_action
+                CHECK (action IN ('CREATED', 'HASH_VERIFIED', 'HASH_MISMATCH'));
+        </sql>
+        <!--
+            The rollback restores the 0006 list, and it will refuse to run if any
+            HASH_VERIFIED or HASH_MISMATCH entry exists — which is correct. Those rows are
+            custody entries, and a rollback that deleted them to make the narrower
+            constraint fit would be the one thing this table exists to prevent. Rolling
+            this changeset back on a database that has run an integrity check is a decision
+            to be made with the ledger in front of you, not by a migration tool.
+        -->
+        <rollback>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_action;</sql>
+            <sql>
+                ALTER TABLE custody_event
+                    ADD CONSTRAINT ck_custody_event_action
+                    CHECK (action IN ('CREATED'));
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

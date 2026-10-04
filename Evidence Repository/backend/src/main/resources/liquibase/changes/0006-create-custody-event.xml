@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        Chain of custody: the append-only ledger of everything that has happened to a
+        preserved artifact, one chain per evidence_item.
+
+        This is README open question 7's next entry, and it is also the first answer to open
+        question 8. Every other table here is *documented* as append-only and enforces none
+        of it — trigger_event, evidence_item and evidence_link all inherit delete from
+        JpaRepository with nothing standing in the way. That is tolerable for a bundle and
+        intolerable for a custody record, because a custody record's only value is that it
+        cannot be quietly improved after the fact. So this table does not rely on the
+        application behaving: each row's contents are bound by a digest, and each row is
+        bound to the one before it.
+
+        What the chaining actually buys, stated precisely, because it is easy to overclaim:
+
+          * Editing a row in place is detectable. entry_hash covers the row's own contents,
+            so an UPDATE that changes performed_by or occurred_at no longer agrees with it.
+          * Reordering is detectable. The canonical form includes evidence_item_id and
+            sequence, so an entry cannot be moved between chains or slid to another
+            position within one.
+          * Deleting a row from the middle is detectable. This is the case a per-row digest
+            alone would miss — the surviving rows are all individually valid — and it is
+            caught by the sequence being contiguous from 0, which is why verification
+            checks position as well as digests.
+          * Truncating the *end* of a chain is NOT detectable from the chain alone, and
+            nothing here pretends otherwise. Detecting that needs the head hash witnessed
+            somewhere this database cannot reach: an anchor row per item elsewhere, a
+            periodic external notarisation, or write-once storage. That is a later
+            changeset and a deployment decision, not something a CHECK constraint can do.
+
+        None of it makes the ledger tamper-*proof* against someone holding both the table
+        and the application. It makes tampering leave a mark, which is the difference
+        between a record an investigator can defend and one they can only present.
+
+        Deliberately not done here: a backfill of opening entries for evidence_item rows
+        that already exist. entry_hash would have to be computed in SQL, which would mean a
+        second implementation of the canonical form living in a migration and agreeing with
+        CustodyChainService.canonicalV1 forever. Items preserved before this changeset
+        therefore verify as "missing origin", which is the truthful answer — a custody entry
+        this application never computed is a fabricated one, and a ledger that fabricates
+        its own first link is worth less than one that admits the gap.
+    -->
+
+    <changeSet id="0006-1" author="dfraas-team">
+        <preConditions onFail="MARK_RAN">
+            <not>
+                <tableExists tableName="custody_event"/>
+            </not>
+        </preConditions>
+        <comment>Creates custody_event — the append-only, hash-chained custody ledger, one chain per evidence item</comment>
+        <createTable tableName="custody_event">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+
+            <!--
+                The artifact this chain belongs to. NOT NULL, and there is no equivalent of
+                evidence_item.evidence_source_id's nullability here: a custody entry that
+                names no exhibit is not a weaker record, it is not a record.
+            -->
+            <column name="evidence_item_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Position within this item's chain, contiguous from 0.
+
+                Carried explicitly rather than inferred from recorded_at ordering, for two
+                reasons. Timestamps tie — two entries inside one transaction can share a
+                now() — and a tie leaves the order of the ledger undefined at exactly the
+                moment it is being asked to prove an order. And a number that must run
+                0, 1, 2, ... is what makes a deleted middle entry visible; a gap in a
+                sequence is a finding, whereas a gap in a set of timestamps is just Tuesday.
+
+                BIGINT rather than INTEGER. Two billion custody entries against one artifact
+                is not a plausible amount of handling, but this column is also the thing an
+                integrity re-verification pass appends to on every scheduled run, and the
+                cost of being wrong about that is an ALTER TABLE on an audited table.
+            -->
+            <column name="sequence" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                What happened. VARCHAR + CHECK (0006-4), not a native Postgres enum, for the
+                reason EvidenceStatus states: a native enum can gain values but cannot lose
+                or rename one without recreating the type and rewriting every dependent
+                column, and this list is business-facing — it will be argued over as the
+                readiness process matures, and it will need to shrink as well as grow.
+
+                The list is deliberately short. Only CREATED is defined, because only the
+                ingest path exists to emit anything: there is no download route (see
+                SecurityConfiguration's unimplemented OTP step-up), no integrity checker and
+                no status-change endpoint. Defining EXPORTED now would put a value in the
+                schema that nothing can produce, and an action list an investigator cannot
+                trust to be exhaustive is worse than a short one — it invites reading "no
+                EXPORTED entries" as "never exported" when it only means "never recorded".
+                Widening is one ALTER TABLE, which is precisely why this is a CHECK.
+            -->
+            <column name="action" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Who did it, or NULL when the honest answer is "the ingestion pipeline" —
+                same rule, and the same interim shape, as evidence_link.linked_by.
+
+                TODO: becomes a foreign key to app_user once that table exists. That is now
+                the third VARCHAR placeholder standing in for one FK (with
+                evidence_link.linked_by and reviewed_by), which is what makes AppUser the
+                next changeset rather than a later one.
+
+                Note this is inside the digest: performed_by is the attribution the ledger
+                exists to hold, so it is length-prefixed into the canonical form along with
+                everything else, and cannot be edited afterwards without the row failing
+                verification.
+            -->
+            <column name="performed_by" type="VARCHAR(255)">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                When the action happened, supplied by the application. No default, and this
+                is the one place in this schema where a timestamp is not the database's own
+                clock — every other table's rationale (work_group.created_at,
+                trigger_event.received_at, evidence_item.created_at) argues the opposite, so
+                the departure needs stating.
+
+                It is not a weakening of that rule, it is forced by the chaining. entry_hash
+                covers occurred_at, and it has to be computed before the INSERT that carries
+                it. A value the database generates during that INSERT cannot be hashed by
+                the writer without reading it back and issuing an UPDATE to store the
+                corrected digest — an UPDATE against this table, which is the single
+                operation the whole design exists to make impossible.
+
+                So the two clocks are separated instead, and both are kept: occurred_at is
+                the application's claim about when the action happened and is covered by the
+                digest, recorded_at is the database's account of when it was told, and it is
+                not. The gap between them is a real signal — an entry claiming 14:00 that
+                the database first saw at 09:00 the next morning is either a backfill or a
+                fabrication, and either way is visible.
+
+                For the opening CREATED entry the ingest path sidesteps the trade-off
+                entirely: it passes evidence_item.created_at, which the database stamped a
+                moment earlier, so the first link of every chain carries a database clock
+                after all.
+            -->
+            <column name="occurred_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="false"/>
+            </column>
+
+            <!-- The database's own account of when this entry arrived. Outside the digest
+                 by design (see occurred_at), and the value to trust when the two disagree. -->
+            <column name="recorded_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                The artifact's digest before and after the action, when the action changed
+                the bytes; NULL on both when it did not, which is most entries.
+
+                Named artifact_hash_* rather than the previous_hash/new_hash the README
+                first proposed, and the rename is worth the divergence: this table now
+                carries two entirely different pairs of hashes, and a column called
+                previous_hash sitting next to prev_entry_hash would be read as part of the
+                chain by anyone skimming it. One pair is about the exhibit, the other is
+                about the ledger. An audit cannot afford that ambiguity.
+
+                The opening entry sets artifact_hash_after to the digest computed at ingest
+                and leaves artifact_hash_before NULL — there was no prior state. That is
+                what anchors evidence_item.current_hash into the chain: current_hash is
+                mutable by design (key rotation, re-encryption, approved redaction), and
+                these columns are the immutable record of every value it has held.
+            -->
+            <column name="artifact_hash_before" type="VARCHAR(64)">
+                <constraints nullable="true"/>
+            </column>
+            <column name="artifact_hash_after" type="VARCHAR(64)">
+                <constraints nullable="true"/>
+            </column>
+
+            <!--
+                The previous entry's entry_hash — the link that makes this a chain.
+
+                NOT NULL, with the first entry in a chain carrying 64 '0' characters rather
+                than a null (CustodyChainService.GENESIS_HASH, tied to sequence 0 by
+                ck_custody_event_origin below). A nullable column would mean every
+                verification pass carries a special case for the origin, and a special case
+                in verification code is where a forged origin eventually hides. One uniform
+                loop, starting from a constant, has nowhere to hide.
+            -->
+            <column name="prev_entry_hash" type="VARCHAR(64)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                SHA-256 over prev_entry_hash concatenated with this entry's canonical form —
+                see CustodyChainService.canonicalV1 for exactly what that covers and in what
+                order. Stored rather than derived on read so that a row whose contents were
+                edited disagrees with the digest that was written alongside it.
+            -->
+            <column name="entry_hash" type="VARCHAR(64)">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Which version of the canonical form entry_hash was computed under.
+
+                The canonical form is frozen: any change to field order, encoding or
+                inclusion changes every digest it produces, so an "improvement" applied in
+                place would invalidate every entry ever written and be indistinguishable
+                from tampering. Instead a new version is added alongside, and this column
+                says which one each row must be verified with — so history keeps verifying
+                under the rules it was written under. Rows are never migrated between
+                versions; that would mean recomputing digests, which is forgery with good
+                intentions.
+
+                SMALLINT with a default of 1, because a version this application does not
+                know about is a row it must refuse to verify rather than quietly pass.
+            -->
+            <column name="canonical_version" type="SMALLINT" defaultValueNumeric="1">
+                <constraints nullable="false"/>
+            </column>
+
+            <!--
+                Free-text account of the action, for a person: the reason a status was
+                changed, what a re-verification found, which operator authorised a hold.
+
+                Inside the digest only as its SHA-256 (see canonicalV1), never inlined. Two
+                reasons. Free text can contain anything, including something shaped like the
+                canonical form's own field encoding, and hashing it first removes any
+                possibility of its content reaching the boundary logic at all. And it keeps
+                the canonical form fixed-size regardless of how much prose an operator
+                writes, so verifying a long chain does not cost more because someone was
+                thorough.
+            -->
+            <column name="detail" type="TEXT">
+                <constraints nullable="true"/>
+            </column>
+        </createTable>
+        <rollback>
+            <dropTable tableName="custody_event"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0006-2" author="dfraas-team">
+        <comment>Foreign key to evidence_item — RESTRICT, as everywhere in this schema</comment>
+        <!--
+            RESTRICT rather than CASCADE, and here it is doing more than it does elsewhere.
+            On evidence_link, CASCADE would quietly remove an exhibit from a bundle. Here it
+            would let a single DELETE on evidence_item destroy the entire custody history of
+            the artifact it deleted — the record of who handled it and when, which survives
+            precisely so that "this evidence was destroyed, by whom" stays answerable.
+            Evidence is soft-delete only (EvidenceStatus.DELETED); this is the constraint
+            that makes the database refuse the alternative.
+        -->
+        <addForeignKeyConstraint
+            constraintName="fk_custody_event_evidence_item"
+            baseTableName="custody_event"
+            baseColumnNames="evidence_item_id"
+            referencedTableName="evidence_item"
+            referencedColumnNames="id"
+            onDelete="RESTRICT"
+            onUpdate="RESTRICT"/>
+        <rollback>
+            <dropForeignKeyConstraint baseTableName="custody_event" constraintName="fk_custody_event_evidence_item"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0006-3" author="dfraas-team">
+        <comment>One entry per position in a chain — the constraint that makes a concurrent append fail rather than fork</comment>
+        <!--
+            Two appends against one item both read the current head, both compute the same
+            next sequence, and both insert. Without this the chain silently forks: two rows
+            at position N, each with a valid entry_hash, and a verification pass that reads
+            them in whatever order the planner chose. That is a corrupt ledger that looks
+            intact, which is the worst outcome available.
+
+            CustodyChainService.append takes a row lock on the parent evidence_item first, so
+            in practice the second appender waits rather than fails. This constraint is what
+            makes that a performance choice rather than the thing correctness rests on —
+            same division of labour as uq_evidence_item_source_artifact and the dedupe
+            pre-check in front of it.
+
+            Leading column is evidence_item_id, so this index also serves the ordered-ledger
+            read ("this item's chain, in order") and the head lookup that finds the last
+            entry. No separate index on evidence_item_id is needed, and adding one would
+            index the same prefix twice.
+        -->
+        <addUniqueConstraint
+            tableName="custody_event"
+            columnNames="evidence_item_id, sequence"
+            constraintName="uq_custody_event_item_sequence"/>
+        <rollback>
+            <dropUniqueConstraint tableName="custody_event" constraintName="uq_custody_event_item_sequence"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0006-4" author="dfraas-team">
+        <comment>Constrain the action list, the four hash columns, and the shape of a chain's origin</comment>
+        <!--
+            addCheckConstraint is a Liquibase Pro tag, so all of these are raw SQL — the same
+            trade-off as ck_evidence_item_current_hash, and worth it for the same reason,
+            more so here: a constraint in the database holds for writes that never pass
+            through this application, and writes that never pass through this application are
+            exactly what a custody ledger is defending against.
+
+            The action list must stay in step with the CustodyAction enum.
+        -->
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_action
+                CHECK (action IN ('CREATED'));
+        </sql>
+
+        <!--
+            All four hash columns are held to a real digest, not merely to a length. A
+            malformed value in either chain column would break verification for the whole
+            chain from that point on, and a malformed artifact hash is a claim about an
+            exhibit that cannot be checked against anything.
+
+            Lowercase hex only, matching ck_evidence_item_current_hash: the same bytes have
+            two hex spellings, and permitting both would mean two rows that disagree
+            textually while agreeing cryptographically — and, worse, a digest that fails
+            verification because it was re-cased somewhere in transit.
+
+            The artifact pair permits NULL and the chain pair does not. Most actions do not
+            touch the bytes, so NULL there means "the artifact was unchanged"; NULL in the
+            chain pair would mean an entry that is not linked to anything, which is not an
+            entry.
+        -->
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_artifact_hash_before
+                CHECK (artifact_hash_before IS NULL OR artifact_hash_before ~ '^[0-9a-f]{64}$');
+        </sql>
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_artifact_hash_after
+                CHECK (artifact_hash_after IS NULL OR artifact_hash_after ~ '^[0-9a-f]{64}$');
+        </sql>
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_prev_entry_hash
+                CHECK (prev_entry_hash ~ '^[0-9a-f]{64}$');
+        </sql>
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_entry_hash
+                CHECK (entry_hash ~ '^[0-9a-f]{64}$');
+        </sql>
+
+        <!-- A position in a chain is a natural number. Negative would let an entry be
+             inserted "before" the origin, which is a way of prepending to a ledger. -->
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_sequence
+                CHECK (sequence &gt;= 0);
+        </sql>
+
+        <!--
+            A chain's origin must be rooted at the genesis hash. Without this, the entry at
+            position 0 could point at any 64-hex value it liked — a predecessor that is
+            nowhere in the ledger — which is exactly what a chain whose beginning was
+            removed and re-rooted looks like.
+
+            Verification checks the same thing, since its loop starts from GENESIS_HASH. The
+            constraint is here for the writer that never goes through verification, which is
+            the whole reason this table's rules live in the database as well as in the
+            service.
+
+            Only this direction is constrained, and the converse cannot be expressed here at
+            all: "no entry other than the origin may carry the genesis hash" needs to know
+            about the row before it, and a row-level CHECK cannot see one. It is left to
+            verification, which catches it anyway — prev_entry_hash has to equal the
+            preceding entry's entry_hash, and no SHA-256 output is 64 zeros.
+        -->
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_origin
+                CHECK (sequence &lt;&gt; 0
+                    OR prev_entry_hash = '0000000000000000000000000000000000000000000000000000000000000000');
+        </sql>
+
+        <!-- Version 0 or a negative version is not a canonical form that ever existed. -->
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_canonical_version
+                CHECK (canonical_version &gt;= 1);
+        </sql>
+        <rollback>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_canonical_version;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_origin;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_sequence;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_entry_hash;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_prev_entry_hash;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_artifact_hash_after;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_artifact_hash_before;</sql>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_action;</sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

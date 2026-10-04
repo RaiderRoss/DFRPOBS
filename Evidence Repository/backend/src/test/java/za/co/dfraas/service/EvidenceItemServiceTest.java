@@ -4,6 +4,9 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.same;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.Mockito.never;
@@ -64,6 +67,8 @@ class EvidenceItemServiceTest {
 
 	private static final String STORAGE_REF = SOURCE_KEY + "/" + ARTIFACT_ID;
 
+	private static final String PRINCIPAL = "j.mokoena";
+
 	@Mock
 	private EvidenceItemRepository repository;
 
@@ -72,6 +77,9 @@ class EvidenceItemServiceTest {
 
 	@Mock
 	private EvidenceStorageService storageService;
+
+	@Mock
+	private CustodyChainService custodyChainService;
 
 	@Captor
 	private ArgumentCaptor<EvidenceItem> itemCaptor;
@@ -83,7 +91,12 @@ class EvidenceItemServiceTest {
 	@BeforeEach
 	void setUp() {
 		service = new EvidenceItemService(
-				repository, sourceRepository, new EvidenceItemMapper(), new HashingService(), storageService);
+				repository,
+				sourceRepository,
+				new EvidenceItemMapper(),
+				new HashingService(),
+				storageService,
+				custodyChainService);
 
 		workGroup = new WorkGroup();
 		workGroup.setId(WORK_GROUP_ID);
@@ -109,7 +122,7 @@ class EvidenceItemServiceTest {
 			return item;
 		});
 
-		EvidenceItemDto preserved = service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain");
+		EvidenceItemDto preserved = service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL);
 
 		then(storageService).should().store(STORAGE_REF, CONTENT, "text/plain");
 		then(repository).should().saveAndFlush(itemCaptor.capture());
@@ -125,6 +138,44 @@ class EvidenceItemServiceTest {
 	}
 
 	/**
+	 * Provenance is not optional, and it is not a second write that might not happen: the
+	 * opening entry is appended to the same item that was just inserted, attributed to the
+	 * authenticated caller, inside the same transaction.
+	 */
+	@Test
+	@DisplayName("Preservation appends the opening custody entry for the item it just stored")
+	void appendsOpeningCustodyEntry() {
+		givenRegisteredSourceWithNoPriorArtifact();
+		given(storageService.read(STORAGE_REF)).willReturn(CONTENT);
+		given(repository.saveAndFlush(any(EvidenceItem.class))).willAnswer(invocation -> invocation.getArgument(0));
+
+		service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL);
+
+		then(repository).should().saveAndFlush(itemCaptor.capture());
+		// The same instance, not an equal one: the entry has to carry the createdAt the
+		// database stamped on that row, which is why it is written after the flush.
+		then(custodyChainService).should().recordCreation(same(itemCaptor.getValue()), eq(PRINCIPAL), anyString());
+	}
+
+	/**
+	 * A rolled-back preservation must leave no custody entry — a ledger describing a
+	 * preservation that never happened is worse than a missing one, because it reads as
+	 * authoritative. Here the entry is simply never written; the {@code REQUIRED} propagation
+	 * on the append is what covers the case where it has been.
+	 */
+	@Test
+	@DisplayName("A failed preservation writes no custody entry")
+	void writesNoCustodyEntryWhenPreservationFails() {
+		givenRegisteredSourceWithNoPriorArtifact();
+		given(storageService.read(STORAGE_REF)).willReturn("tampered".getBytes(UTF_8));
+
+		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL))
+				.isInstanceOf(IntegrityVerificationException.class);
+
+		then(custodyChainService).shouldHaveNoInteractions();
+	}
+
+	/**
 	 * The classification is copied off the source at this moment rather than resolved through
 	 * it later, so reclassifying the source cannot rewrite what past artifacts were preserved
 	 * under.
@@ -136,7 +187,7 @@ class EvidenceItemServiceTest {
 		given(storageService.read(STORAGE_REF)).willReturn(CONTENT);
 		given(repository.saveAndFlush(any(EvidenceItem.class))).willAnswer(invocation -> invocation.getArgument(0));
 
-		service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain");
+		service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL);
 
 		then(repository).should().saveAndFlush(itemCaptor.capture());
 		assertThat(itemCaptor.getValue().getWorkGroup()).isSameAs(workGroup);
@@ -150,7 +201,7 @@ class EvidenceItemServiceTest {
 	@Test
 	@DisplayName("Bytes that do not match the asserted digest are rejected before anything is stored")
 	void rejectsDigestMismatchBeforeStoringAnything() {
-		assertThatThrownBy(() -> service.preserve(request(OTHER_SHA256), CONTENT, "text/plain"))
+		assertThatThrownBy(() -> service.preserve(request(OTHER_SHA256), CONTENT, "text/plain", PRINCIPAL))
 				.isInstanceOf(IntegrityVerificationException.class)
 				.hasMessageContaining(ARTIFACT_ID)
 				.hasMessageNotContaining(CONTENT_SHA256)
@@ -173,7 +224,7 @@ class EvidenceItemServiceTest {
 		givenRegisteredSourceWithNoPriorArtifact();
 		given(storageService.read(STORAGE_REF)).willReturn("tampered".getBytes(UTF_8));
 
-		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain"))
+		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL))
 				.isInstanceOf(IntegrityVerificationException.class)
 				.hasMessageContaining(ARTIFACT_ID);
 
@@ -187,7 +238,7 @@ class EvidenceItemServiceTest {
 		given(sourceRepository.findBySourceKey(SOURCE_KEY)).willReturn(Optional.of(source));
 		given(repository.existsByEvidenceSourceIdAndSourceArtifactId(SOURCE_ID, ARTIFACT_ID)).willReturn(true);
 
-		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain"))
+		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL))
 				.isInstanceOf(DuplicateResourceException.class)
 				.hasMessageContaining(ARTIFACT_ID);
 
@@ -204,7 +255,7 @@ class EvidenceItemServiceTest {
 	void rejectsUnknownSourceKey() {
 		given(sourceRepository.findBySourceKey(SOURCE_KEY)).willReturn(Optional.empty());
 
-		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain"))
+		assertThatThrownBy(() -> service.preserve(request(CONTENT_SHA256), CONTENT, "text/plain", PRINCIPAL))
 				.isInstanceOf(ResourceNotFoundException.class)
 				.hasMessageContaining(SOURCE_KEY);
 

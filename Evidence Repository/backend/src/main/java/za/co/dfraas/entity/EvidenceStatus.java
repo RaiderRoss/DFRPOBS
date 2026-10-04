@@ -29,9 +29,10 @@ public enum EvidenceStatus {
 
 	/**
 	 * A re-verification computed a digest that does not match {@link
-	 * EvidenceItem#getCurrentHash()}. Set by the integrity checker, never by an operator,
-	 * and never cleared by one either — the item stays in this state and the {@code
-	 * IntegrityCheck} row records what was found.
+	 * EvidenceItem#getCurrentHash()}. Set by {@code IntegrityCheckService}, never by an
+	 * operator, and never cleared by anyone — the item stays in this state and the
+	 * {@link CustodyAction#HASH_MISMATCH} custody entry records what was found, with the
+	 * expected and observed digests side by side.
 	 *
 	 * <p>This is the state the whole system exists to be able to report honestly. It is
 	 * deliberately not called {@code FAILED}: the check succeeded, the evidence is what
