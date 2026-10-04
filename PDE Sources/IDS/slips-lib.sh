@@ -11,10 +11,12 @@
 #  beyond the two container names below.
 # ==============================================================
 
-# Pinned, not :latest. The evaluation ran Slips 1.1.23 (each window's metadata/info.txt says
-# so), and :latest moved to 1.1.24 the day it began; a run that pulled :latest afresh would
-# be a different IDS. The same pin is in Remote/vm-net.sh and Remote/slips-warm.sh.
-SLIPS_IMG="${SLIPS_IMG:-stratosphereips/slips:v1.1.23}"
+# Pinned, not :latest. Everything below was measured against 1.1.22 — the Redis paths,
+# the readiness line slips_wait_ready waits for, the alert threshold guaranteed-alert is
+# built to cross, and the alerts.log format slips_forwarder.py parses. 1.1.24 already moved
+# redis-server out of /redis-stable, and a floating tag would make a captured dataset
+# unreproducible as well as breaking the lab. Moving versions is a deliberate change here.
+SLIPS_IMG="${SLIPS_IMG:-stratosphereips/slips:v1.1.22}"
 # Deliberately distinct from the names slips-cli.sh uses, so a running lab
 # console is never adopted or torn down by a capture.
 SLIPS_CONTAINER="${SLIPS_CONTAINER:-pde-slips}"
@@ -25,6 +27,18 @@ _slips_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$1"; 
 slips_preflight() {
 	command -v docker >/dev/null 2>&1 || { echo "docker not found" >&2; return 1; }
 	docker info >/dev/null 2>&1 || { echo "cannot reach the docker daemon" >&2; return 1; }
+	# Docker Desktop runs containers in its own VM, so --net=host there means *that VM's*
+	# network, not this machine's. The veth the lab creates is invisible to Slips, which
+	# then exits with "veth-pde-h is not a valid interface" — under WSL the docker CLI is
+	# usually Docker Desktop's even though the shell is Linux. Caught here, before anything
+	# is changed, rather than after the firewall and namespace are already up.
+	if docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi 'docker desktop'; then
+		echo "docker here is Docker Desktop, whose --net=host cannot see this machine's interfaces" >&2
+		echo "  Slips has to run on a Docker Engine in the same network namespace as the lab." >&2
+		echo "  Under WSL: install Docker Engine in this distro (docs.docker.com/engine/install/ubuntu)" >&2
+		echo "  and turn off Docker Desktop's WSL integration for it. See IDS/README.md." >&2
+		return 1
+	fi
 	docker image inspect "$SLIPS_IMG" >/dev/null 2>&1 || {
 		echo "slips image not present: $SLIPS_IMG" >&2
 		echo "  docker pull $SLIPS_IMG   (about 6GB)" >&2

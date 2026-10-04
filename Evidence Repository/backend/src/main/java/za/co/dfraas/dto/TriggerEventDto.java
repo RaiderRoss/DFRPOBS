@@ -4,7 +4,6 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 import io.swagger.v3.oas.annotations.media.Schema;
-import za.co.dfraas.entity.CorrelationStatus;
 
 /**
  * Read model for {@link za.co.dfraas.entity.TriggerEvent}.
@@ -50,22 +49,16 @@ public record TriggerEventDto(
 		String payloadSha256,
 
 		/*
-		 * Exposed because an investigator reading a bundle needs to know whether they are
-		 * looking at everything. Under continuous collection "correlated" does not mean
-		 * "finished" — evidence covering the alert's window can still be preserved after the
-		 * pass ran — so a bundle presented without its correlation state invites the reader
-		 * to assume completeness the system has not claimed.
+		 * The incident, not its correlation state. Correlation moved to the incident in 0007,
+		 * so a reader wanting to know whether this alert's bundle is complete follows this id —
+		 * repeating the incident's status on every member alert would be one answer printed
+		 * several times, and the first thing to go stale.
 		 */
 		@Schema(description = """
-				How far correlation has got: PENDING (recorded, not yet correlated), CORRELATED \
-				(a pass completed; late-arriving evidence may still be linked), CLOSED (the \
-				collection lag has elapsed and the bundle is settled), FAILED (a pass errored \
-				and has not been retried).
+				The incident this alert belongs to. Alerts the source groups (for Slips: the same \
+				attacker and timewindow) share one; an alert sent without a group key has its own. \
+				Correlation and the evidence bundle are the incident's.
 				""",
-				example = "CORRELATED")
-		CorrelationStatus correlationStatus,
-
-		@Schema(description = "When the first correlation pass completed. Null while PENDING.",
-				example = "2026-09-03T08:16:02.114Z")
-		OffsetDateTime correlatedAt) {
+				example = "8d2f4c1a-6b3e-4f70-9a21-5c7e0b9d3f48")
+		UUID incidentId) {
 }

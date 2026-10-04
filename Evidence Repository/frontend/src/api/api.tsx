@@ -1,4 +1,4 @@
-export type PageName = 'Overview' | 'Trigger events' | 'Work groups' | 'Evidence sources' | 'Evidence items'
+export type PageName = 'Overview' | 'Incidents' | 'Trigger events' | 'Work groups' | 'Evidence sources' | 'Evidence items'
 
 export type TriggerEvent = {
   id: string
@@ -8,6 +8,45 @@ export type TriggerEvent = {
   firedAt: string
   receivedAt: string
   payloadSha256: string
+  // Correlation and the evidence bundle belong to the incident, not the alert.
+  incidentId: string
+}
+
+export type CorrelationStatus = 'PENDING' | 'CORRELATED' | 'CLOSED' | 'FAILED'
+
+/** Alerts a source grouped (for Slips: same attacker, same timewindow), with one bundle. */
+export type Incident = {
+  id: string
+  sourceSystem: string
+  incidentKey: string
+  alertCount: number
+  firstFiredAt: string
+  lastFiredAt: string
+  openedAt: string
+  correlationStatus: CorrelationStatus
+  correlatedAt: string | null
+  windowStart: string
+  windowEnd: string
+}
+
+export type LinkDisposition = 'PROPOSED' | 'CONFIRMED' | 'DISMISSED'
+
+/** One entry in an alert's bundle: the item, how it got there, and any ruling on it. */
+export type EvidenceLink = {
+  id: string
+  incidentId: string
+  linkMethod: 'CAUSAL' | 'AUTO_TIME_WINDOW' | 'AUTO_RULE' | 'MANUAL'
+  disposition: LinkDisposition
+  rationale: string | null
+  linkedBy: string | null
+  linkedAt: string
+  lateArrival: boolean
+  // Null together until someone rules on the link.
+  reviewedBy: string | null
+  reviewedAt: string | null
+  reviewNote: string | null
+  evidenceSourceKey: string | null
+  evidenceItem: EvidenceItem
 }
 
 export type WorkGroup = {
@@ -86,8 +125,10 @@ export type Page<T> = {
 
 export type TriggerEventPage = Page<TriggerEvent>
 export type EvidenceItemPage = Page<EvidenceItem>
+export type EvidenceLinkPage = Page<EvidenceLink>
+export type IncidentPage = Page<Incident>
 
-export const navTabs: PageName[] = ['Overview', 'Trigger events', 'Work groups', 'Evidence sources', 'Evidence items']
+export const navTabs: PageName[] = ['Overview', 'Incidents', 'Trigger events', 'Work groups', 'Evidence sources', 'Evidence items']
 
 const baseUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8080'
 
@@ -156,6 +197,28 @@ export const repositoryApi = {
     if (includeDeleted) params.set('includeDeleted', 'true')
     return request<EvidenceItemPage>(`/api/evidence-items?${params}`)
   },
+  // Newest opened first, by the repository's own clock.
+  listIncidents: (sourceSystem = '', page = 0, size = 50) => {
+    const params = new URLSearchParams({ page: String(page), size: String(size), sort: 'openedAt,desc' })
+    if (sourceSystem) params.set('sourceSystem', sourceSystem)
+    return request<IncidentPage>(`/api/incidents?${params}`)
+  },
+  getIncident: (id: string) => request<Incident>(`/api/incidents/${encodeURIComponent(id)}`),
+  listIncidentAlerts: (id: string, page = 0, size = 50) =>
+    request<TriggerEventPage>(`/api/incidents/${encodeURIComponent(id)}/trigger-events?${new URLSearchParams({ page: String(page), size: String(size) })}`),
+  // Oldest link first, by when the repository made it, so late arrivals land at the end.
+  listIncidentLinks: (incidentId: string, disposition: LinkDisposition | '' = '', page = 0, size = 50) => {
+    const params = new URLSearchParams({ page: String(page), size: String(size) })
+    if (disposition) params.set('disposition', disposition)
+    return request<EvidenceLinkPage>(`/api/incidents/${encodeURIComponent(incidentId)}/links?${params}`)
+  },
+  // The reviewer is whoever is signed in; the body carries only the reason. Each link can be
+  // ruled on once — a second attempt is a 409 naming the ruling that stands.
+  reviewEvidenceLink: (id: string, ruling: 'confirm' | 'dismiss', reason: string) =>
+    request<EvidenceLink>(`/api/evidence-links/${encodeURIComponent(id)}/${ruling}`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
   getEvidenceItem: (id: string) => request<EvidenceItem>(`/api/evidence-items/${encodeURIComponent(id)}`),
   getCustodyChain: (id: string) => request<CustodyEvent[]>(`/api/evidence-items/${encodeURIComponent(id)}/custody`),
   verifyCustodyChain: (id: string) => request<CustodyChainVerification>(`/api/evidence-items/${encodeURIComponent(id)}/custody/verification`),

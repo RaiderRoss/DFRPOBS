@@ -122,6 +122,11 @@ Inside the captured window's own directory, `output/<ts>/`:
 Under a lab, Slips spans many windows, so its working tree lives once per session at
 `output/sessions/ids-<lab-ts>/` rather than being copied into each window.
 
+On a Windows drive (the repo under `/mnt/c` in WSL) that directory moves to
+`/var/lib/pde-lab/sessions/ids-<lab-ts>/` instead: Slips reads nothing Zeek writes on a 9p
+filesystem, so it profiles zero flows and never alerts, with no error. `./lab.sh status`
+and the end of `./lab.sh down` print the path in use; `PDE_IDS_SESSIONS` overrides it.
+
 `conn.log` is kept deliberately: it is the flow record the findings were derived from,
 and "on what basis" is a question an investigation will ask.
 
@@ -172,3 +177,68 @@ Slips decided to raise them.
 named `slips`/`slips-redis` and binds 6379 with `--net=host`; this uses `pde-slips` /
 `pde-slips-redis`. Preflight refuses to start if the lab console is up, rather than
 fighting over the port.
+
+## Running under WSL
+
+Slips sniffs the lab's veth from a container started with `--net=host`, so the container
+must share the lab's network namespace. **Docker Desktop cannot do that.** It runs
+containers in its own VM, where "host" means that VM's network, and the WSL distro's
+`veth-pde-h` does not exist there. Slips exits with `veth-pde-h is not a valid interface`;
+`slips_preflight` now catches this up front.
+
+The fix is a Docker Engine inside the distro itself:
+
+1. Docker Desktop → Settings → Resources → WSL integration → turn it **off** for this
+   distro, so `docker` in WSL stops being Docker Desktop's CLI.
+2. Install Docker Engine in the distro
+   ([docs.docker.com/engine/install/ubuntu](https://docs.docker.com/engine/install/ubuntu/)),
+   and add yourself to the `docker` group.
+3. `docker pull stratosphereips/slips:v1.1.22` again (the version the lab is pinned to) — images are not shared with Docker
+   Desktop.
+
+The Evidence Repository's compose stack then has to choose an engine too. The simplest
+setup is to run it on the same engine, from WSL (`docker compose up -d` in
+`Evidence Repository`). With `networkingMode=mirrored` its ports are on `localhost` for
+both Windows and WSL, so the backend can stay on Windows. If it stays in Docker
+Desktop instead, the forwarder cannot `docker exec` into `dfraas-redpanda` and needs
+`kafka-python-ng` installed for root (the lab runs it under sudo):
+`sudo pip install kafka-python-ng`.
+
+## Forwarding alerts to the Evidence Repository
+
+`slips_forwarder.py` sends each Slips **alert** (not each piece of evidence) to the
+repository's `evidence-events` topic as a trigger event, where the correlation pass links
+it to every artifact whose coverage window overlaps it. This is the alert half of the
+integration; `submit-evidence.sh` is the evidence half.
+
+```bash
+sudo ./lab.sh up --with-ids --forward-alerts     # starts with the lab, stops on `down`
+```
+
+Or by hand, against any Slips output directory:
+
+```bash
+python3 IDS/slips_forwarder.py --slips-out <session dir>            # follow it
+python3 IDS/slips_forwarder.py --slips-out <session dir> --once --sink stdout   # preview
+```
+
+- **Sink.** `kafka-python-ng` if it is installed (to `localhost:19092`), otherwise
+  `rpk` inside the repository's `dfraas-redpanda` container, so nothing needs installing
+  when the compose stack runs on the same machine.
+- **sourceSystem must match the IDS's registered source key** (`pde-sim-slips-01` by
+  default, `DFRAAS_IDS_SOURCE_KEY` to change it). The repository finds the work group to
+  correlate within from that source, so an unregistered key leaves every alert `FAILED`.
+- **Correlation stays within one work group.** Register the firewall and the IDS under the
+  same work group, or the firewall's evidence will never be linked to an IDS alert.
+- **Delivery is at-least-once.** The event id is derived from the alert line, so a
+  re-sent alert is dropped by the repository's dedupe. The read position is kept in
+  `<slips-out>/forwarder.offset` and only moves once the broker has acknowledged.
+- **Repeated alerts are one incident.** Slips alerts again each time an attacker's evidence
+  crosses its threshold within a timewindow. Each alert is sent with
+  `incidentKey=<session>/<ip>/tw<N>`, and the repository files alerts sharing a key under
+  one incident with one evidence bundle, so a scan is reviewed once, not once per alert.
+  The session is part of the key because Slips numbers timewindows from 1 on every run.
+- **Each trigger event carries its evidence.** The payload keeps the alert line plus the
+  evidence lines Slips logged for that source since its previous alert, which is what
+  added up to the threshold.
+- Progress is logged to `.lab/slips-forwarder.log`; `./lab.sh status` says if it died.

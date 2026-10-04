@@ -11,7 +11,7 @@
 #  Captures are taken by Firewall/simulate-firewall.sh, which
 #  detects a running lab and uses it instead of building its own.
 #
-#    sudo ./lab.sh up --with-ids
+#    sudo ./lab.sh up --with-ids [--forward-alerts]
 #    sudo Firewall/simulate-firewall.sh          # window 1
 #    sudo Firewall/simulate-firewall.sh          # window 2
 #    sudo ./lab.sh down
@@ -57,6 +57,7 @@ IDS_REMOTE=0
 WITH_BANKING=0
 VIA_TUNNEL=0
 LOCAL_BANK=0
+FORWARD_ALERTS=0
 IDS_READY_TIMEOUT=240
 USERS=10
 
@@ -70,6 +71,8 @@ usage() {
 	Commands:
 	  up [--with-ids [--ids-remote]] [--with-banking | --local-bank] [--via-tunnel] [--users N]
 	                                build the lab and leave it running
+	     [--forward-alerts]         also send Slips' alerts to the Evidence Repository
+	                                as trigger events (needs --with-ids, local IDS only)
 	  down                          restore the firewall and tear everything down
 	  status                        report what is up, and detect a stale session
 
@@ -113,6 +116,16 @@ lab_up() {
 	fi
 	if [[ $VIA_TUNNEL -eq 1 && $LOCAL_BANK -eq 1 ]]; then
 		die "--via-tunnel uses the bank on the VM; --local-bank is for running without it"
+	fi
+	# With the other combinations that can never work, so it is refused for the real reason
+	# and before any preflight reaches for the VM.
+	if [[ $FORWARD_ALERTS -eq 1 ]]; then
+		[[ $WITH_IDS -eq 1 ]] || die "--forward-alerts needs --with-ids: there are no alerts without the IDS"
+		# The forwarder follows a live alerts.log on this machine. With --ids-remote Slips only
+		# runs per window, after the fact, and with --via-tunnel its output is on the VM.
+		[[ $IDS_REMOTE -eq 0 && $VIA_TUNNEL -eq 0 ]] \
+			|| die "--forward-alerts needs the IDS running here; it does not work with --ids-remote or --via-tunnel"
+		[[ -f "$SLIPS_FORWARDER" ]] || die "--forward-alerts needs $SLIPS_FORWARDER"
 	fi
 
 	if [[ $WITH_IDS -eq 1 ]]; then
@@ -210,7 +223,7 @@ lab_up() {
 	LAB_VETH_HOST="$VETH_HOST"
 	LAB_SUBNET="$SUBNET"
 	LAB_HOST_IP="$HOST_IP"
-	LAB_SLIPS_OUT="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+	LAB_SLIPS_OUT="$(ids_sessions_dir)/ids-$lab_stamp"
 	EOF
 	log "state recorded in $LAB_STATE (ufw was ENABLED=$orig_enabled LOGLEVEL=$orig_loglevel)"
 
@@ -323,7 +336,7 @@ lab_up() {
 	elif [[ $WITH_IDS -eq 1 && $IDS_REMOTE -eq 1 ]]; then
 		# The sensor stays here, the analysis goes to the VM: tcpdump writes the veth for
 		# the whole session, and each capture slices its window out and ships it.
-		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+		local slips_out; slips_out="$(lab_get LAB_SLIPS_OUT)"
 		local tcpdump_pid
 		log "capturing $VETH_HOST to $slips_out/veth.pcap (analysed per window by Slips on $VM_NAME)"
 		tcpdump_pid=$(pcap_capture_start "$VETH_HOST" "$slips_out/veth.pcap" "$LAB_DIR/tcpdump.log") \
@@ -333,13 +346,26 @@ lab_up() {
 		LAB_PCAP="$slips_out/veth.pcap"
 		EOF
 	elif [[ $WITH_IDS -eq 1 ]]; then
-		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+		local slips_out; slips_out="$(lab_get LAB_SLIPS_OUT)"
 		mkdir -p "$slips_out"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
 		slips_start "$VETH_HOST" "$slips_out" "$BANK_PORT" || die "could not start Slips"
 		slips_wait_ready "$IDS_READY_TIMEOUT" || die "Slips never became ready"
 		log "Slips is reading $VETH_HOST"
+
+		# Started once Slips is ready, so its first read finds the file Slips writes.
+		# Recorded straight away for the same reason as the listener: it runs outside the
+		# namespace, and `down` must be able to find it even if setup fails after this.
+		if [[ $FORWARD_ALERTS -eq 1 ]]; then
+			log "forwarding Slips alerts to the Evidence Repository (log: $LAB_DIR/slips-forwarder.log)"
+			local forwarder_pid
+			forwarder_pid=$(slips_forwarder_start "$slips_out" "$LAB_DIR/slips-forwarder.pid" \
+				"$LAB_DIR/slips-forwarder.log") || die "could not start the Slips forwarder"
+			cat >> "$LAB_STATE" <<-EOF
+			LAB_FORWARDER_PID="$forwarder_pid"
+			EOF
+		fi
 	fi
 
 	# --- the bank, on the host side of the veth ------------------------------
@@ -429,6 +455,7 @@ lab_up() {
 	# thousands of lines before the level was lowered.
 	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
+	firewall_exempt_loopback
 
 	# Verdict logging installed directly: ufw hardcodes -m limit --limit 3/min
 	# --limit-burst 10 onto every rule created with its `log` keyword, with no
@@ -521,6 +548,14 @@ lab_down() {
 		vm_tunnel_stop bank
 	fi
 
+	# Before Slips, so it is not left following a file nothing writes to any more.
+	local forwarder_pid; forwarder_pid=$(lab_get LAB_FORWARDER_PID "")
+	if [[ -n "$forwarder_pid" ]]; then
+		log "stopping the Slips forwarder"
+		slips_forwarder_stop "$forwarder_pid"
+		rm -f "$LAB_DIR/slips-forwarder.pid"
+	fi
+
 	# Not in tunnel mode: Slips ran on the VM and was stopped there above. Calling the local
 	# stop would look for containers on this machine that never existed.
 	if [[ "${LAB_WITH_IDS:-0}" -eq 1 && -f "$IDS_LIB" && "$LAB_VIA_TUNNEL" != "1" ]]; then
@@ -546,8 +581,12 @@ lab_down() {
 	# would ENABLE a firewall the lab never enabled.
 	if [[ "$LAB_VIA_TUNNEL" != "1" ]]; then
 		log "restoring firewall"
-		cp -a "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
-		cp -a "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
+		# install, not cp -a: the backups live in the repo, and under WSL that is a Windows
+		# drive, where every file reads as owned by the user with mode 777. Copying the
+		# metadata back left the live rules world-writable — anyone could rewrite the
+		# firewall. The contents are what is being restored; ownership is root's, as ufw ships.
+		install -o root -g root -m 0640 "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
+		install -o root -g root -m 0640 "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
 		ufw logging "${LAB_ORIG_LOGLEVEL:-low}" >/dev/null 2>&1 || true
 		if [[ "${LAB_ORIG_ENABLED:-no}" == "no" ]]; then
 			ufw --force disable >/dev/null 2>&1 || true
@@ -594,7 +633,7 @@ lab_status() {
 		echo "lab: UP since $started"
 		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
 		if [[ "$(lab_get LAB_VIA_TUNNEL 0)" == "1" ]]; then
-			echo "  mode        via the tunnel device — the VM observes, this machine forwards"
+			echo "  mode       via the tunnel device — the VM observes, this machine forwards"
 			echo "  target      users reach $(lab_get LAB_TARGET_IP "?"); this machine's firewall untouched"
 			# shellcheck source=Remote/tun-lib.sh
 			source "$PDE_ROOT/Remote/tun-lib.sh"
@@ -619,7 +658,7 @@ lab_status() {
 				echo "  ids         capture NOT running — windows would have no packets for Slips"
 			fi
 		else
-			echo "  ids         slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")"
+			echo "  ids         slips on $(lab_get LAB_VETH_HOST "$VETH_HOST"), output in $(lab_get LAB_SLIPS_OUT)"
 		fi
 		if [[ "$(lab_get LAB_WITH_BANKING 0)" -eq 1 && "$(lab_get LAB_BANK_WHERE vm)" == "local" ]]; then
 			if helper_alive "$(lab_get LAB_BANK_RELAY_PID "")" "Remote/bank-relay.py"; then
@@ -646,6 +685,12 @@ lab_status() {
 			echo "  listener    ports $(lab_get LAB_ALERT_PORTS "?") on $HOST_IP (pid $lpid)"
 		else
 			echo "  listener    not running — guaranteed-alert connections will not complete"
+		fi
+		local fpid; fpid=$(lab_get LAB_FORWARDER_PID "")
+		if [[ -n "$fpid" && -d "/proc/$fpid" ]]; then
+			echo "  forwarder   Slips alerts -> Evidence Repository (pid $fpid)"
+		elif [[ -n "$fpid" ]]; then
+			echo "  forwarder   NOT running — alerts are not reaching the repository; see $LAB_DIR/slips-forwarder.log"
 		fi
 		echo "  restores to ENABLED=$(lab_get LAB_ORIG_ENABLED "?") LOGLEVEL=$(lab_get LAB_ORIG_LOGLEVEL "?")"
 		return 0
@@ -674,6 +719,7 @@ while [[ $# -gt 0 ]]; do
 		--with-banking) WITH_BANKING=1; shift ;;
 		--local-bank) LOCAL_BANK=1; WITH_BANKING=1; shift ;;
 		--via-tunnel) VIA_TUNNEL=1; shift ;;
+		--forward-alerts) FORWARD_ALERTS=1; shift ;;
 		--users) USERS="$2"; shift 2 ;;
 		*) die "unknown option '$1'" ;;
 	esac

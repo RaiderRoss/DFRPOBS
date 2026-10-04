@@ -624,6 +624,25 @@ dd {
     padding: 8px;
 }
 
+/* The reason box for confirming or dismissing a link. A textarea, not an input: a reason
+   is meant to be a sentence someone will read in the record, not a one-word tag. */
+.review-form {
+  margin-bottom: 18px;
+}
+
+.review-form textarea {
+  display: block;
+  width: 100%;
+  margin: 6px 0 10px;
+  padding: 10px 11px;
+  color: var(--text);
+  background: var(--surface-input);
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  font: inherit;
+  resize: vertical;
+}
+
 .empty-state,
 .error-message,
 .form-message {

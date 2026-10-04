@@ -20,9 +20,9 @@ import za.co.dfraas.TestcontainersConfiguration;
 import za.co.dfraas.entity.EvidenceItem;
 import za.co.dfraas.entity.EvidenceLink;
 import za.co.dfraas.entity.EvidenceStatus;
+import za.co.dfraas.entity.Incident;
 import za.co.dfraas.entity.LinkDisposition;
 import za.co.dfraas.entity.LinkMethod;
-import za.co.dfraas.entity.TriggerEvent;
 import za.co.dfraas.entity.WorkGroup;
 
 /**
@@ -53,7 +53,7 @@ class EvidenceLinkRepositoryTest {
 	private EvidenceItemRepository evidenceItemRepository;
 
 	@Autowired
-	private TriggerEventRepository triggerEventRepository;
+	private IncidentRepository incidentRepository;
 
 	@Autowired
 	private WorkGroupRepository workGroupRepository;
@@ -62,13 +62,13 @@ class EvidenceLinkRepositoryTest {
 	private TestEntityManager entityManager;
 
 	private WorkGroup workGroup;
-	private TriggerEvent alert;
+	private Incident alert;
 	private EvidenceItem item;
 
 	@BeforeEach
 	void setUp() {
 		workGroup = workGroupRepository.findByClassificationCode("ONLINE_BANKING").orElseThrow();
-		alert = triggerEventRepository.saveAndFlush(newTriggerEvent("EVT-1"));
+		alert = incidentRepository.saveAndFlush(newIncident("EVT-1"));
 		item = evidenceItemRepository.saveAndFlush(newItem("evidence/auth/14-15.log"));
 	}
 
@@ -90,7 +90,7 @@ class EvidenceLinkRepositoryTest {
 	@DisplayName("One alert gathers many artifacts, and one artifact belongs to many alerts")
 	void theRelationshipIsManyToManyInBothDirections() {
 		EvidenceItem firewallLog = evidenceItemRepository.saveAndFlush(newItem("evidence/fw/14-15.log"));
-		TriggerEvent secondAlert = triggerEventRepository.saveAndFlush(newTriggerEvent("EVT-2"));
+		Incident secondAlert = incidentRepository.saveAndFlush(newIncident("EVT-2"));
 
 		repository.saveAndFlush(newLink(alert, item, LinkMethod.AUTO_TIME_WINDOW));
 		repository.saveAndFlush(newLink(alert, firewallLog, LinkMethod.AUTO_TIME_WINDOW));
@@ -98,7 +98,7 @@ class EvidenceLinkRepositoryTest {
 		// bundle covering 14:00-15:00 overlaps every alert that fired in that hour.
 		repository.saveAndFlush(newLink(secondAlert, item, LinkMethod.AUTO_RULE));
 
-		assertThat(repository.findByTriggerEventId(alert.getId(), PageRequest.of(0, 10))).hasSize(2);
+		assertThat(repository.findByIncidentId(alert.getId(), PageRequest.of(0, 10))).hasSize(2);
 		assertThat(repository.findByEvidenceItemId(item.getId()))
 				.extracting(EvidenceLink::getLinkMethod)
 				.containsExactlyInAnyOrder(LinkMethod.AUTO_TIME_WINDOW, LinkMethod.AUTO_RULE);
@@ -158,15 +158,16 @@ class EvidenceLinkRepositoryTest {
 		link.setDisposition(LinkDisposition.DISMISSED);
 		link.setReviewedBy("j.mokoena");
 		link.setReviewedAt(OffsetDateTime.parse("2026-01-01T16:00:00Z"));
+		link.setReviewNote("Covers the wrong host; the alert concerns 10.99.0.12.");
 		repository.saveAndFlush(link);
 
 		// Deleting the row would leave the bundle looking as though the item had never been
 		// surfaced — a different and less defensible claim than "it was considered and
 		// rejected", which is precisely what a defence would probe.
-		assertThat(repository.countByTriggerEventId(alert.getId())).isEqualTo(1);
-		assertThat(repository.countByTriggerEventIdAndDisposition(alert.getId(), LinkDisposition.PROPOSED))
+		assertThat(repository.countByIncidentId(alert.getId())).isEqualTo(1);
+		assertThat(repository.countByIncidentIdAndDisposition(alert.getId(), LinkDisposition.PROPOSED))
 				.isZero();
-		assertThat(repository.findByTriggerEventIdAndDisposition(
+		assertThat(repository.findByIncidentIdAndDisposition(
 				alert.getId(), LinkDisposition.DISMISSED, PageRequest.of(0, 10))).hasSize(1);
 	}
 
@@ -199,6 +200,21 @@ class EvidenceLinkRepositoryTest {
 	}
 
 	@Test
+	@DisplayName("A review must state its reason, and a blank one does not count")
+	void reviewWithBlankNoteIsRejected() {
+		EvidenceLink link = newLink(alert, item, LinkMethod.AUTO_TIME_WINDOW);
+		link.setDisposition(LinkDisposition.CONFIRMED);
+		link.setReviewedBy("j.mokoena");
+		link.setReviewedAt(OffsetDateTime.parse("2026-01-01T16:00:00Z"));
+		link.setReviewNote("   ");
+
+		// "Set aside by j.mokoena" without a why is the half of the record a defence probes
+		// and the half the row could not answer — ck_evidence_link_review_complete.
+		assertThatThrownBy(() -> repository.saveAndFlush(link))
+				.isInstanceOf(DataIntegrityViolationException.class);
+	}
+
+	@Test
 	@DisplayName("A late-arriving link is flagged as such")
 	void lateArrivalIsRecorded() {
 		// Normal rather than exceptional once collection is decoupled from alerting:
@@ -223,9 +239,9 @@ class EvidenceLinkRepositoryTest {
 				.isInstanceOf(DataIntegrityViolationException.class);
 	}
 
-	private EvidenceLink newLink(TriggerEvent triggerEvent, EvidenceItem evidenceItem, LinkMethod method) {
+	private EvidenceLink newLink(Incident incident, EvidenceItem evidenceItem, LinkMethod method) {
 		EvidenceLink link = new EvidenceLink();
-		link.setTriggerEvent(triggerEvent);
+		link.setIncident(incident);
 		link.setEvidenceItem(evidenceItem);
 		link.setLinkMethod(method);
 		return link;
@@ -242,14 +258,15 @@ class EvidenceLinkRepositoryTest {
 		return evidenceItem;
 	}
 
-	private static TriggerEvent newTriggerEvent(String externalEventId) {
-		TriggerEvent event = new TriggerEvent();
-		event.setSourceSystem("splunk");
-		event.setExternalEventId(externalEventId);
-		event.setTriggerType("BRUTE_FORCE_LOGIN");
-		event.setFiredAt(OffsetDateTime.parse("2026-01-01T14:30:00Z"));
-		event.setPayload("");
-		event.setPayloadSha256(SHA_256_OF_EMPTY_STRING);
-		return event;
+	/**
+	 * Links belong to incidents since {@code 0007}. The variables keep the name "alert" because
+	 * each test is about one alert's bundle, and an ungrouped alert is an incident of its own.
+	 */
+	private static Incident newIncident(String externalEventId) {
+		Incident incident = new Incident();
+		incident.setSourceSystem("splunk");
+		incident.setIncidentKey(Incident.keyForUngrouped(externalEventId));
+		incident.absorb(OffsetDateTime.parse("2026-01-01T14:30:00Z"));
+		return incident;
 	}
 }

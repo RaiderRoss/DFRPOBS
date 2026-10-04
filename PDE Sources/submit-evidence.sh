@@ -36,6 +36,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # or exported before running.
 # ---------------------------------------------------------------------------
 OUTDIR="${OUTDIR:-$SCRIPT_DIR/output}"
+# The console resolves the URL from pde.conf (PDE_MODE, DFRAAS_LOCAL_PORT) and exports it.
+# Run on its own, this resolves it the same way — the one rule, in lab-config.sh — in a
+# subshell, so nothing else in pde.conf leaks in. An exported DFRAAS_URL still wins, and with
+# no pde.conf at all the default stays a backend on this machine's 8080.
+if [[ -z "${DFRAAS_URL:-}" && -f "${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}" ]]; then
+	DFRAAS_URL=$(
+		PDE_ROOT="$SCRIPT_DIR"
+		# shellcheck source=lab-config.sh
+		source "$SCRIPT_DIR/lab-config.sh"
+		pde_conf_load "${PDE_CONFIG:-$SCRIPT_DIR/pde.conf}" >/dev/null 2>&1
+		printf '%s' "${DFRAAS_URL:-}"
+	) || true
+fi
 URL="${DFRAAS_URL:-http://localhost:8080}"
 AUTH="${DFRAAS_AUTH:-admin:admin}"
 
@@ -378,7 +391,9 @@ case "$CODE" in
 		log "  ./vm.sh tunnel up    then    DFRAAS_URL=http://localhost:18080 $0"
 		log "If the backend runs on Windows and this is WSL, localhost may not route"
 		log "there. Try the host address:"
-		log "  DFRAAS_URL=http://\$(ip route show default | awk '{print \$3}'):8080 $0"
+		log "  DFRAAS_URL=http://\$(ip route show default | awk '{print \$3}'):${URL##*:} $0"
+		log "Under WSL's mirrored networking, the lab's web site needs 8080, so run the"
+		log "backend on another port (SERVER_PORT=8090) and set DFRAAS_LOCAL_PORT=8090 in pde.conf."
 		exit 1
 		;;
 	*)

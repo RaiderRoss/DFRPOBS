@@ -7,6 +7,7 @@ import RepositoryPage from './pages/RepositoryPage.tsx'
 
 export const pageRoutes: Record<PageName, string> = {
     Overview: '/',
+    Incidents: '/incidents',
     'Trigger events': '/trigger-events',
     'Work groups': '/work-groups',
     'Evidence sources': '/evidence-sources',

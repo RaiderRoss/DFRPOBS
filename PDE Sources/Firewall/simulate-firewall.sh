@@ -508,7 +508,13 @@ else
 	if [[ $WITH_IDS -eq 1 ]]; then
 		# Dotted so the scratch directory does not sit among the window directories.
 		# It is renamed into the window's own directory once the window has a stamp.
-		SLIPS_OUT="$OUTDIR/.ids-run"
+		# On a Windows drive Slips reads nothing it writes there — see ids_sessions_dir.
+		if [[ "$(stat -f -c %T "$OUTDIR" 2>/dev/null)" == "v9fs" ]]; then
+			SLIPS_OUT="$(ids_sessions_dir)/.ids-run-$$"
+		else
+			SLIPS_OUT="$OUTDIR/.ids-run"
+		fi
+		mkdir -p "$(dirname "$SLIPS_OUT")"
 		rm -rf "$SLIPS_OUT"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
@@ -558,6 +564,7 @@ else
 	# drains — lines are lost. See lab.sh.
 	ufw logging low >/dev/null
 	ufw --force enable >/dev/null
+	firewall_exempt_loopback
 
 	# ---------------------------------------------------------------------------
 	# Verdict logging, installed directly rather than through ufw's `log` keyword.

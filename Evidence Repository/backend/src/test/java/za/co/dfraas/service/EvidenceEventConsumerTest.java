@@ -28,7 +28,6 @@ import tools.jackson.databind.json.JsonMapper;
 import za.co.dfraas.dto.TriggerEventDto;
 import za.co.dfraas.dto.TriggerEventIngestRequest;
 import za.co.dfraas.dto.TriggerEventIngestResult;
-import za.co.dfraas.entity.CorrelationStatus;
 
 /**
  * Message-handling behaviour of {@link EvidenceEventConsumer}: what it forwards, what it
@@ -80,6 +79,21 @@ class EvidenceEventConsumerTest {
 		// The raw message, not a re-serialisation of the parsed record. The digest has to
 		// describe the bytes that actually arrived.
 		assertThat(request.payload()).isEqualTo(VALID_MESSAGE);
+		// No incidentKey on the wire: the service files it as an incident of its own.
+		assertThat(request.incidentKey()).isNull();
+	}
+
+	@Test
+	@DisplayName("An incident key on the wire is passed through, so the alert can be grouped")
+	void incidentKeyIsForwarded() {
+		given(triggerEventService.recordIfAbsent(any())).willReturn(result(true));
+
+		consumer.onEvidenceEvent("""
+				{"eventId":"EVT-2","sourceSystem":"slips","triggerType":"SLIPS_ALERT",\
+				"firedAt":"2026-01-01T09:00:00Z","incidentKey":"ids-1/10.99.0.20/tw1"}""", "key", 0, 43L);
+
+		then(triggerEventService).should().recordIfAbsent(requestCaptor.capture());
+		assertThat(requestCaptor.getValue().incidentKey()).isEqualTo("ids-1/10.99.0.20/tw1");
 	}
 
 	@Test
@@ -138,10 +152,7 @@ class EvidenceEventConsumerTest {
 				OffsetDateTime.parse("2026-01-01T09:00:00Z"),
 				OffsetDateTime.parse("2026-01-01T09:00:05Z"),
 				"c82fb88239e96ae95bfdc7fc1b17a9ef3015a8ac3135bc8955850e0da4398ae8",
-				// PENDING with a null correlatedAt: the consumer's job ends at recording the
-				// alert, and correlation is a later, separate pass.
-				CorrelationStatus.PENDING,
-				null);
+				UUID.fromString("44444444-4444-4444-4444-444444444444"));
 		return new TriggerEventIngestResult(dto, created);
 	}
 }

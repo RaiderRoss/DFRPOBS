@@ -41,27 +41,36 @@ ATTACK_PROFILE=port-scan
 SEED=1337
 OUTDIR="$SCRIPT_DIR/output"
 
+# ---- where things run ----------------------------------------
+# vm (the research VM) or local (nothing leaves this machine). Picks IDS_REMOTE, REPO_ON_VM,
+# BANK_LOCAL and FORWARD_ALERTS together — see pde_mode_apply in lab-config.sh. Set it per
+# machine in pde.conf, with `pde --local` / `pde --vm`, or option m on the sources screen;
+# never by editing the defaults here, which everyone who pulls inherits.
+PDE_MODE=vm
+
 # IDS correlation: Slips observes the same packets the firewall logs. With IDS_REMOTE the
 # lab captures the veth here and Slips analyses each window on the research VM; without
-# it, Slips runs locally in Docker and sniffs the veth live.
+# it, Slips runs locally in Docker and sniffs the veth live. IDS_REMOTE is set by the mode.
 WITH_IDS=0
-IDS_REMOTE=1
 # Seconds Slips keeps running past the window. Empty means the capture's own default: 45, or
 # 75 when Slips runs on this machine (it reports unanswered connections later there).
 IDS_DRAIN=""
+# FORWARD_ALERTS, set by the mode: send Slips' alerts to the Evidence Repository as trigger
+# events while the sources run. Only means anything with the IDS on and running here: the
+# forwarder follows Slips' live alerts.log, which a per-window analysis on the VM never writes
+# on this machine.
 
 # The banking source: the same users drive the bank (Fineract) during the window, and its
-# audit trail and event stream are collected for it. The bank runs on the research VM, or with
-# BANK_LOCAL=1 on this machine (Banking/local-bank.sh), which needs no cloud account.
+# audit trail and event stream are collected for it. The bank runs on the research VM, or on
+# this machine (Banking/local-bank.sh, no cloud account) — BANK_LOCAL, set by the mode.
 WITH_BANKING=0
-BANK_LOCAL=0
 BANK_RATE=0.5
 BANK_PROFILE=loan-fraud
 
 # ---- evidence repository -------------------------------------
-# Where a captured window goes once it is evidence. On the research VM by default, reached
-# through the admin tunnel; REPO_ON_VM=0 in pde.conf for a repository run locally.
-REPO_ON_VM=1
+# Where a captured window goes once it is evidence: on the research VM through the admin
+# tunnel, or on localhost:DFRAAS_LOCAL_PORT — REPO_ON_VM, set by the mode. DFRAAS_URL, if
+# set, overrides both.
 DFRAAS_AUTH="${DFRAAS_AUTH:-admin:admin}"
 # One registered source per PDE source: they are different collectors observing
 # different things, and the repository classifies and retains per source.
@@ -70,13 +79,26 @@ DFRAAS_IDS_SOURCE_KEY="${DFRAAS_IDS_SOURCE_KEY:-pde-sim-slips-01}"
 DFRAAS_BANK_EVENTS_SOURCE_KEY="${DFRAAS_BANK_EVENTS_SOURCE_KEY:-pde-sim-fineract-events-01}"
 DFRAAS_BANK_AUDIT_SOURCE_KEY="${DFRAAS_BANK_AUDIT_SOURCE_KEY:-pde-sim-fineract-audit-01}"
 
-[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+DFRAAS_URL_FROM_ENV="${DFRAAS_URL:-}"
+pde_conf_load "$CONFIG_FILE"
 
-# Decided after pde.conf, since REPO_ON_VM may be set there. An explicit DFRAAS_URL wins.
-if [ -z "${DFRAAS_URL:-}" ]; then
-	if [ "$REPO_ON_VM" = "1" ]; then DFRAAS_URL="http://localhost:${VM_LOCAL_REPO_PORT}"
-	else DFRAAS_URL="http://localhost:8080"; fi
-fi
+# Switches the mode for this machine: records it in pde.conf, and clears the settings the
+# mode decides, so an override left there from before cannot silently undo the switch.
+#   pde_mode_set <vm|local>
+pde_mode_set() {
+	local key
+	PDE_MODE="$1"
+	persist PDE_MODE
+	if [ -f "$CONFIG_FILE" ]; then
+		for key in $PDE_MODE_KEYS; do sed -i "/^${key}=/d" "$CONFIG_FILE"; done
+	fi
+	pde_mode_apply
+	# The URL follows the repository, unless the environment or pde.conf pins one.
+	if [ -z "$DFRAAS_URL_FROM_ENV" ] && ! grep -qE '^DFRAAS_URL=' "$CONFIG_FILE" 2>/dev/null; then
+		if [ "$REPO_ON_VM" = "1" ]; then DFRAAS_URL="http://localhost:${VM_LOCAL_REPO_PORT}"
+		else DFRAAS_URL="http://localhost:${DFRAAS_LOCAL_PORT}"; fi
+	fi
+}
 
 # shellcheck source=Remote/vm-lib.sh
 source "$SCRIPT_DIR/Remote/vm-lib.sh"
@@ -191,6 +213,8 @@ banner() {
 	local sources="${C_KEY}firewall${R}"
 	if [ "$WITH_IDS" = "1" ]; then
 		sources="${sources} ${C_DIM}+${R} ${C_KEY}ids${R}$([ "$IDS_REMOTE" = "1" ] && printf '%s' "${C_DIM}(vm)${R}")"
+		[ "$IDS_REMOTE" != "1" ] && [ "$FORWARD_ALERTS" = "1" ] \
+			&& sources="${sources} ${C_DIM}(alerts → repository)${R}"
 	fi
 	if [ "$WITH_BANKING" = "1" ]; then
 		sources="${sources} ${C_DIM}+${R} ${C_KEY}banking${R}${C_DIM}($([ "$BANK_LOCAL" = "1" ] && echo here || echo vm))${R}"
@@ -1047,10 +1071,17 @@ lab_bring_up() {
 	local args=(up --users "$USERS")
 	[ "$WITH_IDS" = "1" ] && args+=(--with-ids)
 	[ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" = "1" ] && args+=(--ids-remote)
+	# Local IDS only: lab.sh refuses --forward-alerts with --ids-remote, and a setting left on
+	# while the IDS is on the VM must not stop the sources from starting at all.
+	[ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" != "1" ] && [ "$FORWARD_ALERTS" = "1" ] \
+		&& args+=(--forward-alerts)
 	if [ "$WITH_BANKING" = "1" ]; then
 		if [ "$BANK_LOCAL" = "1" ]; then args+=(--local-bank); else args+=(--with-banking); fi
 	fi
-	if sudo_run "$LAB_SH" "${args[@]}"; then
+	# Through env, because sudo drops the caller's environment: without it a source key
+	# changed in pde.conf would never reach the forwarder, and its alerts would arrive
+	# under the default key — unregistered, so every one would fail correlation.
+	if sudo_run env DFRAAS_IDS_SOURCE_KEY="$DFRAAS_IDS_SOURCE_KEY" "$LAB_SH" "${args[@]}"; then
 		LAB_OWNED=1
 		return 0
 	fi
@@ -1099,6 +1130,10 @@ sources_menu() {
 		# Asked once per draw rather than cached: whether the VM is up is exactly the
 		# thing that changes behind this screen's back.
 		local vst; vst="$(vm_status)"
+		local running_fwd=0; [ -n "$(lab_get LAB_FORWARDER_PID)" ] && running_fwd=1
+		# What the setting amounts to: forwarding needs the IDS on and running here.
+		local want_fwd=0
+		[ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" != "1" ] && [ "$FORWARD_ALERTS" = "1" ] && want_fwd=1
 
 		printf '  %s%-16s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
 		if [ "$state" = "up" ]; then
@@ -1124,6 +1159,11 @@ sources_menu() {
 			done
 		fi
 		printf '  %-16s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
+		if [ "$state" = "up" ] && [ "$running_fwd" = "1" ]; then
+			printf '  %-16s %-12s %s%s%s\n' "forwarder" "alerts→repo" "$C_OK" "running" "$R"
+		else
+			printf '  %-16s %-12s %s%s%s\n' "forwarder" "alerts→repo" "$C_DIM" "off" "$R"
+		fi
 		echo
 		case "$vst" in
 			RUNNING) printf '  %s\n' "${C_DIM}research VM${R}  ${C_OK}$VM_NAME running${R}" ;;
@@ -1162,6 +1202,21 @@ sources_menu() {
 		else
 			printf '  %s6%s  Run the bank on this machine %s(setting: on the VM)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		fi
+		if [ "$FORWARD_ALERTS" = "1" ]; then
+			local fwd_note=""
+			if [ "$WITH_IDS" != "1" ]; then fwd_note=", but the IDS is off so there are none"
+			elif [ "$IDS_REMOTE" = "1" ]; then fwd_note=", but only works with the IDS run locally (4)"; fi
+			printf '  %s7%s  Stop forwarding alerts       %s(setting: on%s)%s\n' "$C_NUM" "$R" "$C_DIM" \
+				"$fwd_note" "$R"
+		else
+			printf '  %s7%s  Forward IDS alerts to the Evidence Repository  %s(setting: off)%s\n' \
+				"$C_NUM" "$R" "$C_DIM" "$R"
+		fi
+		if [ "$PDE_MODE" = "local" ]; then
+			printf '  %sm%s  Use the research VM          %s(mode: local — sets 4, 6, 7 and the repository)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		else
+			printf '  %sm%s  Run everything locally       %s(mode: vm — sets 4, 6, 7 and the repository)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 
 		# Setting and reality can disagree, because every source here attaches when the
 		# sources start and cannot join or leave ones that are already running.
@@ -1170,7 +1225,8 @@ sources_menu() {
 			local want_where; want_where="$([ "$BANK_LOCAL" = "1" ] && echo local || echo vm)"
 			if [ "$running_ids" != "$WITH_IDS" ] || [ "$running_bank" != "$WITH_BANKING" ] \
 				|| { [ "$WITH_IDS" = "1" ] && [ "$running_mode" != "$want_mode" ]; } \
-				|| { [ "$WITH_BANKING" = "1" ] && [ "$running_where" != "$want_where" ]; }; then
+				|| { [ "$WITH_BANKING" = "1" ] && [ "$running_where" != "$want_where" ]; } \
+				|| [ "$running_fwd" != "$want_fwd" ]; then
 				echo
 				warn "Changed, but not yet applied."
 				dim "    Sources attach when they start, so the running ones still have the old"
@@ -1212,6 +1268,25 @@ sources_menu() {
 			   persist WITH_BANKING; changed=1 ;;
 			6) if [ "$BANK_LOCAL" = "1" ]; then BANK_LOCAL=0; else BANK_LOCAL=1; fi
 			   persist BANK_LOCAL; bank_seed_refresh; [ "$WITH_BANKING" = "1" ] && changed=1 ;;
+			7) if [ "$FORWARD_ALERTS" = "1" ]; then FORWARD_ALERTS=0; else FORWARD_ALERTS=1; fi
+			   persist FORWARD_ALERTS
+			   if [ "$FORWARD_ALERTS" = "1" ]; then
+				   echo
+				   dim "  Alerts arrive as source '$DFRAAS_IDS_SOURCE_KEY'. Register it under the firewall's"
+				   dim "  work group (submit --source ids --register-with <id>), or nothing correlates."
+				   [ "$WITH_IDS" = "1" ] || warn "The IDS source is off — turn it on (option 1), or there is nothing to forward."
+				   [ "$IDS_REMOTE" = "1" ] && warn "The IDS runs on the VM — switch it to local (option 4), or nothing is forwarded."
+				   sleep 2
+			   fi
+			   [ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" != "1" ] && changed=1 ;;
+			m|M) if [ "$PDE_MODE" = "local" ]; then pde_mode_set vm; else pde_mode_set local; fi
+			   bank_seed_refresh
+			   echo
+			   dim "  mode: $PDE_MODE — repository at $DFRAAS_URL"
+			   [ "$PDE_MODE" = "local" ] && [ "$WITH_IDS" != "1" ] \
+				   && warn "The IDS source is off — option 1 turns it on, or there are no alerts to forward."
+			   sleep 2
+			   { [ "$WITH_IDS" = "1" ] || [ "$WITH_BANKING" = "1" ]; } && changed=1 ;;
 			2)
 				case "$state" in
 					up)    echo; lab_take_down && lab_bring_up; pause ;;
@@ -1347,9 +1422,15 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 		# For reading evidence back without touching the firewall or asking for sudo.
 		--no-lab) AUTO_LAB=0; shift ;;
+		# Remembered in pde.conf, so it is said once per machine, not on every launch.
+		--local) pde_mode_set local; shift ;;
+		--vm)    pde_mode_set vm; shift ;;
 		-h|--help)
-			echo "usage: pde [--no-lab]"
+			echo "usage: pde [--no-lab] [--local | --vm]"
 			echo "  --no-lab   do not start the PDE sources on launch (read-only use)"
+			echo "  --local    run everything on this machine: IDS, repository, bank (remembered)"
+			echo "  --vm       use the research VM for the IDS, repository and bank (remembered)"
+			echo "  The repository's local port is DFRAAS_LOCAL_PORT in pde.conf (default 8080)."
 			exit 0 ;;
 		*) err "unknown option '$1'"; exit 2 ;;
 	esac
@@ -1420,6 +1501,7 @@ if [ "$AUTO_LAB" = "1" ] && [ "$(lab_state)" = "down" ]; then
 	dim "  The sources run for as long as this console does, and are stopped when you"
 	dim "  quit. Your firewall is restored at that point."
 	echo
+	kv "mode" "$PDE_MODE — $([ "$PDE_MODE" = "local" ] && echo "everything on this machine" || echo "the research VM") (pde --local / --vm)"
 	kv "firewall" "ufw — topology, rules and full logging"
 	if [ "$WITH_IDS" = "1" ] && [ "$IDS_REMOTE" = "1" ]; then
 		kv "ids" "tcpdump on the veth; Slips analyses each window on $VM_NAME"
@@ -1428,7 +1510,9 @@ if [ "$AUTO_LAB" = "1" ] && [ "$(lab_state)" = "down" ]; then
 	else
 		kv "ids" "disabled — option 1 enables it"
 	fi
-	if [ "$WITH_BANKING" = "1" ]; then
+	if [ "$WITH_BANKING" = "1" ] && [ "$BANK_LOCAL" = "1" ]; then
+		kv "banking" "relay $HOST_IP:$BANK_PORT to Fineract on this machine"
+	elif [ "$WITH_BANKING" = "1" ]; then
 		kv "banking" "tunnel $HOST_IP:$BANK_PORT to Fineract on $VM_NAME"
 	else
 		kv "banking" "disabled — option 1 enables it"

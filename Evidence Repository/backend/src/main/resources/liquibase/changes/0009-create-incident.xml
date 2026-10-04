@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        Incidents: one investigation unit over many alerts.
+
+        An IDS does not alert once per attack. Slips re-alerts every time an attacker's
+        evidence crosses its threshold again inside the same timewindow, so one port scan
+        is six trigger events — and under 0005 six bundles, the same firewall log proposed
+        and reviewed six times. The alert was doing two jobs: being a record of what the
+        IDS said, and being the thing an investigator works on. This splits them.
+
+        trigger_event stays exactly what it was — an immutable record of one alert, every
+        one of them kept. incident takes the second job: it owns the correlation state
+        (moved here from trigger_event, unchanged in meaning) and the evidence bundle
+        (evidence_link now points at it). Which alerts share an incident is decided by an
+        incident_key the producer sends; with no key, an alert is an incident of its own,
+        which is exactly the 0005 behaviour.
+    -->
+
+    <changeSet id="0009-1" author="dfraas-team">
+        <comment>Creates incident — the group of alerts an investigation is about</comment>
+        <createTable tableName="incident">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <!--
+                The key is only unique within its source, like trigger_event.external_event_id.
+                That scoping is also the trust boundary: an incident_key is sender-asserted,
+                and confining it to one source_system means a source can group its own alerts
+                and never pull another source's into its incident.
+            -->
+            <column name="source_system" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="incident_key" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+            <!--
+                The span of the member alerts' fired_at, maintained on ingest. Correlation
+                searches from first_fired_at - lookback to last_fired_at + lookahead, so an
+                incident that keeps alerting keeps widening its own window. Sender-asserted,
+                as fired_at is; opened_at is this system's clock.
+            -->
+            <column name="first_fired_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="false"/>
+            </column>
+            <column name="last_fired_at" type="TIMESTAMP WITH TIME ZONE">
+                <constraints nullable="false"/>
+            </column>
+            <column name="opened_at" type="TIMESTAMP WITH TIME ZONE" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <!-- Moved from trigger_event (0005-8); see that changeset for the reasoning. -->
+            <column name="correlation_status" type="VARCHAR(32)" defaultValue="PENDING">
+                <constraints nullable="false"/>
+            </column>
+            <column name="correlation_lookback_seconds" type="INTEGER" defaultValueNumeric="1800">
+                <constraints nullable="false"/>
+            </column>
+            <column name="correlation_lookahead_seconds" type="INTEGER" defaultValueNumeric="900">
+                <constraints nullable="false"/>
+            </column>
+            <column name="correlated_at" type="TIMESTAMP WITH TIME ZONE"/>
+            <column name="correlation_scope" type="TEXT"/>
+        </createTable>
+        <rollback>
+            <dropTable tableName="incident"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0009-2" author="dfraas-team">
+        <comment>Incident constraints: one incident per key per source, and the 0005 correlation rules</comment>
+        <addUniqueConstraint tableName="incident"
+            columnNames="source_system, incident_key"
+            constraintName="uq_incident_source_key"/>
+        <sql>
+            ALTER TABLE incident
+                ADD CONSTRAINT ck_incident_correlation_status
+                CHECK (correlation_status IN ('PENDING', 'CORRELATED', 'CLOSED', 'FAILED'));
+        </sql>
+        <sql>
+            ALTER TABLE incident
+                ADD CONSTRAINT ck_incident_correlation_window
+                CHECK (correlation_lookback_seconds &gt;= 0 AND correlation_lookahead_seconds &gt;= 0);
+        </sql>
+        <sql>
+            ALTER TABLE incident
+                ADD CONSTRAINT ck_incident_correlated_at
+                CHECK (
+                    (correlation_status = 'PENDING' AND correlated_at IS NULL)
+                    OR (correlation_status IN ('CORRELATED', 'CLOSED') AND correlated_at IS NOT NULL)
+                    OR correlation_status = 'FAILED'
+                );
+        </sql>
+        <sql>
+            ALTER TABLE incident
+                ADD CONSTRAINT ck_incident_fired_span
+                CHECK (last_fired_at &gt;= first_fired_at);
+        </sql>
+        <!-- The work queue, partial for the reason 0005-9 gives. -->
+        <sql>
+            CREATE INDEX ix_incident_correlation_pending
+                ON incident (opened_at)
+                WHERE correlation_status IN ('PENDING', 'FAILED');
+        </sql>
+        <rollback>
+            <sql>DROP INDEX ix_incident_correlation_pending;</sql>
+            <sql>ALTER TABLE incident DROP CONSTRAINT ck_incident_fired_span;</sql>
+            <sql>ALTER TABLE incident DROP CONSTRAINT ck_incident_correlated_at;</sql>
+            <sql>ALTER TABLE incident DROP CONSTRAINT ck_incident_correlation_window;</sql>
+            <sql>ALTER TABLE incident DROP CONSTRAINT ck_incident_correlation_status;</sql>
+            <dropUniqueConstraint tableName="incident" constraintName="uq_incident_source_key"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0009-3" author="dfraas-team">
+        <comment>Every existing alert becomes an incident of its own, and trigger_event points at it</comment>
+        <!--
+            One incident per existing alert, carrying its correlation state across unchanged,
+            so nothing already correlated or reviewed changes meaning. Grouping is only ever
+            applied going forward, from keys producers send: inferring groups for alerts
+            recorded before keys existed would be this migration asserting something no
+            source said.
+
+            The key is "event:" + the alert's own id, which uq_trigger_event_source_external
+            already makes unique per source — and which is what the ingest path uses for an
+            alert that arrives without a key, so old and new ungrouped alerts look alike.
+        -->
+        <sql>
+            INSERT INTO incident
+                (source_system, incident_key, first_fired_at, last_fired_at, opened_at,
+                 correlation_status, correlation_lookback_seconds, correlation_lookahead_seconds,
+                 correlated_at, correlation_scope)
+            SELECT source_system, 'event:' || external_event_id, fired_at, fired_at, received_at,
+                   correlation_status, correlation_lookback_seconds, correlation_lookahead_seconds,
+                   correlated_at, correlation_scope
+            FROM trigger_event;
+        </sql>
+        <addColumn tableName="trigger_event">
+            <column name="incident_id" type="UUID"/>
+        </addColumn>
+        <sql>
+            UPDATE trigger_event te
+               SET incident_id = i.id
+              FROM incident i
+             WHERE i.source_system = te.source_system
+               AND i.incident_key = 'event:' || te.external_event_id;
+        </sql>
+        <addNotNullConstraint tableName="trigger_event" columnName="incident_id"/>
+        <addForeignKeyConstraint
+            constraintName="fk_trigger_event_incident"
+            baseTableName="trigger_event" baseColumnNames="incident_id"
+            referencedTableName="incident" referencedColumnNames="id"
+            onDelete="RESTRICT" onUpdate="RESTRICT"/>
+        <createIndex tableName="trigger_event" indexName="ix_trigger_event_incident_id">
+            <column name="incident_id"/>
+        </createIndex>
+        <rollback>
+            <dropIndex tableName="trigger_event" indexName="ix_trigger_event_incident_id"/>
+            <dropForeignKeyConstraint baseTableName="trigger_event" constraintName="fk_trigger_event_incident"/>
+            <dropColumn tableName="trigger_event" columnName="incident_id"/>
+            <sql>DELETE FROM incident;</sql>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0009-4" author="dfraas-team">
+        <comment>evidence_link belongs to the incident, not the alert</comment>
+        <!--
+            The bundle is the incident's: the firewall log covering a scan is proposed and
+            reviewed once, however many times the IDS alerted about it. Under 0007-3 every
+            alert has its own incident, so each existing link maps to exactly one incident and
+            the (incident, item) pair stays unique.
+        -->
+        <addColumn tableName="evidence_link">
+            <column name="incident_id" type="UUID"/>
+        </addColumn>
+        <sql>
+            UPDATE evidence_link el
+               SET incident_id = te.incident_id
+              FROM trigger_event te
+             WHERE te.id = el.trigger_event_id;
+        </sql>
+        <addNotNullConstraint tableName="evidence_link" columnName="incident_id"/>
+        <dropUniqueConstraint tableName="evidence_link" constraintName="uq_evidence_link_pair"/>
+        <dropForeignKeyConstraint baseTableName="evidence_link" constraintName="fk_evidence_link_trigger_event"/>
+        <dropColumn tableName="evidence_link" columnName="trigger_event_id"/>
+        <addForeignKeyConstraint
+            constraintName="fk_evidence_link_incident"
+            baseTableName="evidence_link" baseColumnNames="incident_id"
+            referencedTableName="incident" referencedColumnNames="id"
+            onDelete="RESTRICT" onUpdate="RESTRICT"/>
+        <!-- Same name and role as before: one link per pair, and it serves the bundle read. -->
+        <addUniqueConstraint tableName="evidence_link"
+            columnNames="incident_id, evidence_item_id"
+            constraintName="uq_evidence_link_pair"/>
+        <rollback>
+            <dropUniqueConstraint tableName="evidence_link" constraintName="uq_evidence_link_pair"/>
+            <dropForeignKeyConstraint baseTableName="evidence_link" constraintName="fk_evidence_link_incident"/>
+            <addColumn tableName="evidence_link">
+                <column name="trigger_event_id" type="UUID"/>
+            </addColumn>
+            <!-- Back to the incident's earliest alert: under one-alert incidents, its only one. -->
+            <sql>
+                UPDATE evidence_link el
+                   SET trigger_event_id = (
+                       SELECT te.id FROM trigger_event te
+                        WHERE te.incident_id = el.incident_id
+                        ORDER BY te.received_at, te.id LIMIT 1);
+            </sql>
+            <addNotNullConstraint tableName="evidence_link" columnName="trigger_event_id"/>
+            <addForeignKeyConstraint
+                constraintName="fk_evidence_link_trigger_event"
+                baseTableName="evidence_link" baseColumnNames="trigger_event_id"
+                referencedTableName="trigger_event" referencedColumnNames="id"
+                onDelete="RESTRICT" onUpdate="RESTRICT"/>
+            <addUniqueConstraint tableName="evidence_link"
+                columnNames="trigger_event_id, evidence_item_id"
+                constraintName="uq_evidence_link_pair"/>
+            <dropColumn tableName="evidence_link" columnName="incident_id"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0009-5" author="dfraas-team">
+        <comment>Drop the correlation state from trigger_event — it lives on incident now</comment>
+        <!--
+            Dropped rather than left beside the incident's copy, for the reason 0005-7 gave
+            for evidence_item.trigger_event_id: two answers to "has this been correlated"
+            drift the first time anything writes one and not the other.
+        -->
+        <sql>DROP INDEX ix_trigger_event_correlation_pending;</sql>
+        <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlated_at;</sql>
+        <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlation_window;</sql>
+        <sql>ALTER TABLE trigger_event DROP CONSTRAINT ck_trigger_event_correlation_status;</sql>
+        <dropColumn tableName="trigger_event" columnName="correlation_scope"/>
+        <dropColumn tableName="trigger_event" columnName="correlated_at"/>
+        <dropColumn tableName="trigger_event" columnName="correlation_lookahead_seconds"/>
+        <dropColumn tableName="trigger_event" columnName="correlation_lookback_seconds"/>
+        <dropColumn tableName="trigger_event" columnName="correlation_status"/>
+        <rollback>
+            <addColumn tableName="trigger_event">
+                <column name="correlation_status" type="VARCHAR(32)" defaultValue="PENDING">
+                    <constraints nullable="false"/>
+                </column>
+                <column name="correlation_lookback_seconds" type="INTEGER" defaultValueNumeric="1800">
+                    <constraints nullable="false"/>
+                </column>
+                <column name="correlation_lookahead_seconds" type="INTEGER" defaultValueNumeric="900">
+                    <constraints nullable="false"/>
+                </column>
+                <column name="correlated_at" type="TIMESTAMP WITH TIME ZONE"/>
+                <column name="correlation_scope" type="TEXT"/>
+            </addColumn>
+            <sql>
+                UPDATE trigger_event te
+                   SET correlation_status = i.correlation_status,
+                       correlation_lookback_seconds = i.correlation_lookback_seconds,
+                       correlation_lookahead_seconds = i.correlation_lookahead_seconds,
+                       correlated_at = i.correlated_at,
+                       correlation_scope = i.correlation_scope
+                  FROM incident i
+                 WHERE i.id = te.incident_id;
+            </sql>
+            <sql>
+                ALTER TABLE trigger_event
+                    ADD CONSTRAINT ck_trigger_event_correlation_status
+                    CHECK (correlation_status IN ('PENDING', 'CORRELATED', 'CLOSED', 'FAILED'));
+            </sql>
+            <sql>
+                ALTER TABLE trigger_event
+                    ADD CONSTRAINT ck_trigger_event_correlation_window
+                    CHECK (correlation_lookback_seconds &gt;= 0 AND correlation_lookahead_seconds &gt;= 0);
+            </sql>
+            <sql>
+                ALTER TABLE trigger_event
+                    ADD CONSTRAINT ck_trigger_event_correlated_at
+                    CHECK (
+                        (correlation_status = 'PENDING' AND correlated_at IS NULL)
+                        OR (correlation_status IN ('CORRELATED', 'CLOSED') AND correlated_at IS NOT NULL)
+                        OR correlation_status = 'FAILED'
+                    );
+            </sql>
+            <sql>
+                CREATE INDEX ix_trigger_event_correlation_pending
+                    ON trigger_event (received_at)
+                    WHERE correlation_status IN ('PENDING', 'FAILED');
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
