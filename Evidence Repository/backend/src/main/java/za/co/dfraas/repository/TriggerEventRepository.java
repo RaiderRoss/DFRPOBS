@@ -9,9 +9,10 @@ import java.util.UUID;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
-import za.co.dfraas.entity.CorrelationStatus;
 import za.co.dfraas.entity.TriggerEvent;
 
 /**
@@ -52,25 +53,21 @@ public interface TriggerEventRepository extends JpaRepository<TriggerEvent, UUID
 	List<TriggerEvent> findByFiredAtBetween(OffsetDateTime from, OffsetDateTime to);
 
 	/**
-	 * The correlation work queue: alerts recorded but not yet correlated, oldest first.
-	 *
-	 * <p>This is what README open question 3 was reaching for. The original bug was that
-	 * ingestion could commit a trigger event and then die before preserving anything, with
-	 * no way to tell afterwards; the schema could not answer "which alerts were received and
-	 * produced nothing". Once collection is continuous the gap moves to correlation, but the
-	 * question is the same one and this method is its answer.
-	 *
-	 * <p>Pass {@code PENDING} and {@link CorrelationStatus#FAILED} together to drive a sweep
-	 * — both need the same work done, and the partial index
-	 * {@code ix_trigger_event_correlation_pending} covers exactly that pair. Query them
-	 * separately when reporting, because an alert never attempted and one whose attempt
-	 * broke say entirely different things about the system.
-	 *
-	 * <p>Ordered by {@code receivedAt} rather than {@code firedAt}: a source with a wrong
-	 * clock must not be able to push its alerts to the front of the queue.
+	 * An incident's member alerts. Ordered by the caller's {@code Pageable}; the API sorts on
+	 * {@code receivedAt}, this system's clock, for the reason {@code TriggerEventResource}
+	 * gives. Served by {@code ix_trigger_event_incident_id}.
 	 */
-	Page<TriggerEvent> findByCorrelationStatusInOrderByReceivedAtAsc(
-			Collection<CorrelationStatus> statuses, Pageable pageable);
+	Page<TriggerEvent> findByIncidentId(UUID incidentId, Pageable pageable);
 
-	long countByCorrelationStatus(CorrelationStatus correlationStatus);
+	/**
+	 * Alert counts for a page of incidents in one query, rather than one count per row.
+	 * Each row is {@code [incidentId, count]}.
+	 */
+	@Query("""
+			select te.incident.id, count(te)
+			from TriggerEvent te
+			where te.incident.id in :incidentIds
+			group by te.incident.id
+			""")
+	List<Object[]> countByIncidentIds(@Param("incidentIds") Collection<UUID> incidentIds);
 }

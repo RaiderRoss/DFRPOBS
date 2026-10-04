@@ -24,8 +24,9 @@ import lombok.Getter;
 import lombok.Setter;
 
 /**
- * The association between a {@link TriggerEvent} and an {@link EvidenceItem} that bears on
- * it — the join that replaced {@code evidence_item.trigger_event_id}.
+ * The association between an {@link Incident} and an {@link EvidenceItem} that bears on
+ * it — the join that replaced {@code evidence_item.trigger_event_id}, re-pointed from the
+ * alert to its incident by {@code 0007}.
  *
  * <p>Mirrors Liquibase changeset {@code 0005-create-evidence-link-and-correlation-state}.
  * Because {@code spring.jpa.hibernate.ddl-auto=validate}, any drift between this class and
@@ -60,7 +61,7 @@ import lombok.Setter;
 		name = "evidence_link",
 		uniqueConstraints = @UniqueConstraint(
 				name = "uq_evidence_link_pair",
-				columnNames = {"trigger_event_id", "evidence_item_id"}))
+				columnNames = {"incident_id", "evidence_item_id"}))
 @Getter
 @Setter
 public class EvidenceLink {
@@ -71,20 +72,22 @@ public class EvidenceLink {
 	private UUID id;
 
 	/**
-	 * The alert this link gathers evidence for.
+	 * The incident this link gathers evidence for — not an individual alert, since
+	 * {@code 0007}: a source that alerts six times about one attack gets one bundle, reviewed
+	 * once, rather than the same firewall log proposed six times.
 	 *
 	 * <p>{@code updatable = false} on both foreign keys: re-pointing a link at a different
-	 * alert or a different artifact would silently move an exhibit between incidents while
-	 * keeping the reasoning and the reviewer's name attached to it, which is a forgery in
-	 * everything but name. A wrong link is dismissed; it is not repaired in place.
+	 * incident or a different artifact would silently move an exhibit between investigations
+	 * while keeping the reasoning and the reviewer's name attached to it, which is a forgery
+	 * in everything but name. A wrong link is dismissed; it is not repaired in place.
 	 */
 	@ManyToOne(fetch = FetchType.LAZY, optional = false)
 	@JoinColumn(
-			name = "trigger_event_id",
+			name = "incident_id",
 			nullable = false,
 			updatable = false,
-			foreignKey = @ForeignKey(name = "fk_evidence_link_trigger_event"))
-	private TriggerEvent triggerEvent;
+			foreignKey = @ForeignKey(name = "fk_evidence_link_incident"))
+	private Incident incident;
 
 	@ManyToOne(fetch = FetchType.LAZY, optional = false)
 	@JoinColumn(
@@ -136,7 +139,7 @@ public class EvidenceLink {
 
 	/**
 	 * Who ruled on the link and when. Both null or both set —
-	 * {@code ck_evidence_link_review_pair} — and both mandatory for
+	 * {@code ck_evidence_link_review_complete}, with {@link #reviewNote} — and both mandatory for
 	 * {@link LinkDisposition#DISMISSED}.
 	 *
 	 * <p>Set by the application rather than a column default, unlike every other timestamp
@@ -151,6 +154,18 @@ public class EvidenceLink {
 
 	@Column(name = "reviewed_at")
 	private OffsetDateTime reviewedAt;
+
+	/**
+	 * Why the reviewer ruled as they did. Set with {@link #reviewedBy} and
+	 * {@link #reviewedAt} or not at all, and never blank —
+	 * {@code ck_evidence_link_review_complete}.
+	 *
+	 * <p>Separate from {@link #rationale}, which says why the link was <em>proposed</em> and
+	 * belongs to whoever made it. This says why a person agreed or set it aside, which is
+	 * the part of a dismissal a defence will actually ask about.
+	 */
+	@Column(name = "review_note", columnDefinition = "text")
+	private String reviewNote;
 
 	/**
 	 * Whether this link was added by a later correlation pass, after the alert had already

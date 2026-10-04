@@ -14,10 +14,15 @@ import java.time.OffsetDateTime;
  * <p>Note what a producer is <em>not</em> permitted to send: no digest, and no received
  * timestamp. Both are computed or stamped on this side, because neither is something a
  * sender gets to assert about evidence.
+ *
+ * <p>{@code incidentKey} is optional: alerts from one source sharing a key are filed under
+ * one {@code Incident}, so a source that re-alerts about one attack produces one bundle
+ * rather than several. Omitted, the alert is an incident of its own.
  */
 public record EvidenceEventMessage(
 		String eventId,
 		String sourceSystem,
 		String triggerType,
-		OffsetDateTime firedAt) {
+		OffsetDateTime firedAt,
+		String incidentKey) {
 }

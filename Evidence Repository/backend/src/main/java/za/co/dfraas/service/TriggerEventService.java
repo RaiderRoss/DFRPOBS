@@ -10,9 +10,11 @@ import org.springframework.transaction.annotation.Transactional;
 import za.co.dfraas.dto.TriggerEventDto;
 import za.co.dfraas.dto.TriggerEventIngestRequest;
 import za.co.dfraas.dto.TriggerEventIngestResult;
+import za.co.dfraas.entity.Incident;
 import za.co.dfraas.entity.TriggerEvent;
 import za.co.dfraas.exception.ResourceNotFoundException;
 import za.co.dfraas.mapper.TriggerEventMapper;
+import za.co.dfraas.repository.IncidentRepository;
 import za.co.dfraas.repository.TriggerEventRepository;
 
 /**
@@ -20,7 +22,8 @@ import za.co.dfraas.repository.TriggerEventRepository;
  *
  * <p>Read-only at the class level with writes opting in individually, matching
  * {@link WorkGroupService}. There is exactly one write path — {@link #recordIfAbsent} —
- * and it is called by {@code EvidenceEventConsumer}, not by any HTTP endpoint.
+ * and it is called by {@code EvidenceEventConsumer}, not by any HTTP endpoint. It also
+ * files each new alert under its {@link Incident}, opening one if the key is new.
  */
 @Service
 @Transactional(readOnly = true)
@@ -29,14 +32,17 @@ public class TriggerEventService {
 	private static final String RESOURCE = "TriggerEvent";
 
 	private final TriggerEventRepository repository;
+	private final IncidentRepository incidentRepository;
 	private final TriggerEventMapper mapper;
 	private final HashingService hashingService;
 
 	public TriggerEventService(
 			TriggerEventRepository repository,
+			IncidentRepository incidentRepository,
 			TriggerEventMapper mapper,
 			HashingService hashingService) {
 		this.repository = repository;
+		this.incidentRepository = incidentRepository;
 		this.mapper = mapper;
 		this.hashingService = hashingService;
 	}
@@ -82,11 +88,38 @@ public class TriggerEventService {
 				.orElseGet(() -> {
 					TriggerEvent entity = mapper.toEntity(request);
 					entity.setPayloadSha256(hashingService.sha256Hex(request.payload()));
+					entity.setIncident(fileUnderIncident(request));
 					// saveAndFlush, so the INSERT is issued here rather than at commit —
 					// a deferred flush would surface the constraint violation outside this
 					// method, where the context that explains it is gone.
 					return new TriggerEventIngestResult(mapper.toDto(repository.saveAndFlush(entity)), true);
 				});
+	}
+
+	/**
+	 * Finds or opens the incident this alert belongs to, and widens its span to include it.
+	 *
+	 * <p>Called only for an alert being recorded for the first time — a duplicate delivery
+	 * returns before this, so redelivery cannot stretch an incident's window.
+	 *
+	 * <p>The concurrent case is the one {@link #recordIfAbsent} describes, one level down:
+	 * two first alerts of one incident on different consumers can both miss the lookup, and
+	 * {@code uq_incident_source_key} rejects the second. In practice the producer keys
+	 * messages by attacker, so a group's alerts share a partition and arrive in order.
+	 */
+	private Incident fileUnderIncident(TriggerEventIngestRequest request) {
+		String key = (request.incidentKey() == null || request.incidentKey().isBlank())
+				? Incident.keyForUngrouped(request.externalEventId())
+				: request.incidentKey().strip();
+		Incident incident = incidentRepository.findBySourceSystemAndIncidentKey(request.sourceSystem(), key)
+				.orElseGet(() -> {
+					Incident opened = new Incident();
+					opened.setSourceSystem(request.sourceSystem());
+					opened.setIncidentKey(key);
+					return opened;
+				});
+		incident.absorb(request.firedAt());
+		return incidentRepository.saveAndFlush(incident);
 	}
 
 	public TriggerEventDto findById(UUID id) {

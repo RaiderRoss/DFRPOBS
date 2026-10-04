@@ -24,8 +24,7 @@ public class TriggerEventMapper {
 				entity.getFiredAt(),
 				entity.getReceivedAt(),
 				entity.getPayloadSha256(),
-				entity.getCorrelationStatus(),
-				entity.getCorrelatedAt());
+				entity.getIncident().getId());
 	}
 
 	public List<TriggerEventDto> toDtoList(List<TriggerEvent> entities) {
@@ -37,11 +36,8 @@ public class TriggerEventMapper {
 	 * the database default's, and {@code payloadSha256} is set by the service after it
 	 * computes the digest — a mapper is the wrong place to do cryptography.
 	 *
-	 * <p>The correlation fields are likewise absent. {@code correlationStatus} and the
-	 * window parameters take their defaults from the entity, and {@code correlatedAt} and
-	 * {@code correlationScope} are written by the correlation pass. None of them is
-	 * something a sender may assert: an alert does not get to declare how widely the system
-	 * will search on its behalf, or that it has already been dealt with.
+	 * <p>The incident is likewise absent: {@code TriggerEventService} files the alert,
+	 * because finding or opening an incident is a lookup, not a translation.
 	 */
 	public TriggerEvent toEntity(TriggerEventIngestRequest request) {
 		TriggerEvent entity = new TriggerEvent();

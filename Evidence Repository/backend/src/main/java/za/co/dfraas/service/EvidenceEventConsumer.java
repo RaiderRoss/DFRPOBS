@@ -88,12 +88,12 @@ public class EvidenceEventConsumer {
 			return;
 		}
 
-		log.info("Recorded trigger event: id={} source={} externalEventId={} sha256={}",
+		log.info("Recorded trigger event: id={} source={} externalEventId={} incident={} sha256={}",
 				result.triggerEvent().id(), request.sourceSystem(), request.externalEventId(),
-				result.triggerEvent().payloadSha256());
+				result.triggerEvent().incidentId(), result.triggerEvent().payloadSha256());
 
-		// Correlation is deliberately not done here. The alert is left PENDING and picked up
-		// by CorrelationScheduler's next sweep: correlation is a query over evidence that
+		// Correlation is deliberately not done here. The alert's incident is left for
+		// CorrelationScheduler's next sweep: correlation is a query over evidence that
 		// arrived independently of this message, so running it in the listener would stall
 		// the alert partition behind a slow or over-broad search, and the evidence covering
 		// the window may not even have been preserved yet.
@@ -136,7 +136,8 @@ public class EvidenceEventConsumer {
 				message.sourceSystem(),
 				message.triggerType(),
 				message.firedAt(),
-				payload);
+				payload,
+				message.incidentKey());
 
 		Set<ConstraintViolation<TriggerEventIngestRequest>> violations = validator.validate(request);
 		if (!violations.isEmpty()) {
