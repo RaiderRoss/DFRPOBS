@@ -17,6 +17,7 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 import za.co.dfraas.exception.DuplicateResourceException;
 import za.co.dfraas.exception.EvidenceStorageException;
 import za.co.dfraas.exception.IntegrityVerificationException;
+import za.co.dfraas.exception.LinkAlreadyReviewedException;
 import za.co.dfraas.exception.ResourceNotFoundException;
 
 /**
@@ -45,6 +46,18 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 	public ProblemDetail handleDuplicate(DuplicateResourceException ex) {
 		ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
 		problem.setTitle("Resource already exists");
+		return problem;
+	}
+
+	/**
+	 * 409 with its own title, rather than reusing the duplicate handler's "already exists":
+	 * nothing was being created, and a reviewer told that is left guessing why their ruling
+	 * was refused. The message names the ruling that stands.
+	 */
+	@ExceptionHandler(LinkAlreadyReviewedException.class)
+	public ProblemDetail handleAlreadyReviewed(LinkAlreadyReviewedException ex) {
+		ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+		problem.setTitle("Link already reviewed");
 		return problem;
 	}
 

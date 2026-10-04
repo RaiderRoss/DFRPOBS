@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        Link review: the reason an investigator gives when confirming or dismissing a
+        proposed link.
+
+        0005 recorded who reviewed a link and when, but not why. "Dismissed by alice at
+        10:42" is the half of the record a defence probes and the half that cannot be
+        answered from the row: the reviewer's reasoning is what separates "set aside after
+        looking" from "set aside". rationale cannot carry it — that column holds why the
+        link was proposed, is updatable = false, and belongs to whoever made the link.
+    -->
+
+    <changeSet id="0006-1" author="dfraas-team">
+        <comment>Adds evidence_link.review_note — the reviewer's stated reason</comment>
+        <addColumn tableName="evidence_link">
+            <column name="review_note" type="TEXT"/>
+        </addColumn>
+        <rollback>
+            <dropColumn tableName="evidence_link" columnName="review_note"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0006-2" author="dfraas-team">
+        <comment>A review names who, when and why together, or none of them</comment>
+        <!--
+            Replaces ck_evidence_link_review_pair with a triple. The pair rule stays true —
+            this is a strict extension of it — so dropping the old constraint loses nothing.
+
+            Rows without a reviewer are unaffected: PROPOSED links, and CAUSAL links
+            confirmed by observation at ingest (see ck_evidence_link_dismissal_attribution),
+            carry no review at all and keep all three null.
+
+            Blank counts as missing. A reason of "" is a reviewer declining to give one,
+            and the column exists precisely so that is not possible.
+        -->
+        <sql>
+            ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_review_pair;
+        </sql>
+        <sql>
+            ALTER TABLE evidence_link
+                ADD CONSTRAINT ck_evidence_link_review_complete
+                CHECK (
+                    (reviewed_by IS NULL AND reviewed_at IS NULL AND review_note IS NULL)
+                    OR (reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL
+                        AND review_note IS NOT NULL AND btrim(review_note) &lt;&gt; '')
+                );
+        </sql>
+        <rollback>
+            <sql>ALTER TABLE evidence_link DROP CONSTRAINT ck_evidence_link_review_complete;</sql>
+            <sql>
+                ALTER TABLE evidence_link
+                    ADD CONSTRAINT ck_evidence_link_review_pair
+                    CHECK ((reviewed_by IS NULL) = (reviewed_at IS NULL));
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

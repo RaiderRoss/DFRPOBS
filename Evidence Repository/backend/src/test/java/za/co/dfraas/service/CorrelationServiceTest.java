@@ -31,15 +31,15 @@ import za.co.dfraas.entity.EvidenceItem;
 import za.co.dfraas.entity.EvidenceLink;
 import za.co.dfraas.entity.EvidenceSource;
 import za.co.dfraas.entity.EvidenceStatus;
+import za.co.dfraas.entity.Incident;
 import za.co.dfraas.entity.LinkDisposition;
 import za.co.dfraas.entity.LinkMethod;
-import za.co.dfraas.entity.TriggerEvent;
 import za.co.dfraas.entity.WorkGroup;
 import za.co.dfraas.exception.CorrelationException;
 import za.co.dfraas.repository.EvidenceItemRepository;
 import za.co.dfraas.repository.EvidenceLinkRepository;
 import za.co.dfraas.repository.EvidenceSourceRepository;
-import za.co.dfraas.repository.TriggerEventRepository;
+import za.co.dfraas.repository.IncidentRepository;
 import za.co.dfraas.repository.WorkGroupRepository;
 
 /**
@@ -90,7 +90,7 @@ class CorrelationServiceTest {
 	private CorrelationService service;
 
 	@Autowired
-	private TriggerEventRepository triggerEventRepository;
+	private IncidentRepository incidentRepository;
 
 	@Autowired
 	private EvidenceItemRepository evidenceItemRepository;
@@ -129,7 +129,7 @@ class CorrelationServiceTest {
 		EvidenceItem pointInTime = item(firewall, at("14:45"), at("14:45"));
 		EvidenceItem tooEarly = item(firewall, at("13:00"), at("13:59"));
 		EvidenceItem otherGroup = item(newSourceSaved("hr-syslog", internalSystems), at("14:10"), at("14:20"));
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 
 		var result = service.correlate(alert.getId());
 
@@ -149,11 +149,11 @@ class CorrelationServiceTest {
 	@Test
 	@DisplayName("A first pass marks the alert correlated and freezes the scope it searched")
 	void firstPassRecordsStatusAndScope() {
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 
 		service.correlate(alert.getId());
 
-		TriggerEvent reloaded = reload(alert);
+		Incident reloaded = reload(alert);
 		assertThat(reloaded.getCorrelationStatus()).isEqualTo(CorrelationStatus.CORRELATED);
 		assertThat(reloaded.getCorrelatedAt()).isAtSameInstantAs(NOW);
 		assertThat(reloaded.getCorrelationScope())
@@ -164,7 +164,7 @@ class CorrelationServiceTest {
 	@Test
 	@DisplayName("An alert with nothing overlapping is still correlated — an empty window is an answer")
 	void emptyWindowIsStillCorrelated() {
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 
 		var result = service.correlate(alert.getId());
 
@@ -176,7 +176,7 @@ class CorrelationServiceTest {
 	@DisplayName("A re-run adds nothing twice, and flags evidence that arrived since as late")
 	void rerunIsIdempotentAndFlagsLateArrivals() {
 		EvidenceItem early = item(firewall, at("14:00"), at("14:30"));
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 		service.correlate(alert.getId());
 
 		assertThat(service.correlate(alert.getId()).linksAdded()).isZero();
@@ -197,7 +197,7 @@ class CorrelationServiceTest {
 		for (int i = 0; i < PAGE_SIZE * 2 + 1; i++) {
 			item(firewall, at("14:00"), at("14:40"));
 		}
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 
 		assertThat(service.correlate(alert.getId()).linksAdded()).isEqualTo(PAGE_SIZE * 2 + 1);
 		assertThat(links(alert)).hasSize(PAGE_SIZE * 2 + 1);
@@ -208,7 +208,7 @@ class CorrelationServiceTest {
 	void settledAlertIsClosed() {
 		// Window 10:00-10:45, settled at 11:45, well before the 15:00 clock.
 		item(firewall, at("10:00"), at("10:30"));
-		TriggerEvent alert = alert("slips-ids", at("10:30"));
+		Incident alert = alert("slips-ids", at("10:30"));
 
 		var result = service.correlate(alert.getId());
 
@@ -222,10 +222,25 @@ class CorrelationServiceTest {
 	}
 
 	@Test
+	@DisplayName("A grouped incident searches from its first alert's lookback to its last alert's lookahead")
+	void groupedIncidentWindowSpansEveryAlert() {
+		// Alerts at 14:30 and 15:30: the window is 14:00-15:45. A lone 14:30 alert would stop at
+		// 14:45 and miss the second item; a lone 15:30 alert would start at 15:00 and miss the first.
+		EvidenceItem duringFirst = item(firewall, at("14:05"), at("14:10"));
+		EvidenceItem duringSecond = item(firewall, at("15:35"), at("15:40"));
+		item(firewall, at("15:50"), at("15:55"));
+		Incident scan = incident("slips-ids", at("14:30"), at("15:30"));
+
+		assertThat(service.correlate(scan.getId()).linksAdded()).isEqualTo(2);
+		assertThat(linkedItemIds(scan)).containsExactlyInAnyOrder(duringFirst.getId(), duringSecond.getId());
+		assertThat(links(scan).get(0).getRationale()).contains("alerts fired");
+	}
+
+	@Test
 	@DisplayName("An alert from an unregistered source cannot be correlated")
 	void unregisteredSourceIsRejected() {
 		item(firewall, at("14:00"), at("15:00"));
-		TriggerEvent alert = alert("unknown-siem", FIRED_AT);
+		Incident alert = alert("unknown-siem", FIRED_AT);
 
 		assertThatThrownBy(() -> service.correlate(alert.getId()))
 				.isInstanceOf(CorrelationException.class)
@@ -236,7 +251,7 @@ class CorrelationServiceTest {
 	@Test
 	@DisplayName("Reclassifying the source does not change what an already-correlated alert searches")
 	void frozenScopeOutlivesReclassification() {
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 		service.correlate(alert.getId());
 
 		ids.setWorkGroup(internalSystems);
@@ -249,12 +264,12 @@ class CorrelationServiceTest {
 	@Test
 	@DisplayName("A failure after a completed pass keeps the first completion time")
 	void markFailedKeepsCorrelatedAt() {
-		TriggerEvent alert = alert("slips-ids", FIRED_AT);
+		Incident alert = alert("slips-ids", FIRED_AT);
 		service.correlate(alert.getId());
 
 		service.markFailed(alert.getId());
 
-		TriggerEvent reloaded = reload(alert);
+		Incident reloaded = reload(alert);
 		assertThat(reloaded.getCorrelationStatus()).isEqualTo(CorrelationStatus.FAILED);
 		assertThat(reloaded.getCorrelatedAt()).isAtSameInstantAs(NOW);
 	}
@@ -262,8 +277,8 @@ class CorrelationServiceTest {
 	@Test
 	@DisplayName("The work queue holds pending and failed alerts, oldest first")
 	void queueReturnsUncorrelatedAlerts() {
-		TriggerEvent pending = alert("slips-ids", FIRED_AT);
-		TriggerEvent correlated = alert("slips-ids", FIRED_AT);
+		Incident pending = alert("slips-ids", FIRED_AT);
+		Incident correlated = alert("slips-ids", FIRED_AT);
 		service.correlate(correlated.getId());
 
 		List<UUID> queue = service.queue(List.of(CorrelationStatus.PENDING, CorrelationStatus.FAILED), 10);
@@ -271,15 +286,22 @@ class CorrelationServiceTest {
 		assertThat(queue).contains(pending.getId()).doesNotContain(correlated.getId());
 	}
 
-	private TriggerEvent alert(String sourceSystem, OffsetDateTime firedAt) {
-		TriggerEvent event = new TriggerEvent();
-		event.setExternalEventId(UUID.randomUUID().toString());
-		event.setSourceSystem(sourceSystem);
-		event.setTriggerType("PORT_SCAN");
-		event.setFiredAt(firedAt);
-		event.setPayload("{}");
-		event.setPayloadSha256(SHA_256_OF_EMPTY_STRING);
-		return triggerEventRepository.saveAndFlush(event);
+	/**
+	 * A one-alert incident — what an alert sent without a group key becomes. Correlation reads
+	 * only the incident, so the member trigger events themselves are not needed here.
+	 */
+	private Incident alert(String sourceSystem, OffsetDateTime firedAt) {
+		return incident(sourceSystem, firedAt);
+	}
+
+	private Incident incident(String sourceSystem, OffsetDateTime... firedAts) {
+		Incident incident = new Incident();
+		incident.setSourceSystem(sourceSystem);
+		incident.setIncidentKey(Incident.keyForUngrouped(UUID.randomUUID().toString()));
+		for (OffsetDateTime firedAt : firedAts) {
+			incident.absorb(firedAt);
+		}
+		return incidentRepository.saveAndFlush(incident);
 	}
 
 	private EvidenceItem item(EvidenceSource source, OffsetDateTime start, OffsetDateTime end) {
@@ -310,18 +332,18 @@ class CorrelationServiceTest {
 	}
 
 	/** Flushes the pass's writes and reads the alert back as the database holds it. */
-	private TriggerEvent reload(TriggerEvent alert) {
+	private Incident reload(Incident alert) {
 		entityManager.flush();
 		entityManager.clear();
-		return triggerEventRepository.findById(alert.getId()).orElseThrow();
+		return incidentRepository.findById(alert.getId()).orElseThrow();
 	}
 
-	private List<EvidenceLink> links(TriggerEvent alert) {
+	private List<EvidenceLink> links(Incident alert) {
 		entityManager.flush();
-		return evidenceLinkRepository.findByTriggerEventId(alert.getId(), PageRequest.of(0, 100)).getContent();
+		return evidenceLinkRepository.findByIncidentId(alert.getId(), PageRequest.of(0, 100)).getContent();
 	}
 
-	private List<UUID> linkedItemIds(TriggerEvent alert) {
+	private List<UUID> linkedItemIds(Incident alert) {
 		return links(alert).stream().map(link -> link.getEvidenceItem().getId()).toList();
 	}
 

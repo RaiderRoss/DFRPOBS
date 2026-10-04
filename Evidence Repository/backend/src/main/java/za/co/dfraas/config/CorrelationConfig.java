@@ -13,7 +13,8 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  *
  * <p>The clock is a bean rather than {@code OffsetDateTime.now()} inline because the pass
  * makes a time-based decision — whether an alert's bundle has settled — and that decision
- * has to be testable without waiting an hour for it.
+ * has to be testable without waiting an hour for it. Link review reads the same clock to
+ * stamp {@code reviewedAt}.
  */
 @Configuration(proxyBeanMethods = false)
 @EnableScheduling

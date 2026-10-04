@@ -21,8 +21,8 @@ import za.co.dfraas.entity.CorrelationStatus;
  * evidence covering an alert's window may not have been preserved yet when the alert
  * arrives.
  *
- * <p>Not transactional itself: each alert is handed to the service in its own transaction,
- * so one alert failing records that alert {@code FAILED} and the sweep moves on.
+ * <p>Not transactional itself: each incident is handed to the service in its own transaction,
+ * so one incident failing records that incident {@code FAILED} and the sweep moves on.
  *
  * <p><strong>Assumes a single running instance.</strong> Two instances sweeping the same
  * queue would both try to link the same pairs; {@code uq_evidence_link_pair} stops a
@@ -51,12 +51,12 @@ public class CorrelationScheduler {
 	}
 
 	/**
-	 * One sweep: new and failed alerts first, then a re-run over open ones for late
+	 * One sweep: new and failed incidents first, then a re-run over open ones for late
 	 * arrivals, closing each once its bundle has settled.
 	 *
 	 * <p>Both queues are taken oldest-first and capped at {@code batchSize}, so a backlog is
-	 * worked through across several sweeps rather than in one unbounded run. Open alerts
-	 * beyond the cap wait for a later sweep; nothing is lost by that, because every alert is
+	 * worked through across several sweeps rather than in one unbounded run. Open incidents
+	 * beyond the cap wait for a later sweep; nothing is lost by that, because every incident is
 	 * re-run once more before it closes.
 	 */
 	@Scheduled(
@@ -70,19 +70,19 @@ public class CorrelationScheduler {
 		}
 	}
 
-	private int run(List<UUID> triggerEventIds) {
-		for (UUID id : triggerEventIds) {
+	private int run(List<UUID> incidentIds) {
+		for (UUID id : incidentIds) {
 			try {
 				correlationService.correlate(id);
 			}
 			catch (RuntimeException e) {
-				// Logged at WARN, not ERROR: an alert from an unregistered source fails here
+				// Logged at WARN, not ERROR: an incident from an unregistered source fails here
 				// on every sweep until the source is registered, which is a configuration gap
 				// rather than a fault. The FAILED status is what an audit should look for.
-				log.warn("Correlation failed for trigger event {}: {}", id, e.getMessage());
+				log.warn("Correlation failed for incident {}: {}", id, e.getMessage());
 				correlationService.markFailed(id);
 			}
 		}
-		return triggerEventIds.size();
+		return incidentIds.size();
 	}
 }
