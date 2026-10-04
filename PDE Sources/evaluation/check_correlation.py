@@ -202,10 +202,10 @@ def main():
         if not os.path.isfile(os.path.join(run_dir, "replay.json")):
             sys.exit("no replay.json in %s" % run_dir)
         s = score_run(run_dir)
-        with open(os.path.join(run_dir, "summary.json"), "w") as fh:
+        with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as fh:
             json.dump(s, fh, indent=2)
         md = markdown(s)
-        with open(os.path.join(run_dir, "summary.md"), "w") as fh:
+        with open(os.path.join(run_dir, "summary.md"), "w", encoding="utf-8") as fh:
             fh.write(md)
         print(md)
         summaries.append(s)

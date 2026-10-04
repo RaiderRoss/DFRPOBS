@@ -467,7 +467,7 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "replay.json")
-    with open(out_path, "w") as fh:
+    with open(out_path, "w", encoding="utf-8") as fh:
         json.dump({
             "tag": tag,
             "classification": args.classification,
