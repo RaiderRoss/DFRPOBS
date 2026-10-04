@@ -1,0 +1,267 @@
+{
+  "tag": "eval-design",
+  "classification": "design",
+  "workGroups": {
+    "NETWORK_SECURITY": {
+      "id": "6c09f32d-292c-4891-88ab-b598662d9a96",
+      "sources": [
+        "firewall",
+        "ids"
+      ]
+    },
+    "PRIVILEGED_ACCESS": {
+      "id": "2ed3d1a7-6f80-4224-b4ef-4988dc4617ab",
+      "sources": [
+        "banking-audit"
+      ]
+    },
+    "PUBLIC_FACING_CHANNELS": {
+      "id": "b7075a1b-ab19-4384-87bb-9f7485c4db41",
+      "sources": [
+        "banking-events"
+      ]
+    }
+  },
+  "ingest": {
+    "submitted": 96,
+    "preserved": 96,
+    "alreadyPreserved": 0,
+    "rejected": 0,
+    "hashMatchesManifest": 96,
+    "medianIngestMs": 94
+  },
+  "incidentsExpected": 6,
+  "incidentsFound": 6,
+  "incidentsMissing": [],
+  "alerts": 76,
+  "triggersOnAttacker": 6,
+  "meanRecall": 0.5,
+  "meanPrecision": 0.13425925925925927,
+  "fraudAuditProposed": 0,
+  "perSourceRecall": {
+    "firewall": 6,
+    "ids": 6,
+    "banking-events": 0,
+    "banking-audit": 0
+  },
+  "reviewLoadGrouped": 92,
+  "reviewLoadPerAlert": 1150,
+  "incidents": [
+    {
+      "incidentKey": "20260930231520_guaranteed-alert/10.99.0.20/tw1",
+      "window": "20260930231520_guaranteed-alert",
+      "profile": "guaranteed-alert",
+      "seed": 1001,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 18,
+      "status": "CLOSED",
+      "windowMinutes": 45.3,
+      "linksTotal": 12,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 10,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -7.1,
+        10.7
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.16666666666666666,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 12,
+      "reviewLoadPerAlert": 216,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 12
+      }
+    },
+    {
+      "incidentKey": "20260930232604_db-probe/10.99.0.20/tw1",
+      "window": "20260930232604_db-probe",
+      "profile": "db-probe",
+      "seed": 1001,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 7,
+      "status": "CLOSED",
+      "windowMinutes": 45.2,
+      "linksTotal": 12,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 10,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -17.9,
+        -3.6
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.16666666666666666,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 12,
+      "reviewLoadPerAlert": 84,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 12
+      }
+    },
+    {
+      "incidentKey": "20261001104201_guaranteed-alert/10.99.0.20/tw1",
+      "window": "20261001104201_guaranteed-alert",
+      "profile": "guaranteed-alert",
+      "seed": 1002,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 15,
+      "status": "CLOSED",
+      "windowMinutes": 45.3,
+      "linksTotal": 16,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 14,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -15.9,
+        15.1
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.125,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 16,
+      "reviewLoadPerAlert": 240,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 16
+      }
+    },
+    {
+      "incidentKey": "20261001105708_db-probe/10.99.0.20/tw1",
+      "window": "20261001105708_db-probe",
+      "profile": "db-probe",
+      "seed": 1002,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 9,
+      "status": "CLOSED",
+      "windowMinutes": 45.1,
+      "linksTotal": 18,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 16,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -26.8,
+        12.1
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.1111111111111111,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 18,
+      "reviewLoadPerAlert": 162,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 18
+      }
+    },
+    {
+      "incidentKey": "20261001111257_guaranteed-alert/10.99.0.20/tw1",
+      "window": "20261001111257_guaranteed-alert",
+      "profile": "guaranteed-alert",
+      "seed": 1003,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 19,
+      "status": "CLOSED",
+      "windowMinutes": 45.3,
+      "linksTotal": 16,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 14,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -23.3,
+        8.4
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.125,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 16,
+      "reviewLoadPerAlert": 304,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 16
+      }
+    },
+    {
+      "incidentKey": "20261001112124_db-probe/10.99.0.20/tw1",
+      "window": "20261001112124_db-probe",
+      "profile": "db-probe",
+      "seed": 1003,
+      "alertedIp": "10.99.0.20",
+      "triggerIsAttacker": true,
+      "alerts": 8,
+      "status": "CLOSED",
+      "windowMinutes": 45.1,
+      "linksTotal": 18,
+      "linksOwnWindow": 2,
+      "linksOtherWindows": 16,
+      "linksForeign": 0,
+      "otherWindowsSpanMinutes": [
+        -28.0,
+        12.6
+      ],
+      "ownSourcesFound": [
+        "firewall",
+        "ids"
+      ],
+      "ownSourcesMissing": [
+        "banking-events",
+        "banking-audit"
+      ],
+      "recall": 0.5,
+      "precision": 0.1111111111111111,
+      "fraudAuditProposed": false,
+      "reviewLoadGrouped": 18,
+      "reviewLoadPerAlert": 144,
+      "lateArrivalLinks": 0,
+      "methods": {
+        "AUTO_TIME_WINDOW": 18
+      }
+    }
+  ]
+}
