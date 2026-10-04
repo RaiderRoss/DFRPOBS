@@ -19,6 +19,11 @@ Delivery is at-least-once, matching the consumer:
   * eventId is derived from the alert line itself, so forwarding the same alert twice --
     after a restart, or a re-read -- produces the same id, and the repository's
     (sourceSystem, eventId) dedupe drops the second.
+  * incidentKey is <session>/<ip>/tw<N>. Slips re-alerts every time an attacker's evidence
+    crosses the threshold again within a timewindow, so one attack is several alerts; the
+    repository files alerts sharing a key under one incident, with one evidence bundle.
+    The session (the Slips output directory's name) is part of the key because Slips
+    numbers timewindows from 1 on every run, and tw1 today is not tw1 tomorrow.
   * The read offset is saved only after the broker has acknowledged everything before
     it, so a crash re-sends rather than skips.
   * A trailing line without its newline is a write still in flight. It is left for the
@@ -90,8 +95,11 @@ def parse_ts(s):
     """
     if not s:
         return None
+    # The "(real time ...)" suffix is written 2026/10/04 11:18:03.796742 — slashes, which
+    # fromisoformat rejects. The alert-line timestamp itself is proper ISO.
+    s = re.sub(r"^(\d{4})/(\d{2})/(\d{2})", r"\1-\2-\3", s.strip())
     try:
-        dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     except ValueError:
         return None
     return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
@@ -136,8 +144,9 @@ class Tail:
 
 class Forwarder:
 
-    def __init__(self, source_system, sink, offset_file):
+    def __init__(self, source_system, sink, offset_file, session):
         self.source_system = source_system
+        self.session = session
         self.sink = sink
         self.offset_file = offset_file
         self.sent_offset = self._load_offset()
@@ -201,6 +210,7 @@ class Forwarder:
             # deduplicated by the repository rather than recorded twice.
             "eventId": "%s-tw%s-%s" % (m.group("ip"), m.group("tw"), digest[:16]),
             "sourceSystem": self.source_system,
+            "incidentKey": "%s/%s/tw%s" % (self.session, m.group("ip"), m.group("tw")),
             "triggerType": TRIGGER_TYPES[m.group("verdict")],
             "firedAt": iso(fired),
             # Ignored by the consumer's parser but kept in the payload it stores, which is
@@ -356,6 +366,7 @@ def main():
     args = ap.parse_args()
 
     alerts_log = os.path.join(args.slips_out, "alerts", "alerts.log")
+    session = os.path.basename(os.path.normpath(args.slips_out))
     offset_file = args.offset_file or os.path.join(args.slips_out, "forwarder.offset")
 
     def stop(_signum, _frame):
@@ -378,7 +389,7 @@ def main():
             # only to rebuild each source's evidence context. A failed send starts a new
             # pass rather than carrying on: the evidence buffers it consumed are gone, and
             # replaying from the start is what puts them back.
-            forwarder = Forwarder(args.source_system, sink, offset_file)
+            forwarder = Forwarder(args.source_system, sink, offset_file, session)
             tail = Tail(alerts_log)
             log("following %s as %s (resuming after byte %d)" % (
                 alerts_log, args.source_system, forwarder.sent_offset))

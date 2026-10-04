@@ -115,7 +115,7 @@ lab_up() {
 	LAB_VETH_HOST="$VETH_HOST"
 	LAB_SUBNET="$SUBNET"
 	LAB_HOST_IP="$HOST_IP"
-	LAB_SLIPS_OUT="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+	LAB_SLIPS_OUT="$(ids_sessions_dir)/ids-$lab_stamp"
 	EOF
 	log "state recorded in $LAB_STATE (ufw was ENABLED=$orig_enabled LOGLEVEL=$orig_loglevel)"
 
@@ -150,7 +150,7 @@ lab_up() {
 
 	# --- IDS, before the firewall so `logging full` is not on during its startup ---
 	if [[ $WITH_IDS -eq 1 ]]; then
-		local slips_out="$PDE_ROOT/output/sessions/ids-$lab_stamp"
+		local slips_out; slips_out="$(lab_get LAB_SLIPS_OUT)"
 		mkdir -p "$slips_out"
 		log "starting Slips on $VETH_HOST (loading modules and threat-intel feeds)"
 		slips_start_redis || die "could not start the Slips redis"
@@ -164,7 +164,8 @@ lab_up() {
 		if [[ $FORWARD_ALERTS -eq 1 ]]; then
 			log "forwarding Slips alerts to the Evidence Repository (log: $LAB_DIR/slips-forwarder.log)"
 			local forwarder_pid
-			forwarder_pid=$(slips_forwarder_start "$slips_out" "$LAB_DIR/slips-forwarder.pid" 				"$LAB_DIR/slips-forwarder.log") || die "could not start the Slips forwarder"
+			forwarder_pid=$(slips_forwarder_start "$slips_out" "$LAB_DIR/slips-forwarder.pid" \
+				"$LAB_DIR/slips-forwarder.log") || die "could not start the Slips forwarder"
 			cat >> "$LAB_STATE" <<-EOF
 			LAB_FORWARDER_PID="$forwarder_pid"
 			EOF
@@ -195,6 +196,7 @@ lab_up() {
 	done
 	ufw logging full >/dev/null
 	ufw --force enable >/dev/null
+	firewall_exempt_loopback
 
 	# Verdict logging installed directly: ufw hardcodes -m limit --limit 3/min
 	# --limit-burst 10 onto every rule created with its `log` keyword, with no
@@ -259,8 +261,12 @@ lab_down() {
 	ip link del "${LAB_VETH_HOST:-$VETH_HOST}" 2>/dev/null || true
 
 	log "restoring firewall"
-	cp -a "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
-	cp -a "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
+	# install, not cp -a: the backups live in the repo, and under WSL that is a Windows
+	# drive, where every file reads as owned by the user with mode 777. Copying the
+	# metadata back left the live rules world-writable — anyone could rewrite the
+	# firewall. The contents are what is being restored; ownership is root's, as ufw ships.
+	install -o root -g root -m 0640 "$LAB_DIR/user.rules.bak" /etc/ufw/user.rules 2>/dev/null || true
+	install -o root -g root -m 0640 "$LAB_DIR/user6.rules.bak" /etc/ufw/user6.rules 2>/dev/null || true
 	ufw logging "${LAB_ORIG_LOGLEVEL:-low}" >/dev/null 2>&1 || true
 	if [[ "${LAB_ORIG_ENABLED:-no}" == "no" ]]; then
 		ufw --force disable >/dev/null 2>&1 || true
@@ -298,7 +304,7 @@ lab_status() {
 		echo "lab: UP since $started"
 		echo "  namespace   $ns ($(lab_get LAB_USERS "?") users)"
 		echo "  firewall    ufw enabled with test rules, LOGLEVEL=full"
-		echo "  ids         $([[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && echo "slips on $(lab_get LAB_VETH_HOST "$VETH_HOST")" || echo "not running")"
+		echo "  ids         $([[ "$(lab_get LAB_WITH_IDS 0)" -eq 1 ]] && echo "slips on $(lab_get LAB_VETH_HOST "$VETH_HOST"), output in $(lab_get LAB_SLIPS_OUT)" || echo "not running")"
 		local lpid; lpid=$(lab_get LAB_LISTENER_PID "")
 		if [[ -n "$lpid" && -d "/proc/$lpid" ]]; then
 			echo "  listener    ports $(lab_get LAB_ALERT_PORTS "?") on $HOST_IP (pid $lpid)"

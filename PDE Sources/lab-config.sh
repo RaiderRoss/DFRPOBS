@@ -122,6 +122,68 @@ alert_listener_stop() {
 	pkill -f -- "Firewall/alert_listener.py" 2>/dev/null || true
 }
 
+# Exempts loopback traffic from the lab firewall's default deny and from its audit log.
+# Called right after `ufw enable`; ufw rebuilds its chains on the next reload or disable,
+# so `down` and the capture's exit trap remove these with the rest of the raw rules.
+#
+# Two problems, both fatal to the IDS:
+#
+#  - Under WSL with networkingMode=mirrored, 127.0.0.1 is routed over `loopback0`, not
+#    `lo`, and ufw only exempts `lo`. Every new connection Slips' processes open to their
+#    Redis on 127.0.0.1:6379 falls through to the default deny, Slips times out on its own
+#    message bus, analyses zero flows and never alerts — while Zeek, which needs no Redis,
+#    keeps writing conn.log and makes it look as though everything is working.
+#
+#  - At LOGLEVEL=full ufw logs every packet with no rate limit, and Slips <-> Redis is
+#    by far the busiest traffic on the host: 3.6 GB each of ufw.log, kern.log and syslog
+#    in under half an hour, with rsyslog pinned on a CPU.
+#
+# Neither loses evidence. Loopback traffic can never carry SRC=10.99.0.*, and the capture
+# keeps only those lines — see the extraction in simulate-firewall.sh.
+#   firewall_exempt_loopback
+firewall_exempt_loopback() {
+	local cmd prefix iface
+	for cmd in iptables ip6tables; do
+		command -v "$cmd" >/dev/null || continue
+		[[ $cmd == iptables ]] && prefix=ufw || prefix=ufw6
+		for iface in lo loopback0; do
+			ip link show "$iface" >/dev/null 2>&1 || continue
+			# RETURN from the audit chains: the packet carries on to the real verdict,
+			# it is simply not logged.
+			"$cmd" -I "${prefix}-before-logging-input" 1 -i "$iface" -j RETURN 2>/dev/null || true
+			"$cmd" -I "${prefix}-before-logging-output" 1 -o "$iface" -j RETURN 2>/dev/null || true
+			# ufw already accepts lo; loopback0 is the one it does not know about.
+			if [[ $iface == loopback0 ]]; then
+				"$cmd" -I "${prefix}-before-input" 1 -i "$iface" -j ACCEPT 2>/dev/null || true
+				"$cmd" -I "${prefix}-before-output" 1 -o "$iface" -j ACCEPT 2>/dev/null || true
+			fi
+		done
+	done
+}
+
+# Where Slips keeps its live output for a session — the directory it is started with -o.
+#   ids_sessions_dir    echoes the directory (not created)
+#
+# Normally output/sessions in the repo. But under WSL the repo usually lives on a Windows
+# drive (/mnt/c, a 9p filesystem), and there Slips reads nothing: Zeek writes conn.log
+# into the session directory and Slips' input process never picks a line of it up, so it
+# profiles zero flows and never alerts, with no error anywhere. Measured side by side on
+# the same veth and the same traffic: 0 profiles on /mnt/c, 138 profiles and 7 alerts on
+# ext4. So on 9p the session moves to the Linux filesystem.
+#
+# Nothing downstream needs it in the repo: each captured window already gets its own copy
+# of the IDS evidence (ids_<ts>.alerts.log), and the session path is recorded in the lab
+# state for everything that follows it.
+ids_sessions_dir() {
+	local repo_dir="$PDE_ROOT/output/sessions" probe="$PDE_ROOT/output"
+	[[ -d "$probe" ]] || probe="$PDE_ROOT"
+	if [[ "$(stat -f -c %T "$probe" 2>/dev/null)" == "v9fs" ]]; then
+		echo "${PDE_IDS_SESSIONS:-/var/lib/pde-lab/sessions}"
+	else
+		echo "${PDE_IDS_SESSIONS:-$repo_dir}"
+	fi
+}
+
 SLIPS_FORWARDER="$PDE_ROOT/IDS/slips_forwarder.py"
 
 # Starts the forwarder that sends Slips' alerts to the Evidence Repository as trigger

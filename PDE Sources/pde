@@ -45,6 +45,9 @@ OUTDIR="$SCRIPT_DIR/output"
 # IDS produce independent evidence for the same packets.
 WITH_IDS=0
 IDS_DRAIN=45
+# Send Slips' alerts to the Evidence Repository as trigger events while the sources run.
+# Only means anything with the IDS on — no IDS, no alerts.
+FORWARD_ALERTS=0
 
 # ---- evidence repository -------------------------------------
 # Where a captured window goes once it is evidence. Overridable in pde.conf like
@@ -156,7 +159,9 @@ banner() {
 	# count can never drift out of step with the format.
 	printf '  %s\n' "${C_DIM}users${R} ${C_KEY}${USERS}${R} ${C_DIM}(${MALICIOUS_USERS} attacking)${R}   ${C_DIM}window${R} ${C_KEY}${DURATION}s${R}   ${C_DIM}rate${R} ${C_KEY}${RATE}/s${R}   ${C_DIM}malicious${R} ${C_KEY}${MALICIOUS_PCT}%${R}"
 	local sources
-	if [ "$WITH_IDS" = "1" ]; then
+	if [ "$WITH_IDS" = "1" ] && [ "$FORWARD_ALERTS" = "1" ]; then
+		sources="${C_KEY}firewall${R} ${C_DIM}+${R} ${C_KEY}ids${R} ${C_DIM}(alerts → repository)${R}"
+	elif [ "$WITH_IDS" = "1" ]; then
 		sources="${C_KEY}firewall${R} ${C_DIM}+${R} ${C_KEY}ids${R}"
 	else
 		sources="${C_KEY}firewall${R} ${C_DIM}only${R}"
@@ -879,7 +884,11 @@ LAB_OWNED=0
 lab_bring_up() {
 	local args=(up --users "$USERS")
 	[ "$WITH_IDS" = "1" ] && args+=(--with-ids)
-	if sudo_run "$LAB_SH" "${args[@]}"; then
+	[ "$WITH_IDS" = "1" ] && [ "$FORWARD_ALERTS" = "1" ] && args+=(--forward-alerts)
+	# Through env, because sudo drops the caller's environment: without it a source key
+	# changed in pde.conf would never reach the forwarder, and its alerts would arrive
+	# under the default key — unregistered, so every one would fail correlation.
+	if sudo_run env DFRAAS_IDS_SOURCE_KEY="$DFRAAS_IDS_SOURCE_KEY" "$LAB_SH" "${args[@]}"; then
 		LAB_OWNED=1
 		return 0
 	fi
@@ -917,6 +926,9 @@ sources_menu() {
 		echo
 		local state; state="$(lab_state)"
 		local running_ids; running_ids="$(lab_get LAB_WITH_IDS)"
+		local running_fwd=0; [ -n "$(lab_get LAB_FORWARDER_PID)" ] && running_fwd=1
+		# What the setting amounts to: forwarding with the IDS off would forward nothing.
+		local want_fwd=0; [ "$WITH_IDS" = "1" ] && [ "$FORWARD_ALERTS" = "1" ] && want_fwd=1
 
 		printf '  %s%-12s %-12s %s%s\n' "$C_DIM" "SOURCE" "PRODUCT" "STATUS" "$R"
 		if [ "$state" = "up" ]; then
@@ -931,6 +943,11 @@ sources_menu() {
 			printf '  %-12s %-12s %s%s%s\n' "ids" "Slips" "$C_DIM" "stopped" "$R"
 		fi
 		printf '  %-12s %-12s %s%s%s\n' "auth" "Keycloak" "$C_DIM" "not built yet" "$R"
+		if [ "$state" = "up" ] && [ "$running_fwd" = "1" ]; then
+			printf '  %-12s %-12s %s%s%s\n' "forwarder" "alerts→repo" "$C_OK" "running" "$R"
+		else
+			printf '  %-12s %-12s %s%s%s\n' "forwarder" "alerts→repo" "$C_DIM" "off" "$R"
+		fi
 
 		echo
 		dim "  The firewall is the base source — it owns the topology the traffic runs"
@@ -946,10 +963,18 @@ sources_menu() {
 		else
 			printf '  %s1%s  Turn the IDS source ON   %s(setting: off)%s\n' "$C_NUM" "$R" "$C_DIM" "$R"
 		fi
+		if [ "$FORWARD_ALERTS" = "1" ]; then
+			printf '  %s4%s  Stop forwarding alerts   %s(setting: on%s)%s\n' "$C_NUM" "$R" "$C_DIM" \
+				"$([ "$WITH_IDS" = "1" ] || echo ", but the IDS is off so there are none")" "$R"
+		else
+			printf '  %s4%s  Forward IDS alerts to the Evidence Repository  %s(setting: off)%s\n' \
+				"$C_NUM" "$R" "$C_DIM" "$R"
+		fi
 
 		# Setting and reality can disagree, because Slips attaches at start-up and
-		# cannot join or leave sources that are already running.
-		if [ "$state" = "up" ] && [ "$running_ids" != "$WITH_IDS" ]; then
+		# cannot join or leave sources that are already running — and the forwarder
+		# starts and stops with it.
+		if [ "$state" = "up" ] && { [ "$running_ids" != "$WITH_IDS" ] || [ "$running_fwd" != "$want_fwd" ]; }; then
 			echo
 			warn "Changed, but not yet applied."
 			dim "    Slips attaches when the sources start, so the running ones still have"
@@ -1000,6 +1025,27 @@ sources_menu() {
 					*)     echo; lab_bring_up; pause ;;
 				esac ;;
 			3) [ "$state" = "up" ] && { echo; lab_take_down; pause; } ;;
+			4)
+				if [ "$FORWARD_ALERTS" = "1" ]; then FORWARD_ALERTS=0; else FORWARD_ALERTS=1; fi
+				persist FORWARD_ALERTS
+				if [ "$FORWARD_ALERTS" = "1" ]; then
+					echo
+					dim "  Alerts arrive as source '$DFRAAS_IDS_SOURCE_KEY'. Register it under the firewall's"
+					dim "  work group (submit --source ids --register-with <id>), or nothing correlates."
+					[ "$WITH_IDS" = "1" ] || warn "The IDS source is off — turn it on (option 1), or there is nothing to forward."
+					sleep 2
+				fi
+				if [ "$state" = "up" ]; then
+					echo
+					printf '  %sapply it now? this restarts the sources [y/N]>%s ' "$C_TITLE" "$R"
+					if read -r apply; then
+						case "$apply" in
+							y|Y) echo; lab_take_down && lab_bring_up; pause ;;
+							*)   dim "  left for option 2"; sleep 1 ;;
+						esac
+					fi
+				fi
+				;;
 			0|q) return ;;
 			*) ;;
 		esac
