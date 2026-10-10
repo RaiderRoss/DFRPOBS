@@ -214,6 +214,10 @@ class Forwarder:
             "incidentKey": "%s/%s/tw%s" % (self.session, m.group("ip"), m.group("tw")),
             "triggerType": TRIGGER_TYPES[m.group("verdict")],
             "firedAt": iso(fired),
+            # What the alert is about, for the repository's shared-indicator rule: the
+            # address Slips raised it against. Only this list is matched -- the evidence
+            # below also names the bank's own server, which every artifact mentions.
+            "indicators": {"ip": [m.group("ip")]},
             # Ignored by the consumer's parser but kept in the payload it stores, which is
             # the point: the trigger event retains the alert as Slips wrote it.
             "slips": {

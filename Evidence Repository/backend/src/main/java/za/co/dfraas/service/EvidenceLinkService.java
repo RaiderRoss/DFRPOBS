@@ -2,6 +2,9 @@ package za.co.dfraas.service;
 
 import java.time.Clock;
 import java.time.OffsetDateTime;
+import java.util.Collection;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.UUID;
 
 import org.slf4j.Logger;
@@ -87,6 +90,37 @@ public class EvidenceLinkService {
 	@Transactional
 	public EvidenceLinkDto dismiss(UUID id, String reviewer, String reason) {
 		return review(id, LinkDisposition.DISMISSED, reviewer, reason);
+	}
+
+	/**
+	 * Confirms several links with one reason, all or none.
+	 *
+	 * <p>The record is the same as confirming each in turn: every link carries the reviewer,
+	 * the time and the reason itself. What a bulk ruling saves is the investigator's effort,
+	 * not any of the attribution.
+	 */
+	@Transactional
+	public List<EvidenceLinkDto> confirmAll(Collection<UUID> ids, String reviewer, String reason) {
+		return reviewAll(ids, LinkDisposition.CONFIRMED, reviewer, reason);
+	}
+
+	/** Dismisses several links with one reason, all or none. See {@link #confirmAll}. */
+	@Transactional
+	public List<EvidenceLinkDto> dismissAll(Collection<UUID> ids, String reviewer, String reason) {
+		return reviewAll(ids, LinkDisposition.DISMISSED, reviewer, reason);
+	}
+
+	/**
+	 * <strong>All or none.</strong> If any link is missing or already reviewed, the exception
+	 * rolls back the ones already recorded in this call. A half-applied ruling would leave the
+	 * investigator to work out which of their selection it reached, and a reason written for
+	 * twenty links standing on twelve of them says something they did not.
+	 */
+	private List<EvidenceLinkDto> reviewAll(
+			Collection<UUID> ids, LinkDisposition ruling, String reviewer, String reason) {
+		// Distinct, so a link selected twice is reviewed once rather than refused as a 409
+		// against the ruling this same call just made.
+		return new LinkedHashSet<>(ids).stream().map(id -> review(id, ruling, reviewer, reason)).toList();
 	}
 
 	/**

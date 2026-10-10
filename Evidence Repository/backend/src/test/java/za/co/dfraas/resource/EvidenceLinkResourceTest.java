@@ -129,6 +129,34 @@ class EvidenceLinkResourceTest {
 	}
 
 	@Test
+	@DisplayName("A bulk dismissal applies one reason to the selection, as the authenticated reviewer")
+	void bulkDismissal() throws Exception {
+		UUID other = UUID.fromString("55555555-5555-5555-5555-555555555555");
+		given(service.dismissAll(List.of(LINK_ID, other), "j.mokoena", "Different host."))
+				.willReturn(List.of(sample(LinkDisposition.DISMISSED), sample(LinkDisposition.DISMISSED)));
+
+		mockMvc.perform(post("/api/evidence-links/dismiss")
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("{\"linkIds\":[\"" + LINK_ID + "\",\"" + other + "\"],"
+								+ "\"reason\":\"Different host.\"}"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.length()").value(2))
+				.andExpect(jsonPath("$[0].disposition").value("DISMISSED"));
+	}
+
+	@Test
+	@DisplayName("A bulk ruling with no links selected is a 400, and never reaches the service")
+	void bulkRulingRequiresLinks() throws Exception {
+		mockMvc.perform(post("/api/evidence-links/confirm")
+						.contentType(MediaType.APPLICATION_JSON)
+						.content("{\"linkIds\":[],\"reason\":\"Relevant.\"}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.fieldErrors.linkIds").exists());
+
+		then(service).should(never()).confirmAll(any(), anyString(), anyString());
+	}
+
+	@Test
 	@DisplayName("An unknown link is a 404")
 	void unknownLinkIsNotFound() throws Exception {
 		given(service.findById(LINK_ID)).willThrow(ResourceNotFoundException.of("EvidenceLink", LINK_ID));

@@ -282,8 +282,120 @@ button {
 }
 
 .overview-grid .span-all,
-.custody-panel {
+/* Evidence items: the artifact list on the left, the selected item's metadata and custody
+   ledger stacked on the right. */
+.item-grid {
+    align-items: start;
+}
+
+.item-side {
+    display: grid;
+    gap: 20px;
+    min-width: 0;
+}
+
+/* A list panel never taller than the viewport: its .scroll-body scrolls inside it, and the
+   header, filters and pager stay put. */
+.scroll-panel {
+    display: flex;
+    flex-direction: column;
+    max-height: calc(100vh - 40px);
+}
+
+.scroll-panel .scroll-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+/* An incident's bundle has five wide columns: it takes the full row beneath the list and the
+   incident detail rather than scrolling sideways in one column. */
+.bundle-panel {
     grid-column: 1 / -1;
+}
+
+/* Stays in view while a taller neighbouring column scrolls past — only where nothing sits
+   below it in the same column, or it would slide over that. */
+.sticky-panel {
+    position: sticky;
+    top: 20px;
+    align-self: start;
+}
+
+.scroll-body thead th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--panel);
+}
+
+/* Cells wrap instead of widening the table, so the Inspect column is always on screen. */
+.compact-table th,
+.compact-table td {
+    padding-inline: 8px;
+    white-space: normal;
+}
+
+.compact-table td strong {
+    overflow-wrap: anywhere;
+}
+
+.compact-table td:last-child {
+    text-align: right;
+}
+
+.selected-row td {
+    background: #edfaf7;
+}
+
+.item-side .toolbar {
+    flex-wrap: wrap;
+}
+
+/* The custody ledger as a list: six table columns do not fit the side column. */
+.custody-list {
+    display: grid;
+    gap: 0;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.custody-list li {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+}
+
+.custody-list li small {
+    display: block;
+    color: var(--faint);
+    font-size: .78rem;
+}
+
+.custody-list li p {
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-size: .85rem;
+    line-height: 1.5;
+    overflow-wrap: anywhere;
+}
+
+.custody-entry-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
+.custody-entry-head small {
+    display: inline;
+    margin-left: auto;
+}
+
+.custody-seq {
+    color: var(--ink);
+    font-weight: 800;
 }
 
 .stat-list {
@@ -501,6 +613,11 @@ code {
     text-transform: uppercase;
 }
 
+/* A second heading inside one detail block, such as an incident's member alerts. */
+dl + .detail-kicker {
+    margin-top: 22px;
+}
+
 dl {
     display: grid;
     grid-template-columns: 90px 1fr;
@@ -620,8 +737,27 @@ dd {
     justify-self: start;
 }
 
-.file-field input {
-    padding: 8px;
+/* A bundle's selection, and what can be done to all of it at once. */
+.selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border: 1px solid #a9ded5;
+  border-radius: 2px;
+  background: #edfaf7;
+}
+
+/* Heads each group of links in a bundle: matched by rule, then time overlap only. */
+.group-row-header td {
+  padding-top: 18px;
+  background: #f4f7fb;
+}
+
+.group-row-header td small {
+  white-space: normal;
 }
 
 /* The reason box for confirming or dismissing a link. A textarea, not an input: a reason
@@ -691,6 +827,15 @@ dd {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
+    /* Stacked: sticking would pin the list over the panels below it. */
+    .sticky-panel {
+        position: static;
+    }
+
+    .scroll-panel {
+        max-height: 70vh;
+    }
+
     .header-inner {
         grid-template-columns: auto 1fr;
         gap: 16px;
@@ -743,6 +888,11 @@ dd {
 
     .panel {
         padding: 19px;
+    }
+
+    /* Coverage and digest are on the inspect panel; a phone keeps artifact, status, Inspect. */
+    .compact-table .wide-only {
+        display: none;
     }
 
     .metric-row,

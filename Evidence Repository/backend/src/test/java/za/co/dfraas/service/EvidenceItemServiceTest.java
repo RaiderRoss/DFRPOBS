@@ -13,6 +13,7 @@ import static org.mockito.Mockito.never;
 
 import java.time.OffsetDateTime;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -34,6 +35,7 @@ import za.co.dfraas.exception.DuplicateResourceException;
 import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.exception.ResourceNotFoundException;
 import za.co.dfraas.mapper.EvidenceItemMapper;
+import za.co.dfraas.repository.EvidenceItemIndicatorRepository;
 import za.co.dfraas.repository.EvidenceItemRepository;
 import za.co.dfraas.repository.EvidenceSourceRepository;
 
@@ -81,6 +83,9 @@ class EvidenceItemServiceTest {
 	@Mock
 	private CustodyChainService custodyChainService;
 
+	@Mock
+	private EvidenceItemIndicatorRepository indicatorRepository;
+
 	@Captor
 	private ArgumentCaptor<EvidenceItem> itemCaptor;
 
@@ -96,7 +101,9 @@ class EvidenceItemServiceTest {
 				new EvidenceItemMapper(),
 				new HashingService(),
 				storageService,
-				custodyChainService);
+				custodyChainService,
+				new IndicatorExtractor(),
+				indicatorRepository);
 
 		workGroup = new WorkGroup();
 		workGroup.setId(WORK_GROUP_ID);
@@ -135,6 +142,32 @@ class EvidenceItemServiceTest {
 		assertThat(saved.getSourceArtifactId()).isEqualTo(ARTIFACT_ID);
 		assertThat(saved.getEventStart()).isEqualTo(OffsetDateTime.parse("2026-09-05T14:30:00Z"));
 		assertThat(preserved.currentHash()).isEqualTo(CONTENT_SHA256);
+	}
+
+	@Test
+	@DisplayName("The addresses an artifact mentions are recorded against the item it became")
+	void recordsIndicatorsFromVerifiedBytes() {
+		byte[] content = "SRC=10.99.0.20 DST=10.98.0.1\nSRC=10.99.0.20 DST=10.98.0.1\n".getBytes(UTF_8);
+		givenRegisteredSourceWithNoPriorArtifact();
+		given(storageService.read(STORAGE_REF)).willReturn(content);
+		given(repository.saveAndFlush(any(EvidenceItem.class))).willAnswer(invocation -> {
+			EvidenceItem item = invocation.getArgument(0);
+			item.setId(ITEM_ID);
+			return item;
+		});
+
+		service.preserve(request(new HashingService().sha256Hex(content)), content, "text/plain", PRINCIPAL);
+
+		then(indicatorRepository).should().saveIpv4(ITEM_ID, Set.of("10.98.0.1", "10.99.0.20"));
+	}
+
+	@Test
+	@DisplayName("A rejected artifact records no indicators")
+	void rejectedArtifactRecordsNoIndicators() {
+		assertThatThrownBy(() -> service.preserve(request(OTHER_SHA256), CONTENT, "text/plain", PRINCIPAL))
+				.isInstanceOf(IntegrityVerificationException.class);
+
+		then(indicatorRepository).shouldHaveNoInteractions();
 	}
 
 	/**

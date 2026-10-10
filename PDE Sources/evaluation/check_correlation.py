@@ -15,6 +15,9 @@ What is measured, per incident (one Slips attacker in one window):
                 that records the fraud and the login that committed it
   review load   links an investigator must rule on with incident grouping, against what it
                 would have been had each alert carried its own bundle
+  rule tier     the same recall and precision over AUTO_RULE links only -- those the
+                repository's correlation rules (alert-instant, shared-indicator) proposed
+                above plain time overlap, and which the UI shows first
 
 Plus, for the whole run: artifacts preserved, rejected, and whose repository digest matched
 the digest recorded at capture.
@@ -91,7 +94,10 @@ def score_run(run_dir):
 
         by_source = defaultdict(list)
         foreign, other_window_offsets = 0, []
+        rule_links, rule_own_links, rule_own_sources = 0, 0, set()
         for link in bundle["links"]:
+            is_rule = link["method"] == "AUTO_RULE"
+            rule_links += is_rule
             source = run_keys.get(link["sourceKey"])
             if source is None:
                 foreign += 1  # evidence from outside this run that shares the work group
@@ -99,6 +105,9 @@ def score_run(run_dir):
             stamp = (link["sourceArtifactId"] or "").rsplit("_", 1)[-1]
             if stamp == own["stamp"]:
                 by_source[source].append(link)
+                if is_rule:
+                    rule_own_links += 1
+                    rule_own_sources.add(source)
             else:
                 other_window_offsets.append(
                     (parse(link["eventStart"]) - own_start).total_seconds() / 60.0)
@@ -131,6 +140,10 @@ def score_run(run_dir):
             "reviewLoadPerAlert": total * inc["alertCount"],
             "lateArrivalLinks": sum(l["lateArrival"] for l in bundle["links"]),
             "methods": dict(Counter(l["method"] for l in bundle["links"])),
+            "ruleLinks": rule_links,
+            "ruleOwnSourcesFound": sorted(rule_own_sources),
+            "ruleRecall": len(rule_own_sources) / len(SOURCES),
+            "rulePrecision": rule_own_links / rule_links if rule_links else None,
         })
     incidents.sort(key=lambda i: i["window"])
 
@@ -152,6 +165,10 @@ def score_run(run_dir):
         "perSourceRecall": {s: sum(s in i["ownSourcesFound"] for i in incidents) for s in SOURCES},
         "reviewLoadGrouped": sum(i["reviewLoadGrouped"] for i in incidents),
         "reviewLoadPerAlert": sum(i["reviewLoadPerAlert"] for i in incidents),
+        "ruleLinks": sum(i["ruleLinks"] for i in incidents),
+        "meanRuleRecall": sum(i["ruleRecall"] for i in incidents) / n,
+        "meanRulePrecision": sum(i["rulePrecision"] or 0 for i in incidents) / n,
+        "ruleFraudAuditProposed": sum("banking-audit" in i["ruleOwnSourcesFound"] for i in incidents),
         "incidents": incidents,
     }
     return summary
@@ -186,6 +203,10 @@ def markdown(s):
             "| Per-source recall | %s |" % ", ".join("%s %d/%d" % (k, v, n) for k, v in s["perSourceRecall"].items()),
             "| Links to review, grouped by incident | %d |" % s["reviewLoadGrouped"],
             "| Links to review, one bundle per alert | %d |" % s["reviewLoadPerAlert"],
+            "| Links matched by rule (shown first) | %d |" % s["ruleLinks"],
+            "| Mean recall, rule-matched links only | %.0f%% |" % (100 * s["meanRuleRecall"]),
+            "| Mean precision, rule-matched links only | %.0f%% |" % (100 * s["meanRulePrecision"]),
+            "| Audit trail among rule-matched links | %d of %d |" % (s["ruleFraudAuditProposed"], n),
             ""]
     if s["incidentsMissing"]:
         out += ["**Incidents expected but not found:** " + ", ".join(s["incidentsMissing"]), ""]
@@ -221,6 +242,9 @@ def main():
             ("Audit trail proposed", lambda s: "%d of %d" % (s["fraudAuditProposed"], len(s["incidents"]))),
             ("Links to review (grouped)", lambda s: "%d" % s["reviewLoadGrouped"]),
             ("Links to review (per alert)", lambda s: "%d" % s["reviewLoadPerAlert"]),
+            ("Links matched by rule", lambda s: "%d" % s["ruleLinks"]),
+            ("Rule-tier recall", lambda s: "%.0f%%" % (100 * s["meanRuleRecall"])),
+            ("Rule-tier precision", lambda s: "%.0f%%" % (100 * s["meanRulePrecision"])),
         ]
         for label, fn in rows:
             print("| %s | %s |" % (label, " | ".join(fn(s) for s in summaries)))

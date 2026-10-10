@@ -34,12 +34,15 @@ import za.co.dfraas.entity.EvidenceStatus;
 import za.co.dfraas.entity.Incident;
 import za.co.dfraas.entity.LinkDisposition;
 import za.co.dfraas.entity.LinkMethod;
+import za.co.dfraas.entity.TriggerEvent;
 import za.co.dfraas.entity.WorkGroup;
 import za.co.dfraas.exception.CorrelationException;
+import za.co.dfraas.repository.EvidenceItemIndicatorRepository;
 import za.co.dfraas.repository.EvidenceItemRepository;
 import za.co.dfraas.repository.EvidenceLinkRepository;
 import za.co.dfraas.repository.EvidenceSourceRepository;
 import za.co.dfraas.repository.IncidentRepository;
+import za.co.dfraas.repository.TriggerEventRepository;
 import za.co.dfraas.repository.WorkGroupRepository;
 
 /**
@@ -55,7 +58,8 @@ import za.co.dfraas.repository.WorkGroupRepository;
  */
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
-@Import({TestcontainersConfiguration.class, CorrelationService.class, CorrelationServiceTest.Config.class})
+@Import({TestcontainersConfiguration.class, CorrelationService.class, IndicatorExtractor.class,
+		EvidenceItemIndicatorRepository.class, CorrelationServiceTest.Config.class})
 class CorrelationServiceTest {
 
 	private static final String SHA_256_OF_EMPTY_STRING =
@@ -105,6 +109,12 @@ class CorrelationServiceTest {
 	private WorkGroupRepository workGroupRepository;
 
 	@Autowired
+	private TriggerEventRepository triggerEventRepository;
+
+	@Autowired
+	private EvidenceItemIndicatorRepository indicatorRepository;
+
+	@Autowired
 	private TestEntityManager entityManager;
 
 	private WorkGroup onlineBanking;
@@ -144,6 +154,54 @@ class CorrelationServiceTest {
 		assertThat(link.getLinkedBy()).isNull();
 		assertThat(link.isLateArrival()).isFalse();
 		assertThat(link.getRationale()).contains("ONLINE_BANKING").contains("lookback 1800s");
+	}
+
+	@Test
+	@DisplayName("An item covering the instant an alert fired is proposed by rule, its neighbours by time")
+	void alertInstantRule() {
+		EvidenceItem covering = item(firewall, at("14:25"), at("14:35"));
+		EvidenceItem before = item(firewall, at("14:00"), at("14:20"));
+		Incident scan = alertWithPayload(FIRED_AT, "{}");
+
+		service.correlate(scan.getId());
+
+		assertThat(link(scan, covering).getLinkMethod()).isEqualTo(LinkMethod.AUTO_RULE);
+		assertThat(link(scan, covering).getRationale()).startsWith("Matched alert-instant")
+				.contains(FIRED_AT.toString());
+		assertThat(link(scan, before).getLinkMethod()).isEqualTo(LinkMethod.AUTO_TIME_WINDOW);
+		// A rule changes how a link is graded, never whether it is a finding.
+		assertThat(links(scan)).allSatisfy(link ->
+				assertThat(link.getDisposition()).isEqualTo(LinkDisposition.PROPOSED));
+	}
+
+	@Test
+	@DisplayName("An item mentioning the address the alert names is proposed by rule; a shared server address is not")
+	void sharedIndicatorRule() {
+		EvidenceItem attacker = item(firewall, at("14:00"), at("14:10"));
+		EvidenceItem serverOnly = item(firewall, at("14:10"), at("14:20"));
+		indicatorRepository.saveIpv4(attacker.getId(), List.of("10.98.0.1", "10.99.0.20"));
+		indicatorRepository.saveIpv4(serverOnly.getId(), List.of("10.98.0.1", "10.99.0.11"));
+		// The server appears in the payload's evidence, but only indicators.ip is the subject.
+		Incident scan = alertWithPayload(FIRED_AT,
+				"{\"indicators\":{\"ip\":[\"10.99.0.20\"]},\"slips\":{\"line\":\"from 10.99.0.20 to 10.98.0.1\"}}");
+
+		service.correlate(scan.getId());
+
+		assertThat(link(scan, attacker).getLinkMethod()).isEqualTo(LinkMethod.AUTO_RULE);
+		assertThat(link(scan, attacker).getRationale()).contains("shared-indicator").contains("10.99.0.20")
+				.doesNotContain("10.98.0.1");
+		assertThat(link(scan, serverOnly).getLinkMethod()).isEqualTo(LinkMethod.AUTO_TIME_WINDOW);
+	}
+
+	@Test
+	@DisplayName("An alert whose payload is not JSON is still correlated on time and on its instant")
+	void unreadablePayloadStillCorrelates() {
+		EvidenceItem covering = item(firewall, at("14:25"), at("14:35"));
+		item(firewall, at("14:00"), at("14:10"));
+		Incident alert = alertWithPayload(FIRED_AT, "not json");
+
+		assertThat(service.correlate(alert.getId()).linksAdded()).isEqualTo(2);
+		assertThat(link(alert, covering).getLinkMethod()).isEqualTo(LinkMethod.AUTO_RULE);
 	}
 
 	@Test
@@ -302,6 +360,27 @@ class CorrelationServiceTest {
 			incident.absorb(firedAt);
 		}
 		return incidentRepository.saveAndFlush(incident);
+	}
+
+	/** A one-alert incident whose member trigger event exists, carrying {@code payload}. */
+	private Incident alertWithPayload(OffsetDateTime firedAt, String payload) {
+		Incident incident = incident("slips-ids", firedAt);
+		TriggerEvent event = new TriggerEvent();
+		event.setIncident(incident);
+		event.setSourceSystem("slips-ids");
+		event.setExternalEventId(UUID.randomUUID().toString());
+		event.setTriggerType("SLIPS_ALERT");
+		event.setFiredAt(firedAt);
+		event.setPayload(payload);
+		event.setPayloadSha256(SHA_256_OF_EMPTY_STRING);
+		triggerEventRepository.saveAndFlush(event);
+		return incident;
+	}
+
+	private EvidenceLink link(Incident incident, EvidenceItem item) {
+		return links(incident).stream()
+				.filter(link -> link.getEvidenceItem().getId().equals(item.getId()))
+				.findFirst().orElseThrow();
 	}
 
 	private EvidenceItem item(EvidenceSource source, OffsetDateTime start, OffsetDateTime end) {

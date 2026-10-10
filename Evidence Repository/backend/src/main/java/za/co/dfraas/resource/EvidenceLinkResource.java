@@ -1,6 +1,7 @@
 package za.co.dfraas.resource;
 
 import java.security.Principal;
+import java.util.List;
 import java.util.UUID;
 
 import jakarta.validation.Valid;
@@ -27,6 +28,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import za.co.dfraas.dto.EvidenceLinkDto;
+import za.co.dfraas.dto.LinkBulkReviewRequest;
 import za.co.dfraas.dto.LinkReviewRequest;
 import za.co.dfraas.entity.LinkDisposition;
 import za.co.dfraas.service.EvidenceLinkService;
@@ -162,5 +164,55 @@ public class EvidenceLinkResource {
 			@Valid @RequestBody LinkReviewRequest request,
 			@Parameter(hidden = true) Principal principal) {
 		return ResponseEntity.ok(service.dismiss(id, principal.getName(), request.reason()));
+	}
+
+	@Operation(
+			summary = "Confirm several proposed links with one reason",
+			description = """
+					Each link is recorded exactly as a single confirmation would record it, with the \
+					authenticated reviewer, the time and the reason. All or none: if any link is \
+					missing or already reviewed, nothing is recorded and the response names it.
+					""")
+	@ApiResponse(responseCode = "200", description = "The links, now CONFIRMED, in request order")
+	@ApiResponse(responseCode = "400", description = "No links, too many, or no reason; fieldErrors names it",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "401", description = "Missing or invalid credentials", content = @Content)
+	@ApiResponse(responseCode = "404", description = "A link in the selection does not exist; nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "409", description = "A selected link was already reviewed; nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@PostMapping("/evidence-links/confirm")
+	public ResponseEntity<List<EvidenceLinkDto>> confirmAll(
+			@Valid @RequestBody LinkBulkReviewRequest request,
+			@Parameter(hidden = true) Principal principal) {
+		return ResponseEntity.ok(service.confirmAll(request.linkIds(), principal.getName(), request.reason()));
+	}
+
+	@Operation(
+			summary = "Dismiss several proposed links with one reason",
+			description = """
+					Each link is kept, marked DISMISSED with the authenticated reviewer, the time and \
+					the reason, exactly as a single dismissal records it. All or none: if any link is \
+					missing or already reviewed, nothing is recorded and the response names it.
+					""")
+	@ApiResponse(responseCode = "200", description = "The links, now DISMISSED, in request order")
+	@ApiResponse(responseCode = "400", description = "No links, too many, or no reason; fieldErrors names it",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "401", description = "Missing or invalid credentials", content = @Content)
+	@ApiResponse(responseCode = "404", description = "A link in the selection does not exist; nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "409", description = "A selected link was already reviewed; nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@PostMapping("/evidence-links/dismiss")
+	public ResponseEntity<List<EvidenceLinkDto>> dismissAll(
+			@Valid @RequestBody LinkBulkReviewRequest request,
+			@Parameter(hidden = true) Principal principal) {
+		return ResponseEntity.ok(service.dismissAll(request.linkIds(), principal.getName(), request.reason()));
 	}
 }

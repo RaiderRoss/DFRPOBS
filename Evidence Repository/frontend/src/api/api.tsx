@@ -254,6 +254,13 @@ export const repositoryApi = {
       method: 'POST',
       body: JSON.stringify({ reason }),
     }),
+  // One reason for a selection, recorded on every link as if each were ruled on alone. All or
+  // none: one already-reviewed link refuses the whole selection with a 409 naming it.
+  reviewEvidenceLinks: (ids: string[], ruling: 'confirm' | 'dismiss', reason: string) =>
+    request<EvidenceLink[]>(`/api/evidence-links/${ruling}`, {
+      method: 'POST',
+      body: JSON.stringify({ linkIds: ids, reason }),
+    }),
   getEvidenceItem: (id: string) => request<EvidenceItem>(`/api/evidence-items/${encodeURIComponent(id)}`),
   getCustodyChain: (id: string) => request<CustodyEvent[]>(`/api/evidence-items/${encodeURIComponent(id)}/custody`),
   verifyCustodyChain: (id: string) => request<CustodyChainVerification>(`/api/evidence-items/${encodeURIComponent(id)}/custody/verification`),
@@ -268,17 +275,5 @@ export const repositoryApi = {
       fileName: fileNameFrom(response.headers.get('Content-Disposition'), `evidence-${id}`),
       sha256: sha256FromReprDigest(response.headers.get('Repr-Digest')),
     }
-  },
-  preserveEvidenceItem: (metadata: {
-    sourceKey: string
-    sourceArtifactId: string
-    eventStart: string
-    eventEnd: string
-    sourceSha256: string
-  }, file: File) => {
-    const formData = new FormData()
-    formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }))
-    formData.append('file', file)
-    return request<EvidenceItem>('/api/evidence-items', { method: 'POST', body: formData })
   },
 }

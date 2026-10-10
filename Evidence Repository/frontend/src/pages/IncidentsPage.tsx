@@ -35,12 +35,12 @@ export default function IncidentsPage() {
     useEffect(() => { void load() }, [source])
 
     return <section className="workspace-grid">
-        <article className="panel wide-panel">
+        <article className="panel wide-panel scroll-panel">
             <div className="panel-header"><div><p className="panel-label">GET /api/incidents</p><h2>Incidents</h2></div><span className="chip secure">Read only</span></div>
             <p className="panel-copy">Alerts the source grouped — for Slips, the same attacker in the same timewindow — are one incident with one evidence bundle. Every alert is still kept on the Trigger events tab.</p>
             <div className="toolbar"><input aria-label="Filter by source system" placeholder="Filter source system" value={source} onChange={(event) => setSource(event.target.value)} /><button className="action" type="button" onClick={() => void load()}>Refresh</button></div>
             {error && <p className="error-message">{error}</p>}
-            <div className="event-table-wrap"><table><thead><tr><th>Incident</th><th>Alerts</th><th>Fired</th><th>Status</th><th /></tr></thead><tbody>{incidents.map((row) => <tr key={row.id}>
+            <div className="event-table-wrap scroll-body"><table><thead><tr><th>Incident</th><th>Alerts</th><th>Fired</th><th>Status</th><th /></tr></thead><tbody>{incidents.map((row) => <tr key={row.id}>
                 <td><strong>{row.incidentKey}</strong><small>{row.sourceSystem}</small></td>
                 <td>{row.alertCount}</td>
                 <td>{formatDate(row.firstFiredAt)}{row.lastFiredAt !== row.firstFiredAt && <small>to {formatDate(row.lastFiredAt)}</small>}</td>
@@ -48,9 +48,9 @@ export default function IncidentsPage() {
                 <td><button className="text-button" type="button" onClick={() => void inspect(row.id)}>Inspect</button></td>
             </tr>)}</tbody></table>{incidents.length === 0 && <p className="empty-state">No incidents match this filter.</p>}</div>
         </article>
-        <aside className="panel detail-panel"><p className="panel-label">GET /api/incidents/{'{id}'}</p><h2>Selected incident</h2>
+        <aside className="panel detail-panel scroll-panel"><p className="panel-label">GET /api/incidents/{'{id}'}</p><h2>Selected incident</h2>
             {!selected && <p className="panel-copy">Inspect an incident to see its alerts and review its evidence.</p>}
-            {selected && <div className="detail-block"><span className="detail-kicker">{selected.correlationStatus}</span><strong>{selected.incidentKey}</strong><dl>
+            {selected && <div className="detail-block scroll-body"><span className="detail-kicker">{selected.correlationStatus}</span><strong>{selected.incidentKey}</strong><dl>
                 <dt>Source</dt><dd>{selected.sourceSystem}</dd>
                 <dt>Alerts</dt><dd>{selected.alertCount}</dd>
                 <dt>Search window</dt><dd>{formatDate(selected.windowStart)} — {formatDate(selected.windowEnd)}</dd>
