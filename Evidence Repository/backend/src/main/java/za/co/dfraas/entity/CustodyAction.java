@@ -23,10 +23,6 @@ package za.co.dfraas.entity;
  * <p>So, deliberately absent until the code that would emit them exists:
  *
  * <ul>
- *   <li>{@code EXPORTED} / {@code DOWNLOADED} — there is no retrieval route at all.
- *       {@code SecurityConfiguration} reserves {@code /api/evidence/*&#47;download} for an
- *       OTP step-up it does not implement, so nothing in this application can serve
- *       evidence bytes and nothing could write this entry.</li>
  *   <li>{@code STATUS_CHANGED} — no endpoint or scheduled task changes
  *       {@code EvidenceItem.status} by operator decision. The one status transition that
  *       does exist, to {@code COMPROMISED}, is a consequence of {@link #HASH_MISMATCH} and
@@ -38,7 +34,7 @@ package za.co.dfraas.entity;
  *
  * <p>Adding any of them is one {@code ALTER TABLE} against
  * {@code ck_custody_event_action}, in the same changeset as the code that emits it —
- * changeset {@code 0007} is what that looks like.
+ * changesets {@code 0007} and {@code 0010} are what that looks like.
  */
 public enum CustodyAction {
 
@@ -93,6 +89,28 @@ public enum CustodyAction {
 	 * <p>{@code EvidenceItem.currentHash} is deliberately <em>not</em> updated to the observed
 	 * value. That column is the expectation; overwriting it with the observation would erase
 	 * the discrepancy this entry exists to preserve, and would make a subsequent check pass.
+	 *
+	 * <p>Also written by {@code IntegrityCheckService.export} when an artifact fails the
+	 * re-hash taken before release; nothing is released, and no {@link #EXPORTED} entry
+	 * follows.
 	 */
-	HASH_MISMATCH
+	HASH_MISMATCH,
+
+	/**
+	 * The artifact's bytes were released to the principal named on the entry, after being
+	 * re-hashed and found to match {@code EvidenceItem.currentHash}. Written by
+	 * {@code IntegrityCheckService.export}, in the same transaction as the read.
+	 *
+	 * <p>Reads as expected/observed like {@link #HASH_VERIFIED}, and the two are equal by
+	 * construction: an export that fails the re-hash releases nothing and is recorded as
+	 * {@link #HASH_MISMATCH} instead. So {@code artifactHashAfter} on this entry is the digest
+	 * of exactly the bytes that left, and a copy held outside the system can be checked
+	 * against it.
+	 *
+	 * <p>Every release is an entry, including a second download by the same principal, since
+	 * "how many copies exist and who holds them" is the custody question an export raises.
+	 * Reads that release nothing — listings, metadata, the chain itself — are not recorded
+	 * here; see {@code ACCESSED} above.
+	 */
+	EXPORTED
 }

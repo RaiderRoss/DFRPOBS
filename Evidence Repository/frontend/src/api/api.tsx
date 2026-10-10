@@ -148,9 +148,9 @@ export function hasCredentials() {
   return Boolean(credentials)
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function send(path: string, options: RequestInit, accept: string): Promise<Response> {
   const headers = new Headers(options.headers)
-  headers.set('Accept', 'application/json')
+  headers.set('Accept', accept)
   if (credentials) headers.set('Authorization', `Basic ${credentials}`)
   if (options.body && !(options.body instanceof FormData)) headers.set('Content-Type', 'application/json')
 
@@ -159,7 +159,42 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const problem = await response.json().catch(() => ({})) as { detail?: string; title?: string }
     throw new Error(problem.detail ?? problem.title ?? `${response.status} ${response.statusText}`)
   }
+  return response
+}
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await send(path, options, 'application/json')
   return response.status === 204 ? (undefined as T) : response.json() as Promise<T>
+}
+
+/** A released artifact: the bytes, the name the server gave them, and their digest as sent. */
+export type EvidenceDownload = {
+  blob: Blob
+  fileName: string
+  // Hex SHA-256 from the Repr-Digest header, or null if the header was missing or unreadable.
+  sha256: string | null
+}
+
+/** `filename*=UTF-8''…` (RFC 6266) wins over plain `filename="…"` when both are present. */
+function fileNameFrom(disposition: string | null, fallback: string) {
+  if (!disposition) return fallback
+  const extended = /filename\*=UTF-8''([^;]+)/i.exec(disposition)
+  if (extended) return decodeURIComponent(extended[1])
+  const plain = /filename="((?:\\.|[^"\\])*)"/i.exec(disposition)
+  return plain ? plain[1].replace(/\\(.)/g, '$1') : fallback
+}
+
+/** RFC 9530 `sha-256=:<base64>:` to lower-case hex, the form the rest of the API uses. */
+function sha256FromReprDigest(header: string | null) {
+  const match = header && /sha-256=:([^:]+):/.exec(header)
+  if (!match) return null
+  return Array.from(atob(match[1]), (char) => char.charCodeAt(0).toString(16).padStart(2, '0')).join('')
+}
+
+/** Lower-case hex SHA-256 of a blob, computed in the browser. */
+export async function sha256Hex(blob: Blob) {
+  const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export const repositoryApi = {
@@ -223,6 +258,17 @@ export const repositoryApi = {
   getCustodyChain: (id: string) => request<CustodyEvent[]>(`/api/evidence-items/${encodeURIComponent(id)}/custody`),
   verifyCustodyChain: (id: string) => request<CustodyChainVerification>(`/api/evidence-items/${encodeURIComponent(id)}/custody/verification`),
   checkEvidenceIntegrity: (id: string) => request<IntegrityCheckResult>(`/api/evidence-items/${encodeURIComponent(id)}/integrity-checks`, { method: 'POST' }),
+  // The only call that returns evidence bytes. The server re-hashes them before release and
+  // appends an EXPORTED custody entry; a mismatch is refused with 422 and nothing is sent.
+  // Accepts problem+json too, so a refusal arrives with its explanation.
+  downloadEvidenceItem: async (id: string): Promise<EvidenceDownload> => {
+    const response = await send(`/api/evidence-items/${encodeURIComponent(id)}/content`, {}, 'application/octet-stream, application/problem+json')
+    return {
+      blob: await response.blob(),
+      fileName: fileNameFrom(response.headers.get('Content-Disposition'), `evidence-${id}`),
+      sha256: sha256FromReprDigest(response.headers.get('Repr-Digest')),
+    }
+  },
   preserveEvidenceItem: (metadata: {
     sourceKey: string
     sourceArtifactId: string

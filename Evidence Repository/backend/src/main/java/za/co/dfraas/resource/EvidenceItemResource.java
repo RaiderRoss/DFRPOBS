@@ -2,6 +2,9 @@ package za.co.dfraas.resource;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+import java.util.HexFormat;
 import java.util.UUID;
 
 import jakarta.validation.Valid;
@@ -12,6 +15,11 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.web.PageableDefault;
 import org.springframework.data.web.PagedModel;
+import org.springframework.http.CacheControl;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
@@ -20,6 +28,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
@@ -32,9 +41,11 @@ import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import za.co.dfraas.dto.EvidenceExport;
 import za.co.dfraas.dto.EvidenceIngestRequest;
 import za.co.dfraas.dto.EvidenceItemDto;
 import za.co.dfraas.dto.IntegrityCheckResult;
+import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.service.EvidenceItemService;
 import za.co.dfraas.service.IntegrityCheckService;
 
@@ -55,17 +66,18 @@ import za.co.dfraas.service.IntegrityCheckService;
  * coverage window — is a different act with a different provenance story, and belongs in an
  * endpoint that says so rather than in this one with fields left blank.
  *
- * <p><strong>No download endpoint here.</strong> {@code SecurityConfiguration} reserves
- * {@code /api/evidence/*&#47;download} for the OTP step-up it does not yet implement, and
- * adding a retrieval route before that exists would put evidence bytes behind nothing but a
- * password. Responses carry the digest instead, which is enough to verify a copy obtained
- * through whatever gated route lands later.
+ * <p><strong>One route releases bytes, and it is verified and recorded.</strong>
+ * {@code GET /{id}/content} re-hashes the stored object before releasing it, refuses one
+ * that no longer matches, and appends an {@code EXPORTED} custody entry for every release.
+ * Every other response carries the digest and never the bytes. The route is behind
+ * authentication only: the OTP step-up the README describes for export needs a user model
+ * this prototype does not have, and is stated there as future work.
  *
- * <p><strong>The integrity check lives here, the custody ledger does not.</strong>
- * {@code POST /{id}/integrity-checks} is an operation <em>on the artifact</em> — it reads
- * the stored bytes — and it happens to append a custody entry, the same way preservation
- * does. Reading the chain is a different concern with its own resource,
- * {@code CustodyResource}, nested under the same item.
+ * <p><strong>The integrity check and the export live here, the custody ledger does
+ * not.</strong> Both are operations <em>on the artifact</em> — they read the stored bytes —
+ * and they happen to append a custody entry, the same way preservation does. Reading the
+ * chain is a different concern with its own resource, {@code CustodyResource}, nested under
+ * the same item.
  */
 @RestController
 @RequestMapping("/api/evidence-items")
@@ -74,12 +86,16 @@ import za.co.dfraas.service.IntegrityCheckService;
 				Artifacts preserved from registered sources. Uploads are verified on arrival — the \
 				digest the source computed at capture is checked against one recomputed here, and \
 				again after storage — and deduped on the producer's own artifact id, so a re-sent \
-				artifact is never preserved twice. Responses carry the digest, never the bytes or \
-				the storage key.
+				artifact is never preserved twice. Responses carry the digest, never the storage \
+				key; the bytes leave only through /content, which re-hashes them first and records \
+				each release in the chain of custody.
 				""")
 public class EvidenceItemResource {
 
 	private static final String DEFAULT_CONTENT_TYPE = MediaType.APPLICATION_OCTET_STREAM_VALUE;
+
+	/** RFC 9530's header for the digest of the representation sent. */
+	static final String REPR_DIGEST = "Repr-Digest";
 
 	private final EvidenceItemService service;
 	private final IntegrityCheckService integrityCheckService;
@@ -253,6 +269,90 @@ public class EvidenceItemResource {
 			@PathVariable("id") UUID id,
 			@Parameter(hidden = true) Authentication authentication) {
 		return ResponseEntity.ok(integrityCheckService.check(id, principalOf(authentication)));
+	}
+
+	/**
+	 * Releases the artifact's bytes, re-hashed first, and records the release.
+	 *
+	 * <p><strong>A {@code GET} that writes to the ledger</strong>, unlike the integrity check,
+	 * which is a {@code POST} so that an idle request cannot append to the chain. The
+	 * difference is that every {@code GET} here that succeeds does release the bytes, so the
+	 * {@code EXPORTED} entry it writes is true whoever or whatever sent it — a prefetch that
+	 * received the evidence is an export, and the chain should say so. What would make an
+	 * entry false is a request that records a release without making one, which is why
+	 * {@link #headContent} refuses {@code HEAD} rather than letting Spring answer it by running
+	 * this method and discarding the body.
+	 *
+	 * <p><strong>422 on a mismatch, unlike the integrity check's 200.</strong> The caller asked
+	 * for the bytes and is not getting them, so the request did fail; the body is a problem
+	 * document rather than a finding to be read. The finding itself has already been
+	 * committed by the service — this exception is thrown after it returns.
+	 *
+	 * <p>Always {@code application/octet-stream} as an attachment, whatever content type the
+	 * producer sent at upload: a browser must not render evidence inline, and nothing here
+	 * should be interpreting it. The file name is the producer's artifact id. The digest of the
+	 * released bytes is in {@code Repr-Digest} (RFC 9530), so a client can check its copy on
+	 * receipt without a second request.
+	 */
+	@Operation(
+			summary = "Download a preserved artifact, verified",
+			description = """
+					Reads the stored object back and re-hashes it before releasing anything. On a \
+					match, returns the bytes as an attachment with their SHA-256 in Repr-Digest, and \
+					appends an EXPORTED custody entry attributed to the caller. On a mismatch, \
+					releases nothing, appends HASH_MISMATCH, marks the item COMPROMISED and returns \
+					422. Every successful download is a separate custody entry.
+					""")
+	@ApiResponse(responseCode = "200", description = "The artifact's bytes, verified against the recorded digest",
+			content = @Content(mediaType = MediaType.APPLICATION_OCTET_STREAM_VALUE))
+	@ApiResponse(responseCode = "401", description = "Missing or invalid credentials", content = @Content)
+	@ApiResponse(responseCode = "404", description = "No evidence item with that id",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "422",
+			description = "The stored object no longer matches its digest; nothing released, finding recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@ApiResponse(responseCode = "503",
+			description = "The evidence store is unreachable; nothing was released and nothing was recorded",
+			content = @Content(mediaType = "application/problem+json",
+					schema = @Schema(implementation = ProblemDetail.class)))
+	@GetMapping("/{id}/content")
+	public ResponseEntity<byte[]> content(
+			@Parameter(description = "Evidence item id", example = "c4d1f7a2-33b8-4e19-9a06-5f2b8e4c1d73")
+			@PathVariable("id") UUID id,
+			@Parameter(hidden = true) Authentication authentication) {
+
+		EvidenceExport export = integrityCheckService.export(id, principalOf(authentication));
+		if (!export.released()) {
+			throw IntegrityVerificationException.exportRefused(id);
+		}
+
+		String fileName = export.sourceArtifactId() != null ? export.sourceArtifactId() : "evidence-" + id;
+		return ResponseEntity.ok()
+				.contentType(MediaType.APPLICATION_OCTET_STREAM)
+				.contentLength(export.content().length)
+				.header(HttpHeaders.CONTENT_DISPOSITION,
+						ContentDisposition.attachment().filename(fileName, StandardCharsets.UTF_8).build().toString())
+				.header(REPR_DIGEST, reprDigestOf(export.sha256()))
+				.cacheControl(CacheControl.noStore())
+				.body(export.content());
+	}
+
+	/**
+	 * Refuses {@code HEAD} on the content route. Spring would otherwise answer it by running
+	 * {@link #content} and discarding the body, which would append an {@code EXPORTED} entry
+	 * for a release that never happened.
+	 */
+	@Operation(hidden = true)
+	@RequestMapping(value = "/{id}/content", method = RequestMethod.HEAD)
+	public ResponseEntity<Void> headContent(@PathVariable("id") UUID id) {
+		return ResponseEntity.status(HttpStatus.METHOD_NOT_ALLOWED).allow(HttpMethod.GET).build();
+	}
+
+	/** RFC 9530: the algorithm, then the digest as base64 between colons. */
+	private static String reprDigestOf(String sha256Hex) {
+		return "sha-256=:" + Base64.getEncoder().encodeToString(HexFormat.of().parseHex(sha256Hex)) + ":";
 	}
 
 	/**

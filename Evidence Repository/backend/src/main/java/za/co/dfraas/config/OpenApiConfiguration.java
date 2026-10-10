@@ -35,8 +35,9 @@ import io.swagger.v3.oas.annotations.servers.Server;
 
 						Trigger events arrive over Kafka and are recorded idempotently; this API \
 						reads them back. Every endpoint outside the actuator health probe and these \
-						docs requires authentication, and evidence download will additionally \
-						require an OTP step-up once 2FA lands.
+						docs requires authentication. Evidence download re-hashes the artifact before \
+						releasing it and records each release in its chain of custody; an OTP step-up \
+						on download is future work.
 						"""),
 		servers = @Server(url = "/", description = "This instance"),
 		security = @SecurityRequirement(name = OpenApiConfiguration.BASIC_AUTH))

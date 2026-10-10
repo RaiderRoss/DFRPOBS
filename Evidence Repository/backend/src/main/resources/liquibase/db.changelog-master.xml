@@ -44,4 +44,8 @@
          bundle move from trigger_event to incident; every alert is still recorded. -->
     <include file="changes/0009-create-incident.xml" relativeToChangelogFile="true"/>
 
+    <!-- Verified export: widens the custody action list to record each release of an
+         artifact's bytes. Must follow 0007. -->
+    <include file="changes/0010-widen-custody-actions-for-export.xml" relativeToChangelogFile="true"/>
+
 </databaseChangeLog>
