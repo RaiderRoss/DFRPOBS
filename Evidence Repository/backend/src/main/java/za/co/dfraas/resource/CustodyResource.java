@@ -28,9 +28,10 @@ import za.co.dfraas.service.CustodyChainService;
  * <p><strong>Read-only, and deliberately so.</strong> Nothing here appends: a custody entry
  * is written by the action it records, in that action's transaction, and an endpoint that
  * accepted one directly would be a way of asserting that something happened to an exhibit
- * without it having happened. The two writers that exist are the ingest path
- * ({@code CREATED}) and the integrity check ({@code HASH_VERIFIED} / {@code HASH_MISMATCH});
- * each lives beside the operation it describes.
+ * without it having happened. The writers that exist are the ingest path ({@code CREATED}),
+ * the integrity check ({@code HASH_VERIFIED} / {@code HASH_MISMATCH}) and the verified
+ * export ({@code EXPORTED}, or {@code HASH_MISMATCH} when it refuses); each lives beside the
+ * operation it describes.
  *
  * <p><strong>Two endpoints, not one.</strong> The chain and its verification are separate
  * answers and are kept in separate responses, so that what the ledger says and whether it

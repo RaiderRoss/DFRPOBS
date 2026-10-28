@@ -1,0 +1,174 @@
+{
+  "tag": "tamper",
+  "nonce": "20261004T183512",
+  "window": "20260930230812_port-scan",
+  "artifact": "firewall_20260930230812.log",
+  "artifactSha256": "675c6252384fcc6253eaebb00297a54b2a5f647e90c4627bd2302b099f42c0b4",
+  "sourceKey": "pde-sim-ufw-01-tamper",
+  "databaseRoleIsSuperuser": true,
+  "finishedAt": "2026-10-04T18:35:16.342255+00:00",
+  "results": [
+    {
+      "test": "T1",
+      "attack": "Artifact altered in transit: one byte flipped, original digest claimed",
+      "expected": "HTTP 422; nothing stored",
+      "outcome": "REJECTED",
+      "passed": true,
+      "details": {
+        "httpStatus": 422,
+        "response": {
+          "detail": "Integrity check failed for artifact firewall_20260930230812_t1_20261004T183512: the digest computed on arrival does not match the digest the source asserted",
+          "instance": "/api/evidence-items",
+          "status": 422,
+          "title": "Evidence integrity check failed"
+        },
+        "objectStoredAfterRejection": false,
+        "genuineRetryHttpStatus": 201
+      }
+    },
+    {
+      "test": "T2",
+      "attack": "Evidence altered in storage: object overwritten in MinIO, bypassing the API",
+      "expected": "HASH_MISMATCH recorded; item COMPROMISED; recorded digest kept; stays COMPROMISED after the object is restored",
+      "outcome": "DETECTED",
+      "passed": true,
+      "details": {
+        "itemId": "5d84f029-4f66-41be-8acb-a7e392f9fdad",
+        "expectedHash": "675c6252384fcc6253eaebb00297a54b2a5f647e90c4627bd2302b099f42c0b4",
+        "observedHash": "d8a020e4c21292d4b656fc464c06feb210763604b81ca5c8d95dad36986897d2",
+        "statusAfterMismatch": "COMPROMISED",
+        "currentHashAfterMismatch": "675c6252384fcc6253eaebb00297a54b2a5f647e90c4627bd2302b099f42c0b4",
+        "statusAfterRestore": "COMPROMISED",
+        "chainActions": [
+          "CREATED",
+          "HASH_VERIFIED",
+          "HASH_MISMATCH",
+          "HASH_VERIFIED"
+        ],
+        "chainIntactAfter": true,
+        "chainBefore": {
+          "evidenceItemId": "5d84f029-4f66-41be-8acb-a7e392f9fdad",
+          "intact": true,
+          "missingOrigin": false,
+          "firstDivergentSequence": null,
+          "length": 2,
+          "headEntryHash": "458ecc8617c20226f0041fcf6927c76c564b9848df47b4093059984bdbd9ea7f"
+        }
+      }
+    },
+    {
+      "test": "T3",
+      "attack": "Custody entry edited in the database: performed_by of entry 1 rewritten",
+      "expected": "PREVENTED, or DETECTED at sequence 1",
+      "outcome": "DETECTED",
+      "passed": true,
+      "details": {
+        "itemId": "3c24f6e4-c450-4aa3-9dac-caa9eb6ddbdc",
+        "before": {
+          "evidenceItemId": "3c24f6e4-c450-4aa3-9dac-caa9eb6ddbdc",
+          "intact": true,
+          "missingOrigin": false,
+          "firstDivergentSequence": null,
+          "length": 3,
+          "headEntryHash": "aa07bb2ef6ae15025b0d1c8a3a9a15a44569faf7d4bfa9d63b196ff0103e625f"
+        },
+        "verification": {
+          "evidenceItemId": "3c24f6e4-c450-4aa3-9dac-caa9eb6ddbdc",
+          "intact": false,
+          "missingOrigin": false,
+          "firstDivergentSequence": 1,
+          "length": 3,
+          "headEntryHash": null
+        }
+      }
+    },
+    {
+      "test": "T4a",
+      "attack": "Custody entries reordered: entries 1 and 2 swapped",
+      "expected": "PREVENTED, or DETECTED at sequence 1",
+      "outcome": "DETECTED",
+      "passed": true,
+      "details": {
+        "itemId": "1f09c28a-5b14-4b3c-9a44-2956cd95429b",
+        "before": {
+          "evidenceItemId": "1f09c28a-5b14-4b3c-9a44-2956cd95429b",
+          "intact": true,
+          "missingOrigin": false,
+          "firstDivergentSequence": null,
+          "length": 3,
+          "headEntryHash": "8da2740944fb1742d46a4e372602bad8e5dc5162872eb25b108a72f4329540d8"
+        },
+        "verification": {
+          "evidenceItemId": "1f09c28a-5b14-4b3c-9a44-2956cd95429b",
+          "intact": false,
+          "missingOrigin": false,
+          "firstDivergentSequence": 1,
+          "length": 3,
+          "headEntryHash": null
+        }
+      }
+    },
+    {
+      "test": "T4b",
+      "attack": "Custody entry deleted from the middle of the chain (entry 1 of 0-2)",
+      "expected": "PREVENTED, or DETECTED at sequence 1 (the hole)",
+      "outcome": "DETECTED",
+      "passed": true,
+      "details": {
+        "itemId": "3cccdd99-0f8e-4e59-b7b1-e8608e0a0b10",
+        "before": {
+          "evidenceItemId": "3cccdd99-0f8e-4e59-b7b1-e8608e0a0b10",
+          "intact": true,
+          "missingOrigin": false,
+          "firstDivergentSequence": null,
+          "length": 3,
+          "headEntryHash": "ac3893c443c8a60e15fce6521d7f4146bd7a96ed1218d2d20595b7730bcb4094"
+        },
+        "verification": {
+          "evidenceItemId": "3cccdd99-0f8e-4e59-b7b1-e8608e0a0b10",
+          "intact": false,
+          "missingOrigin": false,
+          "firstDivergentSequence": 1,
+          "length": 2,
+          "headEntryHash": null
+        }
+      }
+    },
+    {
+      "test": "T5",
+      "attack": "Custody chain truncated: newest entry deleted",
+      "expected": "UNDETECTED by chain verification (known limitation); would be caught by a head hash witnessed outside the database",
+      "outcome": "UNDETECTED",
+      "passed": true,
+      "details": {
+        "itemId": "9d44027c-9647-407b-b19b-532edfd7c34f",
+        "lengthBefore": 3,
+        "lengthAfter": 2,
+        "headBefore": "83366fc91359deb1147b285ac6bcc40f4d283970df0846761ba7406cb7d63d0b",
+        "headAfter": "10146b2e0d031eae59679d8ccacb8fc34f056b49f13eb5e30ba3ee6aa560f0b5",
+        "externalWitnessWouldDetect": true,
+        "verification": {
+          "evidenceItemId": "9d44027c-9647-407b-b19b-532edfd7c34f",
+          "intact": true,
+          "missingOrigin": false,
+          "firstDivergentSequence": null,
+          "length": 2,
+          "headEntryHash": "10146b2e0d031eae59679d8ccacb8fc34f056b49f13eb5e30ba3ee6aa560f0b5"
+        }
+      }
+    },
+    {
+      "test": "T6",
+      "attack": "Duplicate submission: an already preserved artifact sent again",
+      "expected": "HTTP 409; no second item; custody chain unchanged",
+      "outcome": "REJECTED",
+      "passed": true,
+      "details": {
+        "itemId": "5168fff3-5c9c-41c8-aa8a-4613950f8029",
+        "httpStatus": 409,
+        "chainLengthBefore": 1,
+        "chainLengthAfter": 1
+      }
+    }
+  ]
+}

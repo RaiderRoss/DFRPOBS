@@ -1,5 +1,7 @@
 package za.co.dfraas.exception;
 
+import java.util.UUID;
+
 /**
  * Thrown when bytes fail to hash to the digest they were expected to. Translated to 422 by
  * {@code ApiExceptionHandler}.
@@ -43,5 +45,20 @@ public class IntegrityVerificationException extends RuntimeException {
 		return new IntegrityVerificationException(
 				"Integrity check failed for artifact " + sourceArtifactId
 						+ ": the object read back from storage does not match the bytes that arrived");
+	}
+
+	/**
+	 * The stored object no longer hashes to the digest recorded at preservation, so it was not
+	 * released. Unlike the two ingest cases, the finding has already been recorded — thrown
+	 * only after the transaction that appended {@code HASH_MISMATCH} and marked the item
+	 * {@code COMPROMISED} has committed — so the message says so, and names the item by the
+	 * id the caller asked for.
+	 */
+	public static IntegrityVerificationException exportRefused(UUID evidenceItemId) {
+		return new IntegrityVerificationException(
+				"Export refused for evidence item " + evidenceItemId
+						+ ": the stored object does not match the digest recorded at preservation. Nothing was"
+						+ " released; the finding is recorded in the item's chain of custody and the item is"
+						+ " marked COMPROMISED");
 	}
 }

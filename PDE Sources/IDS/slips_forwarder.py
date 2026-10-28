@@ -57,13 +57,14 @@ from datetime import datetime, timezone
 IP = r"\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f]*:[0-9A-Fa-f:]+"
 
 # "<iso>: Src IP 10.99.0.20                . Generated an alert given enough evidence on
-#  timewindow 1. (real time <iso>)". "Is blocked" is the same verdict from a Slips run
+#  timewindow 1. (real time: <iso>)". "Is blocked" is the same verdict from a Slips run
 # with blocking enabled. The colon straight after the timestamp is what distinguishes an
-# alert line from an evidence line, which puts a space there.
+# alert line from an evidence line, which puts a space there. Slips 1.1.23 writes a colon
+# after "real time"; the colon is optional here so older output still matches.
 ALERT_RE = re.compile(
     r"^(?P<ts>\S+?):\s+Src IP\s+(?P<ip>" + IP + r")\s*\.\s+"
     r"(?P<verdict>Generated an alert|Is blocked) given enough evidence on timewindow\s+(?P<tw>\d+)"
-    r"(?:.*?\(real time\s+(?P<real>[^)]+)\))?")
+    r"(?:.*?\(real time:?\s+(?P<real>[^)]+)\))?")
 
 SRC_IP_RE = re.compile(r"Src IP\s+(?P<ip>" + IP + ")")
 
@@ -213,6 +214,10 @@ class Forwarder:
             "incidentKey": "%s/%s/tw%s" % (self.session, m.group("ip"), m.group("tw")),
             "triggerType": TRIGGER_TYPES[m.group("verdict")],
             "firedAt": iso(fired),
+            # What the alert is about, for the repository's shared-indicator rule: the
+            # address Slips raised it against. Only this list is matched -- the evidence
+            # below also names the bank's own server, which every artifact mentions.
+            "indicators": {"ip": [m.group("ip")]},
             # Ignored by the consumer's parser but kept in the payload it stores, which is
             # the point: the trigger event retains the alert as Slips wrote it.
             "slips": {

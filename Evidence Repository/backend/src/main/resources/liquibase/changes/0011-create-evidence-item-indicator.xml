@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        Indicators: the network addresses each preserved artifact mentions, extracted from
+        its bytes at ingest.
+
+        Time overlap alone proposes every artifact a classification produced around an
+        incident — tens per bundle in the evaluation — and gives an investigator no way to
+        tell the ones worth opening first. This table is what lets correlation match on
+        something narrower: an artifact that names the address an alert is about.
+
+        Derived by the repository from the bytes it preserved, never asserted by the
+        producer, so the same artifact always yields the same rows and anyone holding the
+        bytes can reproduce them. Written once, in the ingest transaction, and never
+        updated: like the artifact itself, what it contains does not change.
+    -->
+
+    <changeSet id="0011-1" author="dfraas-team">
+        <comment>Creates evidence_item_indicator — addresses each artifact mentions</comment>
+        <createTable tableName="evidence_item_indicator">
+            <column name="evidence_item_id" type="UUID">
+                <constraints nullable="false"
+                             foreignKeyName="fk_evidence_item_indicator_item"
+                             referencedTableName="evidence_item" referencedColumnNames="id"/>
+            </column>
+            <!-- One type today. VARCHAR + CHECK, matching every other enum-like column, so
+                 an account or host type is a widened CHECK and not a new table. -->
+            <column name="indicator_type" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="indicator_value" type="VARCHAR(255)">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addPrimaryKey tableName="evidence_item_indicator"
+                       columnNames="evidence_item_id, indicator_type, indicator_value"
+                       constraintName="pk_evidence_item_indicator"/>
+        <sql>
+            ALTER TABLE evidence_item_indicator
+                ADD CONSTRAINT ck_evidence_item_indicator_type CHECK (indicator_type IN ('IPV4'));
+        </sql>
+        <rollback>
+            <dropTable tableName="evidence_item_indicator"/>
+        </rollback>
+    </changeSet>
+
+    <changeSet id="0011-2" author="dfraas-team">
+        <comment>Index for "which artifacts mention this address"</comment>
+        <createIndex tableName="evidence_item_indicator" indexName="ix_evidence_item_indicator_value">
+            <column name="indicator_type"/>
+            <column name="indicator_value"/>
+        </createIndex>
+    </changeSet>
+
+</databaseChangeLog>

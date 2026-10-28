@@ -23,6 +23,7 @@ import org.springframework.boot.jpa.test.autoconfigure.TestEntityManager;
 import org.springframework.context.annotation.Import;
 
 import za.co.dfraas.TestcontainersConfiguration;
+import za.co.dfraas.dto.EvidenceExport;
 import za.co.dfraas.dto.IntegrityCheckResult;
 import za.co.dfraas.entity.CustodyAction;
 import za.co.dfraas.entity.CustodyEvent;
@@ -63,7 +64,8 @@ class IntegrityCheckServiceTest {
 	private static final String OTHER_SHA256 =
 			"82e35a63ceba37e9646434c5dd412ea577147f1e4a41ccde1614253187e3dbf9";
 
-	private static final String STORAGE_REF = "pde-sim-ufw-01/firewall_20260905143000";
+	private static final String ARTIFACT_ID = "firewall_20260905143000";
+	private static final String STORAGE_REF = "pde-sim-ufw-01/" + ARTIFACT_ID;
 	private static final String PRINCIPAL = "j.mokoena";
 
 	/** Pinned, so the test can assert on exactly what was stamped into the entry and hashed. */
@@ -261,6 +263,129 @@ class IntegrityCheckServiceTest {
 	@DisplayName("Checking an artifact that does not exist is a not-found")
 	void unknownItemIsNotFound() {
 		assertThatThrownBy(() -> service.check(UUID.randomUUID(), PRINCIPAL))
+				.isInstanceOf(ResourceNotFoundException.class);
+	}
+
+	@Test
+	@DisplayName("Export releases intact bytes and records EXPORTED with the digest of what was released")
+	void exportReleasesIntactBytesAndRecordsExported() {
+		given(storageService.read(STORAGE_REF)).willReturn(CONTENT);
+
+		EvidenceExport export = service.export(item.getId(), PRINCIPAL);
+
+		assertThat(export.released()).isTrue();
+		assertThat(export.content()).isEqualTo(CONTENT);
+		assertThat(export.sha256()).isEqualTo(CONTENT_SHA256);
+		// A manually built item, with no source behind it and so no producer artifact id.
+		assertThat(export.sourceArtifactId()).isNull();
+		assertThat(export.status()).isEqualTo(EvidenceStatus.PRESERVED);
+		assertThat(export.custodyEvent().action()).isEqualTo(CustodyAction.EXPORTED);
+
+		CustodyEvent entry = headOfChain();
+		assertThat(entry.getSequence()).isEqualTo(1L);
+		assertThat(entry.getAction()).isEqualTo(CustodyAction.EXPORTED);
+		assertThat(entry.getPerformedBy()).isEqualTo(PRINCIPAL);
+		assertThat(entry.getArtifactHashBefore()).isEqualTo(CONTENT_SHA256);
+		assertThat(entry.getArtifactHashAfter()).isEqualTo(CONTENT_SHA256);
+		assertThat(entry.getOccurredAt()).isEqualTo(OffsetDateTime.ofInstant(CHECKED_AT, ZoneOffset.UTC));
+		assertThat(entry.getDetail()).contains("before export").contains("Released 5 bytes");
+
+		assertThat(reloadedItem().getStatus()).isEqualTo(EvidenceStatus.PRESERVED);
+	}
+
+	/**
+	 * The point of verifying on export: bytes that no longer match are never handed over, and
+	 * the finding is recorded exactly as an on-demand check would record it.
+	 */
+	@Test
+	@DisplayName("Export of a mismatched object releases nothing, records HASH_MISMATCH and marks COMPROMISED")
+	void exportOfMismatchedObjectReleasesNothing() {
+		given(storageService.read(STORAGE_REF)).willReturn(OTHER_CONTENT);
+
+		EvidenceExport export = service.export(item.getId(), PRINCIPAL);
+
+		assertThat(export.released()).isFalse();
+		assertThat(export.content()).isNull();
+		assertThat(export.sha256()).isEqualTo(OTHER_SHA256);
+		assertThat(export.status()).isEqualTo(EvidenceStatus.COMPROMISED);
+
+		CustodyEvent entry = headOfChain();
+		assertThat(entry.getAction()).isEqualTo(CustodyAction.HASH_MISMATCH);
+		assertThat(entry.getArtifactHashBefore()).isEqualTo(CONTENT_SHA256);
+		assertThat(entry.getArtifactHashAfter()).isEqualTo(OTHER_SHA256);
+		assertThat(entry.getDetail())
+				.contains("before export")
+				.contains("from PRESERVED to COMPROMISED")
+				.contains("Export refused");
+		// No EXPORTED entry: the chain must never claim a release that did not happen.
+		assertThat(custodyEventRepository.findByEvidenceItemIdOrderBySequenceAsc(item.getId()))
+				.extracting(CustodyEvent::getAction)
+				.doesNotContain(CustodyAction.EXPORTED);
+
+		EvidenceItem reloaded = reloadedItem();
+		assertThat(reloaded.getStatus()).isEqualTo(EvidenceStatus.COMPROMISED);
+		assertThat(reloaded.getCurrentHash()).isEqualTo(CONTENT_SHA256);
+	}
+
+	/**
+	 * EXPORTED has to be accepted by {@code ck_custody_event_action} (changeset {@code 0010})
+	 * and hash into the chain like any other entry. Each download is its own entry.
+	 */
+	@Test
+	@DisplayName("Repeated exports are separate entries and the chain still verifies")
+	void repeatedExportsAreSeparateEntriesAndChainVerifies() {
+		given(storageService.read(STORAGE_REF)).willReturn(CONTENT, CONTENT, OTHER_CONTENT);
+
+		service.export(item.getId(), PRINCIPAL);
+		service.export(item.getId(), "a.naidoo");
+		service.export(item.getId(), PRINCIPAL);
+		entityManager.flush();
+		entityManager.clear();
+
+		List<CustodyEvent> chain = custodyEventRepository.findByEvidenceItemIdOrderBySequenceAsc(item.getId());
+		assertThat(chain).extracting(CustodyEvent::getAction).containsExactly(
+				CustodyAction.CREATED, CustodyAction.EXPORTED, CustodyAction.EXPORTED, CustodyAction.HASH_MISMATCH);
+		assertThat(chain).extracting(CustodyEvent::getPerformedBy)
+				.containsExactly(PRINCIPAL, PRINCIPAL, "a.naidoo", PRINCIPAL);
+		assertThat(custodyChainService.verify(item.getId()).intact()).isTrue();
+	}
+
+	/**
+	 * The gate is the digest, not the status: bytes that match the recorded digest are the
+	 * ones preserved, whatever happened in between, and the entry says what the status is.
+	 */
+	@Test
+	@DisplayName("A compromised item whose object matches again is released, and stays COMPROMISED")
+	void compromisedItemThatMatchesIsReleased() {
+		given(storageService.read(STORAGE_REF)).willReturn(OTHER_CONTENT, CONTENT);
+		service.check(item.getId(), PRINCIPAL);
+
+		EvidenceExport export = service.export(item.getId(), PRINCIPAL);
+
+		assertThat(export.released()).isTrue();
+		assertThat(export.status()).isEqualTo(EvidenceStatus.COMPROMISED);
+		assertThat(headOfChain().getAction()).isEqualTo(CustodyAction.EXPORTED);
+		assertThat(headOfChain().getDetail()).contains("COMPROMISED from an earlier mismatch");
+		assertThat(reloadedItem().getStatus()).isEqualTo(EvidenceStatus.COMPROMISED);
+	}
+
+	@Test
+	@DisplayName("A storage failure on export releases nothing and records nothing")
+	void exportStorageFailureRecordsNothing() {
+		given(storageService.read(STORAGE_REF))
+				.willThrow(new EvidenceStorageException("Could not read evidence object " + STORAGE_REF, null));
+
+		assertThatThrownBy(() -> service.export(item.getId(), PRINCIPAL))
+				.isInstanceOf(EvidenceStorageException.class);
+
+		assertThat(custodyEventRepository.findByEvidenceItemIdOrderBySequenceAsc(item.getId())).hasSize(1);
+		assertThat(reloadedItem().getStatus()).isEqualTo(EvidenceStatus.PRESERVED);
+	}
+
+	@Test
+	@DisplayName("Exporting an artifact that does not exist is a not-found")
+	void exportOfUnknownItemIsNotFound() {
+		assertThatThrownBy(() -> service.export(UUID.randomUUID(), PRINCIPAL))
 				.isInstanceOf(ResourceNotFoundException.class);
 	}
 

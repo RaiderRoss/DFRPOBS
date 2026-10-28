@@ -25,7 +25,6 @@ function Dashboard() {
                 <div className="header-inner">
                     <Space className="brand-row" align="center" size={10}>
                         <Tag color="cyan">DFRaaS</Tag>
-                        <Typography.Text className="brand-caption">Evidence operations</Typography.Text>
                     </Space>
                     <Space className="title-row" direction="vertical" size={2}>
                         <Typography.Title level={1}>Evidence repository</Typography.Title>

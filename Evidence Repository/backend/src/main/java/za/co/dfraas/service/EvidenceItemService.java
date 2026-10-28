@@ -19,6 +19,7 @@ import za.co.dfraas.exception.DuplicateResourceException;
 import za.co.dfraas.exception.IntegrityVerificationException;
 import za.co.dfraas.exception.ResourceNotFoundException;
 import za.co.dfraas.mapper.EvidenceItemMapper;
+import za.co.dfraas.repository.EvidenceItemIndicatorRepository;
 import za.co.dfraas.repository.EvidenceItemRepository;
 import za.co.dfraas.repository.EvidenceSourceRepository;
 
@@ -42,6 +43,8 @@ public class EvidenceItemService {
 	private final HashingService hashingService;
 	private final EvidenceStorageService storageService;
 	private final CustodyChainService custodyChainService;
+	private final IndicatorExtractor indicatorExtractor;
+	private final EvidenceItemIndicatorRepository indicatorRepository;
 
 	public EvidenceItemService(
 			EvidenceItemRepository repository,
@@ -49,13 +52,17 @@ public class EvidenceItemService {
 			EvidenceItemMapper mapper,
 			HashingService hashingService,
 			EvidenceStorageService storageService,
-			CustodyChainService custodyChainService) {
+			CustodyChainService custodyChainService,
+			IndicatorExtractor indicatorExtractor,
+			EvidenceItemIndicatorRepository indicatorRepository) {
 		this.repository = repository;
 		this.sourceRepository = sourceRepository;
 		this.mapper = mapper;
 		this.hashingService = hashingService;
 		this.storageService = storageService;
 		this.custodyChainService = custodyChainService;
+		this.indicatorExtractor = indicatorExtractor;
+		this.indicatorRepository = indicatorRepository;
 	}
 
 	public EvidenceItemDto findById(UUID id) {
@@ -203,6 +210,10 @@ public class EvidenceItemService {
 		} catch (DataIntegrityViolationException ex) {
 			throw DuplicateResourceException.of(RESOURCE, "sourceArtifactId", request.sourceArtifactId());
 		}
+
+		// From the verified bytes, in this transaction: an item is never visible without the
+		// indicators correlation will match it on.
+		indicatorRepository.saveIpv4(stored.getId(), indicatorExtractor.ipv4(content));
 
 		// The chain's first link. The detail names the checks this artifact actually passed
 		// rather than restating the digest, which the entry already carries in

@@ -236,7 +236,7 @@ class CustodyEventRepositoryTest {
 				.createNativeQuery("""
 						INSERT INTO custody_event (evidence_item_id, "sequence", action, occurred_at,
 								prev_entry_hash, entry_hash, canonical_version)
-						VALUES (:itemId, 0, 'EXPORTED', now(), :genesis, :entryHash, 1)
+						VALUES (:itemId, 0, 'DOWNLOADED', now(), :genesis, :entryHash, 1)
 						""")
 				.setParameter("itemId", item.getId())
 				.setParameter("genesis", GENESIS_HASH)

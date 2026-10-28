@@ -23,9 +23,9 @@ import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
  * layered on here as their supporting pieces land:
  *
  * <ul>
- *   <li>OTP/2FA step-up gating evidence export/download specifically — see the
- *       placeholder matcher below. Needs the AppUser entity and its {@code mfaEnabled}
- *       flag first.</li>
+ *   <li>OTP/2FA step-up gating evidence export ({@code GET /api/evidence-items/{id}/content})
+ *       specifically — see the placeholder matcher below. Needs the AppUser entity and its
+ *       {@code mfaEnabled} flag first.</li>
  *   <li>OAuth2/mTLS for service-to-service calls, replacing HTTP Basic.</li>
  *   <li>An {@code AppUser}-backed {@code UserDetailsService}, replacing the dev-only
  *       {@code spring.security.user.*} credentials in application.properties.</li>
@@ -64,10 +64,11 @@ public class SecurityConfiguration {
 								"/v3/api-docs",
 								"/v3/api-docs/**",
 								"/v3/api-docs.yaml").permitAll()
-						// Placeholder for the step-up rule. Authentication alone is not
-						// enough to download evidence — this matcher must additionally
-						// require a verified OTP once 2FA is implemented.
-						.requestMatchers(HttpMethod.GET, "/api/evidence/*/download").authenticated()
+						// Placeholder for the step-up rule on the one route that releases
+						// evidence bytes. Authentication alone is what guards it in the
+						// prototype; this matcher is where a verified OTP would be required
+						// once a user model exists (out of scope — README, Future work).
+						.requestMatchers(HttpMethod.GET, "/api/evidence-items/*/content").authenticated()
 						.anyRequest().authenticated())
 				.httpBasic(basic -> {})
 				.build();
@@ -93,6 +94,9 @@ public class SecurityConfiguration {
 		// Authorization is what forces the preflight in the first place — HTTP Basic puts it on
 		// every call, and it is not a CORS-safelisted request header.
 		configuration.setAllowedHeaders(List.of("Authorization", "Content-Type", "Accept"));
+		// The download's file name and digest. Neither is CORS-safelisted, so without this the
+		// frontend could fetch the bytes but not name them or check them on receipt.
+		configuration.setExposedHeaders(List.of("Content-Disposition", "Repr-Digest"));
 		// Deliberately false. The frontend builds the Authorization header in JS rather than
 		// relying on a cookie or a browser-managed credential, so it does not need
 		// credentialed-mode CORS — and leaving this off keeps the response uncacheable as a

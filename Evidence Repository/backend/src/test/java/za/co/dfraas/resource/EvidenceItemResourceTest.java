@@ -2,15 +2,21 @@ package za.co.dfraas.resource;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.startsWith;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willThrow;
+import static org.mockito.Mockito.never;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.head;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -32,6 +38,7 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import org.springframework.http.MediaType;
 import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.security.test.context.support.WithAnonymousUser;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -39,6 +46,7 @@ import org.springframework.test.web.servlet.request.MockMultipartHttpServletRequ
 
 import za.co.dfraas.config.SecurityConfiguration;
 import za.co.dfraas.dto.CustodyEventDto;
+import za.co.dfraas.dto.EvidenceExport;
 import za.co.dfraas.dto.EvidenceItemDto;
 import za.co.dfraas.dto.IntegrityCheckResult;
 import za.co.dfraas.entity.CustodyAction;
@@ -349,6 +357,113 @@ class EvidenceItemResourceTest {
 				.andReturn().getResponse().getContentAsString();
 
 		assertThat(body).doesNotContain("pde-sim-ufw-01/");
+	}
+
+	@Test
+	@DisplayName("GET content releases the bytes as an attachment, with their digest, exported as the caller")
+	void contentReleasesBytesAsAnAttachmentWithTheirDigest() throws Exception {
+		given(integrityCheckService.export(eq(ITEM_ID), eq("user")))
+				.willReturn(export(true, "hello".getBytes(UTF_8), CONTENT_SHA256, CustodyAction.EXPORTED));
+
+		mockMvc.perform(get("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isOk())
+				.andExpect(header().string("Content-Type", MediaType.APPLICATION_OCTET_STREAM_VALUE))
+				.andExpect(header().string("Content-Length", "5"))
+				.andExpect(header().string("Content-Disposition",
+						allOf(
+								startsWith("attachment"),
+								containsString(ARTIFACT_ID))))
+				// RFC 9530: the SHA-256 of "hello", base64 between colons.
+				.andExpect(header().string("Repr-Digest", "sha-256=:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=:"))
+				.andExpect(header().string("Cache-Control", containsString("no-store")))
+				.andExpect(content().bytes("hello".getBytes(UTF_8)));
+
+		then(integrityCheckService).should().export(ITEM_ID, "user");
+	}
+
+	/**
+	 * The finding has been committed by the service by the time this is thrown, so the
+	 * problem document can say so; what it must not do is carry the digests or the bytes.
+	 */
+	@Test
+	@DisplayName("A mismatched object is refused with 422, no bytes and no digests")
+	void contentOfMismatchedObjectIsRefused() throws Exception {
+		given(integrityCheckService.export(any(), any()))
+				.willReturn(export(false, null, OTHER_SHA256, CustodyAction.HASH_MISMATCH));
+
+		String body = mockMvc.perform(get("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isUnprocessableEntity())
+				.andExpect(jsonPath("$.title").value("Evidence integrity check failed"))
+				.andExpect(jsonPath("$.detail").value(containsString("COMPROMISED")))
+				.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).doesNotContain(CONTENT_SHA256).doesNotContain(OTHER_SHA256);
+	}
+
+	@Test
+	@DisplayName("Downloading an unknown item is 404")
+	void contentOfUnknownItemIsNotFound() throws Exception {
+		willThrow(ResourceNotFoundException.of("EvidenceItem", ITEM_ID))
+				.given(integrityCheckService).export(any(), any());
+
+		mockMvc.perform(get("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isNotFound());
+	}
+
+	@Test
+	@DisplayName("An unreachable store on download is 503 and names no storage key")
+	void contentStorageFailureIsServiceUnavailable() throws Exception {
+		willThrow(new EvidenceStorageException("Could not read evidence object pde-sim-ufw-01/" + ARTIFACT_ID, null))
+				.given(integrityCheckService).export(any(), any());
+
+		String body = mockMvc.perform(get("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isServiceUnavailable())
+				.andReturn().getResponse().getContentAsString();
+
+		assertThat(body).doesNotContain("pde-sim-ufw-01/");
+	}
+
+	/**
+	 * Spring answers HEAD on a GET route by running the handler and dropping the body, which
+	 * here would append an EXPORTED entry for a release that never happened.
+	 */
+	@Test
+	@DisplayName("HEAD on content is refused and never reaches the export")
+	void headOnContentIsRefusedWithoutExporting() throws Exception {
+		mockMvc.perform(head("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isMethodNotAllowed())
+				.andExpect(header().string("Allow", "GET"));
+
+		then(integrityCheckService).should(never()).export(any(), any());
+	}
+
+	@Test
+	@DisplayName("Downloading without credentials is 401 and never reaches the export")
+	@WithAnonymousUser
+	void contentRequiresAuthentication() throws Exception {
+		mockMvc.perform(get("/api/evidence-items/{id}/content", ITEM_ID))
+				.andExpect(status().isUnauthorized());
+
+		then(integrityCheckService).should(never()).export(any(), any());
+	}
+
+	private static EvidenceExport export(boolean released, byte[] content, String sha256, CustodyAction action) {
+		CustodyEventDto entry = new CustodyEventDto(
+				UUID.fromString("55555555-5555-5555-5555-555555555555"),
+				ITEM_ID,
+				1L,
+				action,
+				"user",
+				OffsetDateTime.parse("2026-09-06T09:15:00.123456Z"),
+				OffsetDateTime.parse("2026-09-06T09:15:00.125000Z"),
+				CONTENT_SHA256,
+				sha256,
+				"3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b",
+				"b1f5a6d7c8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071829",
+				(short) 1,
+				"Re-verified before export.");
+		return new EvidenceExport(ITEM_ID, ARTIFACT_ID, released, content, sha256,
+				released ? EvidenceStatus.PRESERVED : EvidenceStatus.COMPROMISED, entry);
 	}
 
 	private static IntegrityCheckResult checkResult(

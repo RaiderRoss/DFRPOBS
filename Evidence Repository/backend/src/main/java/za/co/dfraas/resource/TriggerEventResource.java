@@ -39,7 +39,7 @@ import za.co.dfraas.service.TriggerEventService;
  * <p>There is also no endpoint returning the raw {@code payload}. That is a gap rather
  * than an oversight: the alert body can carry customer identifiers and the attacker's own
  * input, so retrieving it belongs behind the same OTP step-up that
- * {@code SecurityConfiguration} already reserves for evidence download. Responses here
+ * {@code SecurityConfiguration} reserves for evidence download. Responses here
  * carry {@code payloadSha256} instead, which is enough to verify a copy obtained through
  * that gated route.
  */

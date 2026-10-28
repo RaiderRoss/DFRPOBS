@@ -6,6 +6,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import java.time.Clock;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +20,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
 
 import za.co.dfraas.TestcontainersConfiguration;
 import za.co.dfraas.dto.EvidenceLinkDto;
@@ -168,6 +171,54 @@ class EvidenceLinkServiceTest {
 	void unknownLinkIsNotFound() {
 		assertThatThrownBy(() -> service.confirm(UUID.randomUUID(), "j.mokoena", "Relevant."))
 				.isInstanceOf(ResourceNotFoundException.class);
+	}
+
+	@Test
+	@DisplayName("A bulk dismissal records the reviewer, time and reason on every link, once each")
+	void bulkDismissalRecordsEachLink() {
+		EvidenceLink first = link(LinkMethod.AUTO_TIME_WINDOW);
+		EvidenceLink second = link(LinkMethod.AUTO_TIME_WINDOW);
+
+		List<EvidenceLinkDto> dismissed = service.dismissAll(
+				List.of(first.getId(), second.getId(), first.getId()), "j.mokoena", "Different host.");
+
+		assertThat(dismissed).extracting(EvidenceLinkDto::id).containsExactly(first.getId(), second.getId());
+		assertThat(dismissed).allSatisfy(link -> {
+			assertThat(link.disposition()).isEqualTo(LinkDisposition.DISMISSED);
+			assertThat(link.reviewedBy()).isEqualTo("j.mokoena");
+			assertThat(link.reviewedAt()).isAtSameInstantAs(NOW);
+			assertThat(link.reviewNote()).isEqualTo("Different host.");
+		});
+	}
+
+	/**
+	 * Outside the test transaction, so that the service's own transaction commits or rolls
+	 * back for real; inside one, a rollback would only mark the test's transaction and the
+	 * partial dismissal would still be visible. What it commits is removed afterwards.
+	 */
+	@Test
+	@Transactional(propagation = Propagation.NOT_SUPPORTED)
+	@DisplayName("A bulk ruling that reaches an already-reviewed link records nothing at all")
+	void bulkRulingIsAllOrNone() {
+		EvidenceLink pending = link(LinkMethod.AUTO_TIME_WINDOW);
+		EvidenceLink reviewed = link(LinkMethod.AUTO_TIME_WINDOW);
+		try {
+			service.confirm(reviewed.getId(), "a.pillay", "Relevant.");
+
+			assertThatThrownBy(() -> service.dismissAll(
+					List.of(pending.getId(), reviewed.getId()), "j.mokoena", "Different host."))
+					.isInstanceOf(LinkAlreadyReviewedException.class);
+
+			// pending was dismissed first in the call, and that dismissal did not survive it.
+			assertThat(service.findById(pending.getId()).disposition()).isEqualTo(LinkDisposition.PROPOSED);
+			assertThat(service.findById(reviewed.getId()).reviewedBy()).isEqualTo("a.pillay");
+		} finally {
+			linkRepository.deleteAllById(List.of(pending.getId(), reviewed.getId()));
+			evidenceItemRepository.deleteAllById(
+					List.of(pending.getEvidenceItem().getId(), reviewed.getEvidenceItem().getId()));
+			incidentRepository.deleteById(alert.getId());
+			evidenceSourceRepository.deleteById(firewall.getId());
+		}
 	}
 
 	@Test

@@ -29,7 +29,10 @@ public enum LinkMethod {
 	CAUSAL,
 
 	/**
-	 * Matched on something narrower than time — host, account, source address, session id.
+	 * Overlapped the window and also matched a named correlation rule, which the link's
+	 * rationale names: the item covers the instant an alert fired ({@code alert-instant}), or
+	 * mentions an address the alert names as its subject ({@code shared-indicator}). See
+	 * {@code CorrelationService}.
 	 *
 	 * <p>Kept separate from {@link #AUTO_TIME_WINDOW} because it is far stronger evidence of
 	 * relevance, and an investigator triaging a large bundle needs to see which links are

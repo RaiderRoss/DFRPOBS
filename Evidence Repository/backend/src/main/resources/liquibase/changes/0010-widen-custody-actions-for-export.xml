@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+    xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.29.xsd">
+
+    <!--
+        The second widening of the custody action list, following the rule 0006 set and 0007
+        applied: a value is added in the same change as the code that emits it.
+        IntegrityCheckService.export now releases an artifact's bytes over
+        GET /api/evidence-items/{id}/content, and every release is recorded as EXPORTED.
+
+        The artifact hash pair on an EXPORTED entry reads as expected/observed, as on
+        HASH_VERIFIED: the bytes are re-hashed before they leave, and the entry carries the
+        digest they were expected to have and the digest of what was actually released. The
+        two are equal by construction, because a mismatch releases nothing — it is recorded
+        as HASH_MISMATCH instead, and the item moves to COMPROMISED. So "every EXPORTED entry
+        names bytes that matched the recorded digest" holds for the whole table, and a copy
+        held by an investigator can be checked against artifact_hash_after of the entry that
+        released it.
+
+        No backfill: widening a CHECK touches no rows, and every existing entry holds one of
+        the three values that remain valid.
+    -->
+
+    <changeSet id="0010-1" author="dfraas-team">
+        <comment>Widen ck_custody_event_action to admit EXPORTED, written when an artifact's bytes are released</comment>
+        <!-- DROP then ADD, for the reason 0007 gives. The list must stay in step with the CustodyAction enum. -->
+        <sql>
+            ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_action;
+        </sql>
+        <sql>
+            ALTER TABLE custody_event
+                ADD CONSTRAINT ck_custody_event_action
+                CHECK (action IN ('CREATED', 'HASH_VERIFIED', 'HASH_MISMATCH', 'EXPORTED'));
+        </sql>
+        <!--
+            Restores the 0007 list, and refuses to run once any EXPORTED entry exists — the
+            same position 0007's rollback takes: deleting custody entries to make a narrower
+            constraint fit is not a migration tool's decision.
+        -->
+        <rollback>
+            <sql>ALTER TABLE custody_event DROP CONSTRAINT ck_custody_event_action;</sql>
+            <sql>
+                ALTER TABLE custody_event
+                    ADD CONSTRAINT ck_custody_event_action
+                    CHECK (action IN ('CREATED', 'HASH_VERIFIED', 'HASH_MISMATCH'));
+            </sql>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
