@@ -3,7 +3,8 @@
 The 24 evidence windows from the PDE lab's evaluation batch, captured on 30 September and
 1 October 2026. Each folder is one **window**: 30 seconds of simulated activity at a bank, and
 everything the bank's evidence sources recorded during it. These are the windows the
-dissertation's results (sections 5.3.1–5.3.3) are based on.
+dissertation's logging and monitoring results (Chapter 4, section 4.4) are based on, and
+`score.py` recomputes those results from them (see "Recomputing the results" below).
 
 ## What happened in each window
 
@@ -70,7 +71,9 @@ Named `<timestamp>_<attack type>`. The timestamp is when the window opened, in U
 
 ## What is in a folder
 
-The four **evidence files** — what a bank would hand to an investigator. They are read-only.
+The four **evidence files** — what a bank would hand to an investigator. They were made
+read-only when collected; a git checkout does not keep that setting, so the fingerprints below
+are the check that counts.
 
 | file | source | what it records |
 |---|---|---|
@@ -85,7 +88,7 @@ Supporting files:
 |---|---|
 | `firewall_<ts>.manifest.json`, `banking_<ts>.manifest.json` | where each source's evidence came from, how it was collected, how to read its timestamps, and its fingerprint (SHA-256 hash) |
 | `window_<ts>.group.json` | ties the four sources together as one window, with every file's fingerprint |
-| `firewall_<ts>.groundtruth.json`, `banking_<ts>.groundtruth.json` | the lab's own list, written before anything was sent, of every action and whether it was honest or malicious. Used to check the evidence; **not evidence itself** and never submitted |
+| `firewall_<ts>.groundtruth.json`, `banking_<ts>.groundtruth.json` | the lab's own list of every action and whether it was honest or malicious. The plan and its labels are fixed before anything is sent; the file is written when the window ends, with what actually happened to each action. Used to check the evidence; **not evidence itself** and never submitted |
 | `banking-events_<ts>.raw.jsonl` | the message system's raw copy of the bank events, kept so the decoded file can be checked. Not submitted |
 
 Not included, to keep the repository small (about 7 MB per window): the IDS's internal working
@@ -104,6 +107,23 @@ grep -o '"sha256": "[0-9a-f]*"' firewall_20260930230812.manifest.json
 
 The two values must match. For the other three sources the recorded fingerprint is in
 `window_<ts>.group.json`. All 96 evidence files matched when this folder was made.
+
+## Recomputing the results
+
+`score.py` recomputes the logging and monitoring results in Chapter 4, section 4.4 of the
+dissertation from these folders. It checks every record against the window's ground truth by
+exact key, re-hashes every file against its recorded fingerprint, and counts what the IDS
+found and alerted on. It only reads.
+
+```bash
+python3 score.py            # the report, for the 24 windows
+python3 score.py --json     # the same figures, per window
+python3 score.py ../output/<timestamp>   # any window the lab captures
+```
+
+It needs only Python 3 and `../Banking/reconcile.py`, the bank matching that also ran during
+each capture. It does not recompute how long each capture took, which the batch runner timed
+and which is not stored in the windows.
 
 ## Sending a window to the Evidence Repository
 
